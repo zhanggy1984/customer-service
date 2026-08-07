@@ -48,6 +48,39 @@ def _detect_injection(text: str) -> bool:
     return bool(INJECTION_RE.search(text))
 
 
+# 部分退货规则兜底：LLM 未提取 items 槽时，从"只退/就退/只要退/仅退/单退 + 商品名"句式降级提取。
+# 只匹配强指定信号词；捕获后再精化，避免把普通原因/全额语义/否定句式误当商品名：
+# - 前缀"了/个"为完成时语气词与量词（"只退了个手机壳"→"手机壳"）
+# - 后缀 strip 语气/量词尾缀（"只退手机壳吧"→"手机壳"、"只退手机壳一个"→"手机壳"）
+# - 多商品按"和/、/斜杠"拆分（"只退手机壳和钢化膜"→两个商品）
+# - 停用词过滤"款/货/单/运费/差价"等，拦截"只退款""就退货吧"等全额语义
+# - 否定句式（"不要只退手机壳"/"只退手机壳不行"）与用户意图相反，整体跳过
+_PARTIAL_RETURN_RE = re.compile(r"(?:只退|就退|只要退|仅退|单退)\s*([^\s，,。.!！?？]{1,16})")
+_PARTIAL_RETURN_PREFIX_RE = re.compile(r"^(?:了|个)+")
+_PARTIAL_RETURN_TRAIL_RE = re.compile(r"(?:一个|[吧啊呀哈哦了呢么的下])+$")
+_PARTIAL_RETURN_SPLIT_RE = re.compile(r"[和、/／]")
+_PARTIAL_RETURN_NOISE = {"款", "货", "单", "运费", "差价", "费用", "钱"}
+_PARTIAL_RETURN_NEG_RE = re.compile(
+    r"(?:不要|别|不想|不能|不用)\s*(?:只退|就退|只要退|仅退|单退)"
+    r"|(?:只退|就退|只要退|仅退|单退)[^，,。.!！?？]{0,16}(?:不行|不要|算了)"
+)
+
+
+def _extract_partial_items(text: str) -> list:
+    """从用户输入兜底提取指定退货商品名；无匹配或语义为否定/全额时返回空列表。"""
+    if _PARTIAL_RETURN_NEG_RE.search(text):
+        return []
+    items = []
+    for m in _PARTIAL_RETURN_RE.finditer(text):
+        name = _PARTIAL_RETURN_PREFIX_RE.sub("", m.group(1))
+        name = _PARTIAL_RETURN_TRAIL_RE.sub("", name).strip()
+        for piece in _PARTIAL_RETURN_SPLIT_RE.split(name):
+            piece = piece.strip()
+            if piece and piece not in _PARTIAL_RETURN_NOISE and piece not in items:
+                items.append(piece)
+    return items
+
+
 def _rule_engine_fallback(fn):
     """LLM 全部不可用（熔断）时降级规则引擎。"""
 
@@ -195,16 +228,15 @@ async def run_agent(session: Session, user_message: str, user_id: int, emit=None
             await status("order_query", "正在处理...")
         # 多轮补充指定退货商品：LLM 在任意推进轮都可能提取 items 槽。若仅 _init_state 注入，
         # 后轮（如先"我要退货 ORD-001"再"只退手机壳"）会被丢弃且被误当退货原因、按全量确认。
-        # 此处合并本轮 items；资格已算过（已过 check_eligibility）则回到该节点携带新子集重算。
-        if (
-            intent == "RETURN_REQUEST"
-            and session.agent_state
-            and (intent_result.slots or {}).get("items")
-        ):
-            merged = {**session.agent_state, "return_items": intent_result.slots["items"]}
-            if merged.get("stage") in ("collect_reason", "confirm"):
-                merged.update({"stage": "check_eligibility", "eligibility": None, "awaiting": None})
-            session.agent_state = merged
+        # 此处合并本轮 items（LLM 未提取时用"只退/就退/只要退 + 商品名"句式规则兜底）；
+        # 资格已算过（已过 check_eligibility）则回到该节点携带新子集重算。
+        if intent == "RETURN_REQUEST" and session.agent_state:
+            items = (intent_result.slots or {}).get("items") or _extract_partial_items(user_message)
+            if items:
+                merged = {**session.agent_state, "return_items": items}
+                if merged.get("stage") in ("collect_reason", "confirm"):
+                    merged.update({"stage": "check_eligibility", "eligibility": None, "awaiting": None})
+                session.agent_state = merged
         new_state = await FLOWS[intent].step(session.agent_state, user_message)
         session.agent_state = new_state
         session.intent = intent

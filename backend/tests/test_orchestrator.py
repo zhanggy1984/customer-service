@@ -142,3 +142,52 @@ async def test_multi_round_items_merged_and_eligibility_recomputed(monkeypatch):
     assert "钢化膜" not in reply3
     assert "29.9" in reply3
     assert len(emit.actions()) == 1  # 确认 action 只在最终的确认节点发
+
+
+def test_extract_partial_items():
+    """规则兜底提取：只匹配强信号词，strip 语气尾缀，普通原因不误伤。"""
+    from app.agent.orchestrator import _extract_partial_items
+
+    assert _extract_partial_items("只退手机壳") == ["手机壳"]
+    assert _extract_partial_items("质量问题，只要退手机壳吧") == ["手机壳"]
+    assert _extract_partial_items("就退手机壳") == ["手机壳"]
+    assert _extract_partial_items("只退了手机壳") == ["手机壳"]  # 完成时语气词"了"不污染商品名
+    assert _extract_partial_items("只退了个手机壳") == ["手机壳"]  # 量词"个"不污染
+    assert _extract_partial_items("只退个手机壳") == ["手机壳"]
+    assert _extract_partial_items("只退手机壳一个") == ["手机壳"]  # 尾缀"一个"收敛
+    assert _extract_partial_items("只退手机壳和钢化膜") == ["手机壳", "钢化膜"]  # 多商品拆分
+    assert _extract_partial_items("只退手机壳、钢化膜") == ["手机壳", "钢化膜"]  # 顿号分隔
+    assert _extract_partial_items("只退手机保护套") == ["手机保护套"]  # 4 字商品名完整提取
+    assert _extract_partial_items("不想要了") == []
+    assert _extract_partial_items("确认") == []
+    assert _extract_partial_items("算了，不退了") == []
+    # 全额语义/非指定商品不误伤
+    assert _extract_partial_items("就退货吧") == []
+    assert _extract_partial_items("只退款") == []
+    assert _extract_partial_items("只要退款") == []
+    assert _extract_partial_items("仅退款") == []
+    # 否定句式与用户意图相反，整体跳过
+    assert _extract_partial_items("不要只退手机壳") == []
+    assert _extract_partial_items("只退手机壳不行") == []
+    assert _extract_partial_items("别只退手机壳") == []
+
+
+@pytest.mark.asyncio
+async def test_multi_round_items_fallback_when_llm_misses(monkeypatch):
+    """LLM 未提取 items 时，规则兜底从"只退手机壳"句式提取，避免按全量确认。"""
+    classify = _FakeClassify([
+        IntentResult(intent="RETURN_REQUEST", confidence=0.9, slots={"order_id": "ORD-T"}),
+        IntentResult(intent="RETURN_REQUEST", confidence=0.9, slots={}),  # LLM 本轮未提取 items
+    ])
+    monkeypatch.setattr("app.agent.orchestrator.classify_intent", classify)
+    _patch_services(monkeypatch)
+
+    emit = _Emit()
+    session = _session()
+    await run_agent(session, "我要退货 ORD-T", 1, emit)
+
+    reply2 = await run_agent(session, "只退手机壳", 1, emit)
+    assert "原因" in reply2  # 兜底合并后重算资格，追原因而非按全量确认
+    assert session.agent_state["return_items"] == ["手机壳"]
+    assert [i["item_id"] for i in session.agent_state["eligibility"]["items"]] == ["SKU-1"]
+    assert session.agent_state["eligibility"]["refund_amount"] == 29.9
