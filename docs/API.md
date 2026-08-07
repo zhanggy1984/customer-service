@@ -48,6 +48,27 @@ data: {"type":"error","message":"..."}   # 出错时
 
 会话不存在/过期时自动重建，`done.session_id` 为实际会话 id。
 
+### 会话历史（侧边栏列表 + 历史消息 + 删除）
+
+```bash
+# 当前用户的会话列表（空会话不展示，按最近写入倒序，最多 50 条）
+GET /sessions
+# 200 {"items":[{"session_id":"a1b2...","title":"我要退货 ORD-001","updated_at":"2026-08-07T12:00:00","intent":"RETURN_REQUEST"}],"total":1}
+#   title = 首条 user 消息前 30 字；assistant 开头/无 user 消息的会话标题为"新会话"
+#   updated_at = 最后保存/活跃时间（conversation_history 每次保存 DELETE+INSERT 刷新，非会话创建时间）
+
+# 拉取单个会话的历史消息（归属校验；Redis 过期自动走 MySQL 恢复）
+GET /sessions/{sid}/messages
+# 200 {"session_id":"a1b2...","intent":"RETURN_REQUEST","messages":[{"role":"user","content":"...","ts":"2026-08-07T12:00:00Z"}]}
+# 403 无权访问他人会话 / 404 会话不存在
+
+# 删除单个会话（Redis + MySQL conversation_history 一并清除，仅限本人）
+DELETE /sessions/{sid}
+# 200 {"msg":"已删除"} / 403 / 404
+```
+
+前端将当前会话 `session_id` 持久化到 localStorage（按用户隔离，key `cs_session_{user_id}`），刷新页面 / 重新登录后自动恢复最近会话并加载历史，可继续对话；侧边栏支持切换历史会话与删除。
+
 ## Admin（需 `role=admin`）
 
 ### 知识库管理

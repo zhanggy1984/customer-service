@@ -19,7 +19,19 @@ export function useChat() {
   const sending = ref(false)
   const progress = ref('')
   const confirmVisible = ref(false)
-  const { ensureSession, setSession } = useSession()
+  const { ensureSession, setSession, loadMessages } = useSession()
+
+  /** 加载某会话的历史消息，替换当前列表（切换 / 恢复会话用） */
+  async function loadHistory(sid: string) {
+    const data = await loadMessages(sid)
+    messages.value = (data.messages || []).map((m, idx) => ({
+      id: `h_${sid}_${idx}`,
+      role: m.role,
+      content: m.content,
+    }))
+    confirmVisible.value = false
+    progress.value = ''
+  }
 
   function setContent(id: string, content: string) {
     const m = messages.value.find((x) => x.id === id)
@@ -88,5 +100,5 @@ export function useChat() {
     confirmVisible.value = false
   }
 
-  return { messages, sending, progress, confirmVisible, send, sendConfirm, clear }
+  return { messages, sending, progress, confirmVisible, send, sendConfirm, clear, loadHistory }
 }

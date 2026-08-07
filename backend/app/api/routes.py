@@ -5,6 +5,7 @@
 - Admin: 知识库管理（MySQL 为源 + ChromaDB 同步，见 rag/kb_store.py）+ 订单维护
 """
 import asyncio
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -104,6 +105,92 @@ async def send_message(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/sessions")
+async def list_sessions(user: dict = Depends(get_current_user)) -> dict:
+    """当前用户的会话列表（供前端侧边栏展示 / 切换历史会话）。
+
+    数据源：MySQL conversation_history（StorageRouter 每次 save 双写落库，含 user_id 索引）。
+    标题取首条 user 消息，空会话（未发过消息）不展示，按写入顺序（id 自增）倒序取最近 50 个。
+    """
+    rows = await mysql_pool.fetchall(
+        # JSON_LENGTH 判断消息非空数组，语义明确且避免 JSON 列与字符串 '' 比较的跨版本兼容风险
+        "SELECT session_id, intent, messages, created_at FROM conversation_history "
+        "WHERE user_id=%s AND JSON_LENGTH(messages) > 0 "
+        "ORDER BY id DESC LIMIT 50",
+        (int(user["sub"]),),
+    )
+    items: list[dict] = []
+    for row in rows:
+        title = "新会话"
+        try:
+            msgs = json.loads(row["messages"] or "[]")
+            if not isinstance(msgs, list):  # 脏数据防御：非数组按空处理，避免逐字符遍历
+                msgs = []
+        except (json.JSONDecodeError, TypeError):
+            msgs = []
+        for m in msgs:
+            # 数组内元素同样防御：非 dict 跳过、content 非字符串跳过，
+            # 避免 m.get()/content[:30] 对非法元素抛异常导致整个列表 500
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if m.get("role") == "user" and isinstance(content, str) and content:
+                title = content[:30]
+                break
+        # _save_mysql 每次 DELETE+INSERT，此时间实为"最后保存/活跃时间"，故命名为 updated_at
+        updated_at = row["created_at"]
+        if hasattr(updated_at, "isoformat"):
+            updated_at = updated_at.isoformat()
+        items.append(
+            {
+                "session_id": row["session_id"],
+                "title": title,
+                "updated_at": updated_at,
+                "intent": row["intent"],
+            }
+        )
+    logger.info("event=api_list_sessions", extra={"user_id": user["sub"], "count": len(items)})
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/sessions/{sid}/messages")
+async def get_session_messages(sid: str, user: dict = Depends(get_current_user)) -> dict:
+    """拉取单个会话的历史消息（SSE 发消息前前端用于恢复历史渲染）。
+
+    归属校验与 send_message 一致；会话从 Redis 过期（TTL）时经 storage_router 走 MySQL 兜底重建。
+    """
+    session = await session_manager.get_session(sid)
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if session.user_id != int(user["sub"]):
+        raise HTTPException(status_code=403, detail="无权访问该会话")
+    messages = [m.model_dump(mode="json") for m in session.messages[-200:]]
+    logger.info(
+        "event=api_get_session_messages",
+        extra={"session_id": sid, "user_id": user["sub"], "count": len(messages)},
+    )
+    return {"session_id": sid, "intent": session.intent, "messages": messages}
+
+
+@router.delete("/sessions/{sid}")
+async def delete_session(sid: str, user: dict = Depends(get_current_user)) -> dict:
+    """删除单个会话（Redis + MySQL conversation_history 一并清除）。
+
+    归属校验与历史读取一致：仅能删除自己的会话，admin 无跨用户特权。
+    与 send_message 同锁串行化：防止删除后同会话并发 send 重新 save 复活（TOCTOU）。
+    """
+    lock = await session_locks.get(sid)
+    async with lock:
+        session = await session_manager.get_session(sid)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if session.user_id != int(user["sub"]):
+            raise HTTPException(status_code=403, detail="无权删除该会话")
+        await session_manager.close_session(sid)
+    logger.info("event=api_delete_session", extra={"session_id": sid, "user_id": user["sub"]})
+    return {"msg": "已删除"}
 
 
 # =============================================================
