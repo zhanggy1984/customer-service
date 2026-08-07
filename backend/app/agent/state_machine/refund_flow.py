@@ -72,7 +72,8 @@ async def _confirm(state):
         if is_confirm(ui):
             return {"confirmed": True, "awaiting": None, "stage": "execute"}
         if is_deny(ui):
-            return {"stage": END, "final": True, "message": "已取消仅退款操作"}
+            # 显式清 awaiting，避免 LangGraph 浅合并残留旧值被上层误判仍在确认中
+            return {"stage": END, "final": True, "awaiting": None, "message": "已取消仅退款操作"}
     elig = state["eligibility"]
     return {
         "stage": "confirm",

@@ -60,6 +60,16 @@ async def _load_items(order_db_id: int) -> list[OrderItem]:
     return [_row_to_order_item(r) for r in rows]
 
 
+def _refundable_amount(order: OrderInfo) -> tuple[float, list[OrderItem]]:
+    """可退款商品合计：过滤定制类(returnable=false)与已退过(status!=NORMAL)的商品。
+
+    仅退款的资格判定(check)与落库(create)共用同一口径，避免两处金额不一致。
+    返回 (金额, 可退商品列表)；金额为 0 且列表为空表示无可退商品。
+    """
+    eligible = [it for it in order.items if it.returnable and it.status == "NORMAL"]
+    return round(sum(it.price * it.quantity for it in eligible), 2), eligible
+
+
 class LocalOrderService(IOrderService):
     async def query_order(self, order_id: str, user_id: int) -> OrderInfo | None:
         row = await mysql_pool.fetchone("SELECT * FROM orders WHERE order_id=%s", (order_id,))
@@ -149,7 +159,10 @@ class LocalReturnService(IReturnService):
 class LocalRefundService(IRefundService):
     async def check_refund_eligibility(self, order: OrderInfo) -> dict:
         if order.status == "PAID":
-            return {"eligible": True, "reason": "未发货，可申请仅退款", "amount": order.total_amount}
+            amount, eligible_items = _refundable_amount(order)
+            if not eligible_items:
+                return {"eligible": False, "reason": "订单内商品均为定制类，不支持退款", "amount": 0.0}
+            return {"eligible": True, "reason": "未发货，可申请仅退款", "amount": amount}
         if order.status == "SHIPPED":
             return {"eligible": False, "reason": "订单已发货，请先拒收，物流退回后自动退款", "amount": 0.0}
         if order.status == "DELIVERED":
@@ -161,17 +174,19 @@ class LocalRefundService(IRefundService):
         self, order: OrderInfo, user_id: int, reason: str, session_id: str
     ) -> RefundResult:
         refund_id = f"RF-{int(time.time() * 1000)}"
+        # 金额与 check_refund_eligibility 同口径（过滤定制类商品），避免判定与落库不一致
+        amount, _ = _refundable_amount(order)
         await mysql_pool.execute(
             "INSERT INTO refund_orders (refund_id, order_id, user_id, reason, amount, status, session_id) "
             "VALUES (%s,%s,%s,%s,%s,'APPROVED',%s)",
-            (refund_id, order.db_id, user_id, reason, order.total_amount, session_id),
+            (refund_id, order.db_id, user_id, reason, amount, session_id),
         )
         logger.info("event=refund_created", extra={"order_id": order.order_id, "refund_id": refund_id})
         return RefundResult(
             success=True,
             refund_id=refund_id,
             status="APPROVED",
-            amount=order.total_amount,
+            amount=amount,
             message="退款申请已提交",
         )
 

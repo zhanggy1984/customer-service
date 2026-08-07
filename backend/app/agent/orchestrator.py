@@ -78,7 +78,9 @@ def _init_state(intent: str, result: IntentResult, session: Session, user_id: in
     sid = session.session_id
     if intent == "RETURN_REQUEST":
         oid = slots.get("order_id")
+        # return_items: 用户指定只退的部分商品（商品名数组），空列表=退全部可退商品
         return {"user_id": user_id, "session_id": sid, "order_id": oid,
+                "return_items": slots.get("items", []) or [],
                 "stage": "verify_order" if oid else "collect_order_id"}
     if intent == "REFUND_REQUEST":
         oid = slots.get("order_id")
@@ -191,12 +193,26 @@ async def run_agent(session: Session, user_message: str, user_id: int, emit=None
             await status("order_query", "正在为您办理...")
         else:
             await status("order_query", "正在处理...")
+        # 多轮补充指定退货商品：LLM 在任意推进轮都可能提取 items 槽。若仅 _init_state 注入，
+        # 后轮（如先"我要退货 ORD-001"再"只退手机壳"）会被丢弃且被误当退货原因、按全量确认。
+        # 此处合并本轮 items；资格已算过（已过 check_eligibility）则回到该节点携带新子集重算。
+        if (
+            intent == "RETURN_REQUEST"
+            and session.agent_state
+            and (intent_result.slots or {}).get("items")
+        ):
+            merged = {**session.agent_state, "return_items": intent_result.slots["items"]}
+            if merged.get("stage") in ("collect_reason", "confirm"):
+                merged.update({"stage": "check_eligibility", "eligibility": None, "awaiting": None})
+            session.agent_state = merged
         new_state = await FLOWS[intent].step(session.agent_state, user_message)
         session.agent_state = new_state
         session.intent = intent
         reply = new_state.get("message", "")
-        # 到达确认节点 → 通知前端渲染 ConfirmButton
-        if new_state.get("awaiting") == "confirm" and emit:
+        # 到达确认节点 → 通知前端渲染 ConfirmButton。
+        # 注意必须先排除 final：取消时 _confirm 返回 final 但 awaiting 残留旧值 "confirm"，
+        # 若不排除会在取消响应里误发 confirm action，导致前端确认按钮残留。
+        if not new_state.get("final") and new_state.get("awaiting") == "confirm" and emit:
             await emit({"type": "action", "action": "confirm", "intent": intent})
         if new_state.get("final"):
             session.agent_state = None

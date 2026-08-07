@@ -22,6 +22,7 @@ class ReturnState(TypedDict, total=False):
     user_id: int
     session_id: str
     order_id: str
+    return_items: list  # 用户指定只退的部分商品名数组；空 = 退全部可退商品
     order: dict
     reason: str
     confirmed: bool
@@ -92,13 +93,30 @@ async def _check_eligibility(state):
     elig = await return_service.check_eligibility(order, state["user_id"])
     if not elig["eligible"]:
         return {"stage": END, "final": True, "message": elig["reason"]}
+    # 部分退货：用户指定只退部分商品时，按商品名包含匹配筛子集（整件粒度，不支持部分数量）。
+    # 指定商品均不可退时明确拒绝（不回退"退全部"，避免退错），提示可退清单让用户重新发起。
+    requested = state.get("return_items") or []
+    raw_items = elig.get("items", [])
+    if requested:
+        selected = [
+            it for it in raw_items
+            if any(req.strip().lower() in it.name.lower() for req in requested)
+        ]
+        if not selected:
+            names = "、".join(it.name for it in raw_items)
+            return {"stage": END, "final": True,
+                    "message": f"您指定的商品不支持退货。该订单可退商品：{names}，请重新发起退货并指定正确的商品"}
+        refund_amount = round(sum(it.price * it.quantity for it in selected), 2)
+        raw_items = selected
+    else:
+        refund_amount = elig.get("refund_amount", 0)
     # items 转 dict 列表存入 state（OrderItem 对象不可 JSON 序列化）
     elig_saved = {
         "eligible": True,
-        "refund_amount": elig.get("refund_amount", 0),
+        "refund_amount": refund_amount,
         "items": [
             {"item_id": i.item_id, "name": i.name, "price": i.price, "quantity": i.quantity}
-            for i in elig.get("items", [])
+            for i in raw_items
         ],
     }
     return {"eligibility": elig_saved, "stage": "collect_reason"}
@@ -123,7 +141,8 @@ async def _confirm(state):
         if _is_confirm(ui):
             return {"confirmed": True, "awaiting": None, "stage": "execute"}
         if _is_deny(ui):
-            return {"stage": END, "final": True, "message": "已取消退货操作"}
+            # 显式清 awaiting，避免 LangGraph 浅合并残留旧值被上层误判仍在确认中
+            return {"stage": END, "final": True, "awaiting": None, "message": "已取消退货操作"}
     elig = state["eligibility"]
     items_desc = "、".join(f"{i['name']}×{i['quantity']}" for i in elig["items"])
     return {

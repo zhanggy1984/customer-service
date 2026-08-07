@@ -13,6 +13,8 @@ REQUIRED_SLOTS: Dict[str, List[str]] = {
     "COMPLAINT": [],  # complaint_type 由 LLM 从输入提取，不强制
     "CHITCHAT": [],
 }
+# 可选槽位（不进 required，缺失不追问）：RETURN_REQUEST 的 items = 用户指定只退的部分商品名数组；
+# 由 orchestrator._init_state 注入 state.return_items，空列表 = 退全部可退商品。
 
 
 def check_missing_slots(intent: str, slots: dict) -> list[str]:
