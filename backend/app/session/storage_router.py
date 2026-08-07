@@ -103,7 +103,9 @@ class StorageRouter:
                     session.session_id,
                     session.user_id,
                     session.intent,
-                    json.dumps([m.model_dump() for m in session.messages], ensure_ascii=False),
+                    # model_dump() 默认保留 datetime 对象，裸 json.dumps 会抛 TypeError，
+                    # 与 Redis 的 model_dump_json() 口径一致，mode="json" 输出 ISO 字符串
+                    json.dumps([m.model_dump(mode="json") for m in session.messages], ensure_ascii=False),
                     agent_state_payload,
                     "",
                 ),

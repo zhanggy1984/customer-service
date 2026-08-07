@@ -119,3 +119,50 @@ async def test_save_mysql_with_datetime_in_agent_state(monkeypatch):
     # agent_state_payload（第 5 个参数）中 datetime 已用 default=str 兜底转字符串
     # （str(datetime) 输出空格分隔，如 "2026-08-03 15:00:00"）
     assert '"2026-08-03 15:00:00"' in inserted[0][4]
+
+
+@pytest.mark.asyncio
+async def test_save_mysql_with_datetime_in_messages(monkeypatch):
+    """messages 含 datetime（ts）时，MySQL 兜底写入不应抛异常。
+
+    回归：model_dump() 默认保留 datetime 对象，裸 json.dumps 抛 TypeError；
+    修复为 mode="json"，与 Redis 的 model_dump_json() 口径一致输出 ISO 字符串。
+    """
+    from datetime import datetime, timezone
+
+    from app.session.models import Message
+
+    calls: list[tuple] = []
+
+    class FakeMySQL:
+        async def execute(self, sql, params=None):
+            calls.append((sql, params))
+            return 1
+
+    class FakeRedisOK:
+        async def get(self, key):
+            return None
+
+        async def set(self, *a, **kw):
+            return None
+
+        async def ping(self):
+            return True
+
+        async def expire(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(sr_mod, "mysql_pool", FakeMySQL())
+    router = StorageRouter(FakeRedisOK(), ttl=3600)
+    ts = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    session = Session(
+        session_id="s4",
+        user_id=1,
+        messages=[Message(role="user", content="hi", ts=ts)],
+    )
+    await router.save(session)  # 不应抛异常
+
+    inserted = [p for s, p in calls if s.startswith("INSERT INTO conversation_history")]
+    assert inserted, "应写入 MySQL 会话快照"
+    # messages（第 4 个参数）中 ts 已序列化为 ISO 字符串，而非 datetime 对象
+    assert "2026-08-03T15:00:00" in inserted[0][3]
