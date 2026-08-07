@@ -36,6 +36,7 @@
 | 订单查询 | 「查一下订单」 | 缺单号时自动列出最近订单；支持中途任意切换意图，进度快照可恢复 |
 | 政策咨询 | 「退货时限是多久」 | RAG 检索知识库 → LLM 结合政策回答，命中/未命中都有兜底 |
 | 闲聊 | 「你好」 | LLM 自由回复并引导业务；连续闲聊第 4 轮自动收束到规则话术 |
+| 会话历史 | 刷新页面 / 重新登录 | 侧边栏展示历史会话列表（标题=首条消息 + 时间），点击切换并加载历史消息，可继续对话；当前会话 `session_id` 持久化到 localStorage（按用户隔离），删除会话 Redis + MySQL 一并清除 |
 
 ### 管理侧（Admin 后台，`role=admin`）
 
@@ -232,7 +233,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 - **JSON 结构化日志**：每个请求 1 进 1 出 + 6 阶段各 1 条 + LLM 调用/DB 操作全埋点，注入 `session_id` / `intent` / `latency_ms`，支持全链路追踪。
 
 ### ⑦ 验证指标
-自动化测试 44 项全部通过（含状态机、编排器、存储序列化回归）、集成测试端到端跑通 14 个业务场景（A-N）、压测 300 并发业务端点全部成功、P99 = 27ms。
+自动化测试 56 项全部通过（含状态机、编排器、存储序列化回归、会话历史接口、消息体截断）、集成测试端到端跑通 14 个业务场景（A-N）、压测 300 并发业务端点全部成功、P99 = 27ms。
 
 ---
 
@@ -262,6 +263,7 @@ cp .env.example .env
 | `SERVICE_MODE` | local | `local` 直连 MySQL / `remote` 切微服务对接层 |
 | `CHROMA_HOST` | chroma | 容器内服务名；留空则回退嵌入式向量库 |
 | `REDIS_URL` / `MYSQL_URL` | 服务名 | 容器网络内使用服务名，本地开发改为 localhost |
+| `SESSION_MAX_MESSAGES` | 40 | 会话消息体保存上限（条数），超出截断为「首条 user 消息 + 最近 N-1 条」；LLM/状态机不读消息全文，截断仅影响前端历史展示 |
 
 ## 3.3 启动全部服务
 
@@ -307,7 +309,7 @@ docker compose exec backend python -m pytest tests/ -v
 
 > 本地执行需先安装 `backend/requirements.txt` 并把 `.env` 中 `REDIS_URL`/`MYSQL_URL`/`CHROMA_HOST` 改为本机可达地址，否则 pytest 收集时初始化 RAG/连接会失败。
 
-覆盖范围：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义）、部分退货规则兜底（量词/语气词/多商品/否定句式边界）、RAG（命中/空结果）、StorageRouter 切换、知识库文档管理（含 datetime 序列化回归）。
+覆盖范围：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义）、部分退货规则兜底（量词/语气词/多商品/否定句式边界）、RAG（命中/空结果）、StorageRouter 切换、知识库文档管理（含 datetime 序列化回归）、会话历史接口（列表归属过滤/标题截断、历史消息读取、删除权限）、会话消息体截断（首条 user 锚点保留 / 上限内不动 / keep=0 边界）。
 
 前端组件测试：
 
@@ -315,7 +317,7 @@ docker compose exec backend python -m pytest tests/ -v
 cd frontend && npx vitest run
 ```
 
-覆盖范围：ChatPanel 消息渲染、StreamingMessage 逐字追加、ConfirmButton、登录/注册表单验证。
+覆盖范围：ChatPanel 消息渲染、ChatInput 输入、登录/注册表单验证、useSession（session_id 按用户持久化/恢复/隔离）、useChat 历史消息加载映射。
 
 ## 3.7 集成测试
 

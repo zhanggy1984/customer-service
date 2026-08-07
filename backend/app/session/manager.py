@@ -39,6 +39,7 @@ class SessionManager:
         return await self._router.load(sid)
 
     async def update_session(self, session: Session) -> None:
+        session.trim(settings.session_max_messages)  # 消息体截断，防无限增长
         await self._router.save(session)
 
     async def close_session(self, sid: str) -> None:

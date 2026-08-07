@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     # ---------- 会话 ----------
     session_ttl: int = 3600
     conversation_max_rounds: int = 10
+    # 会话消息体保存上限（条数）：超出截断，仅保留首条 user 消息 + 最近 N-1 条
+    session_max_messages: int = 40
 
     # ---------- RAG ----------
     chroma_persist_dir: str = "./data/chroma"

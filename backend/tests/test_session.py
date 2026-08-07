@@ -2,7 +2,7 @@
 import pytest
 
 from app.session import storage_router as sr_mod
-from app.session.models import Session
+from app.session.models import Message, Session
 from app.session.storage_router import StorageRouter
 
 
@@ -166,3 +166,61 @@ async def test_save_mysql_with_datetime_in_messages(monkeypatch):
     assert inserted, "应写入 MySQL 会话快照"
     # messages（第 4 个参数）中 ts 已序列化为 ISO 字符串，而非 datetime 对象
     assert "2026-08-03T15:00:00" in inserted[0][3]
+
+
+# ---------- Session.trim 消息体截断 ----------
+
+def _msgs(n: int, start_with_user: bool = True) -> list[Message]:
+    """构造 n 条交替角色消息，index 与 content 对应（m0 开始）。"""
+    return [
+        Message(role="user" if (i % 2 == 0) == start_with_user else "assistant", content=f"m{i}")
+        for i in range(n)
+    ]
+
+
+def test_trim_within_limit_untouched():
+    session = Session(session_id="t1", user_id=1, messages=_msgs(5))
+    session.trim(10)
+    assert len(session.messages) == 5
+
+
+def test_trim_exactly_limit_untouched():
+    session = Session(session_id="t2", user_id=1, messages=_msgs(10))
+    session.trim(10)
+    assert len(session.messages) == 10
+
+
+def test_trim_keeps_first_user_and_recent():
+    """超过上限：保留首条 user 消息（标题锚点）+ 最近 N-1 条，中间丢弃。"""
+    session = Session(session_id="t3", user_id=1, messages=_msgs(50))
+    session.trim(10)
+    assert len(session.messages) == 10
+    assert session.messages[0].content == "m0"    # 首条 user 保留
+    assert session.messages[0].role == "user"
+    assert session.messages[-1].content == "m49"  # 最近一条保留
+    assert session.messages[1].content == "m41"   # 跳过中间，接最近一段
+
+
+def test_trim_first_not_user_keeps_only_recent():
+    """首条非 user（assistant 开头）：无标题锚点可保，只取最近 N 条。"""
+    msgs = [Message(role="assistant", content="welcome")] + _msgs(30)  # 31 条，尾部 10 条是 m20..m29
+    session = Session(session_id="t4", user_id=1, messages=msgs)
+    session.trim(10)
+    assert len(session.messages) == 10
+    assert session.messages[0].content == "m20"
+    assert session.messages[-1].content == "m29"
+
+
+def test_trim_empty_untouched():
+    session = Session(session_id="t5", user_id=1)
+    session.trim(10)
+    assert session.messages == []
+
+
+def test_trim_max_one_keeps_only_anchor():
+    """max=1 且首条是 user：keep=0 时只保留首条锚点，不重复、不残留其他。"""
+    session = Session(session_id="t6", user_id=1, messages=_msgs(5))
+    session.trim(1)
+    assert len(session.messages) == 1
+    assert session.messages[0].content == "m0"
+    assert session.messages[0].role == "user"

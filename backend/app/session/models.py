@@ -29,6 +29,22 @@ class Session(BaseModel):
     def touch(self) -> None:
         self.updated_at = _utcnow()
 
+    def trim(self, max_messages: int) -> None:
+        """消息体截断：超过 max_messages 条时，保留首条 user 消息 + 最近 N-1 条。
+
+        首条 user 消息是会话列表标题的锚点（list_sessions 取它做标题），删掉会导致标题退化；
+        其余更早消息是截断的物理丢弃（前端历史仅展示保留部分）。状态机续推靠 agent_state，
+        不依赖 messages 全文，故截断不影响业务。
+        """
+        if len(self.messages) <= max_messages:
+            return
+        head = [self.messages[0]] if self.messages and self.messages[0].role == "user" else []
+        keep = max_messages - len(head)
+        # keep 可能为 0（max=1 且保留首条后无剩余空间），此时 tail 必须为空；
+        # 直接 [-0:] 等价 [:] 会返回整个列表，造成首条重复且不截断
+        tail = self.messages[-keep:] if keep > 0 else []
+        self.messages = head + tail
+
     def to_llm_messages(self, limit: int | None = None) -> list[dict]:
         """转成 LLM 需要的消息列表（截断最近 limit 条）。"""
         msgs = self.messages[-limit:] if limit else self.messages
