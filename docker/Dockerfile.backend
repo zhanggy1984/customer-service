@@ -1,0 +1,23 @@
+# 后端镜像
+# 基础镜像用 python:3.11-slim: asyncmy 0.2.9 仅提供 cp311 wheel，
+# 3.12 slim 镜像无编译工具链会导致 pip 安装失败。
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TZ=Asia/Shanghai
+
+WORKDIR /app
+
+# 先装依赖再拷代码，利用 Docker 层缓存
+COPY backend/requirements.txt /app/requirements.txt
+# torch 单独装 CPU 版（PyPI 默认 CUDA 版 ~2GB，CPU 版几百 MB），供 sentence-transformers 使用
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install -r /app/requirements.txt
+
+COPY backend/ /app/
+
+EXPOSE 8000
+
+# --timeout-graceful-shutdown 30s：停止接受新请求后等待活跃请求完成再退出
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "30"]

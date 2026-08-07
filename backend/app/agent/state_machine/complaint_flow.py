@@ -1,0 +1,147 @@
+"""投诉状态机（LangGraph）。
+
+节点链: collect_complaint_type → collect_description → severity_assess(deepseek-reasoner) → execute → notify
+complaint_type 由意图分类 slots 或从描述关键词提取；severity 由 reasoner 评估（HIGH/MEDIUM/LOW）。
+"""
+import json
+import re
+from typing import TypedDict
+
+from langgraph.graph import END
+
+from app.agent.state_machine.base import BaseStateMachine
+from app.agent.state_machine.edges import is_deny
+from app.config import settings
+from app.infrastructure.deepseek import deepseek_client
+from app.services import complaint_service
+from app.utils.logger import logger
+
+COMPLAINT_TYPES = {"商品质量", "物流问题", "服务态度", "价格问题", "其他"}
+
+
+class ComplaintState(TypedDict, total=False):
+    user_id: int
+    session_id: str
+    order_id: str
+    complaint_type: str
+    description: str
+    severity: str
+    result: dict
+    user_input: str
+    stage: str
+    message: str
+    awaiting: str
+    final: bool
+
+
+def _guess_type(text: str) -> str:
+    if any(k in text for k in ("质量", "破损", "瑕疵", "坏了")):
+        return "商品质量"
+    if any(k in text for k in ("物流", "快递", "发货", "配送")):
+        return "物流问题"
+    if any(k in text for k in ("服务", "态度", "客服")):
+        return "服务态度"
+    if any(k in text for k in ("价格", "贵", "降价")):
+        return "价格问题"
+    return "其他"
+
+
+async def _assess_severity(description: str) -> str:
+    """reasoner 评估投诉严重性。异常/超时降级 MEDIUM。"""
+    try:
+        data = await deepseek_client.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是客服工单严重性评估员。根据用户投诉内容评估严重性，只输出 JSON："
+                        '{"severity":"HIGH|MEDIUM|LOW"}。'
+                        "HIGH=人身安全/批量质量问题/涉及金额>5000元；MEDIUM=一般服务或质量问题；LOW=建议反馈。"
+                    ),
+                },
+                {"role": "user", "content": description},
+            ],
+            model=settings.deepseek_model_reasoner,
+            timeout=settings.deepseek_timeout_reasoner,
+        )
+        raw = data["choices"][0]["message"]["content"]
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        severity = json.loads(m.group(0)).get("severity", "MEDIUM")
+        if severity in ("HIGH", "MEDIUM", "LOW"):
+            return severity
+    except Exception as exc:
+        logger.warning("event=severity_assess_fallback error=%s", str(exc))
+    return "MEDIUM"
+
+
+async def _collect_complaint_type(state):
+    ct = state.get("complaint_type")
+    if ct in COMPLAINT_TYPES:
+        return {"stage": "collect_description", "awaiting": None}
+    ui = (state.get("user_input") or "").strip()
+    guessed = _guess_type(ui) if ui else None
+    if guessed:  # 用户直接描述了问题 → 推断类型并推进
+        return {"complaint_type": guessed, "awaiting": None, "stage": "collect_description"}
+    return {"stage": "collect_complaint_type", "awaiting": "complaint_type", "message": "请问您投诉哪类问题？商品质量 / 物流 / 服务态度 / 其他"}
+
+
+async def _collect_description(state):
+    desc = (state.get("user_input") or "").strip()
+    if state.get("awaiting") == "description":
+        if is_deny(desc):
+            return {"stage": END, "final": True, "message": "已取消投诉"}
+        if not desc:
+            return {"stage": "collect_description", "awaiting": "description", "message": "请详细描述您遇到的问题，方便我们跟进"}
+        ct = state.get("complaint_type")
+        if ct not in COMPLAINT_TYPES:
+            ct = _guess_type(desc)
+        return {"description": desc, "complaint_type": ct, "awaiting": None, "stage": "severity_assess"}
+    if state.get("description"):
+        return {"stage": "severity_assess", "awaiting": None}
+    return {"stage": "collect_description", "awaiting": "description", "message": "请详细描述您遇到的问题，方便我们跟进"}
+
+
+async def _severity_assess(state):
+    severity = await _assess_severity(state["description"])
+    logger.info("event=severity_assessed", extra={"severity": severity})
+    return {"severity": severity, "stage": "execute"}
+
+
+async def _execute(state):
+    result = await complaint_service.create_complaint(
+        user_id=state["user_id"],
+        order_id=state.get("order_id"),
+        complaint_type=state.get("complaint_type", ""),
+        description=state.get("description", ""),
+        severity=state.get("severity", "MEDIUM"),
+        session_id=state["session_id"],
+    )
+    return {
+        "result": {
+            "success": result.success,
+            "ticket_id": result.ticket_id,
+            "severity": result.severity,
+        },
+        "stage": "notify",
+    }
+
+
+async def _notify(state):
+    r = state["result"]
+    if r["success"]:
+        sev_desc = {"HIGH": "紧急处理", "MEDIUM": "24小时内跟进", "LOW": "24小时内回复"}.get(r["severity"], "尽快处理")
+        msg = f"投诉工单已创建（工单号 {r['ticket_id']}），严重级别：{r['severity']}，我们将{sev_desc}。"
+    else:
+        msg = "投诉工单创建失败，请稍后重试或拨打客服热线 400-XXX-XXXX"
+    return {"stage": END, "final": True, "message": msg}
+
+
+class ComplaintFlow(BaseStateMachine):
+    STATE_TYPE = ComplaintState
+    NODES = {
+        "collect_complaint_type": _collect_complaint_type,
+        "collect_description": _collect_description,
+        "severity_assess": _severity_assess,
+        "execute": _execute,
+        "notify": _notify,
+    }

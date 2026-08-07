@@ -1,0 +1,23 @@
+# 前端镜像 — 多阶段构建
+# 生产模式: 前端静态产物 + nginx 反代 打进同一个镜像，单入口暴露 :80。
+# 开发模式请使用 Vite dev server (npm run dev)，不依赖本镜像。
+#
+# 构建:
+#   docker build -f docker/Dockerfile.frontend -t cs-frontend .
+# 运行(需与 backend 同网络，nginx.conf 里 upstream backend:8000):
+#   docker run -p 80:80 --network cs-net cs-frontend
+
+# --- 阶段 1: 构建前端产物 ---
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY frontend/package.json /app/package.json
+COPY frontend/package-lock.json* /app/
+RUN npm ci
+COPY frontend/ /app/
+RUN npm run build
+
+# --- 阶段 2: nginx 托管 ---
+FROM nginx:alpine
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80

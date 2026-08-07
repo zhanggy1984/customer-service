@@ -1,0 +1,27 @@
+# ============ Phase 1: Web 框架 / DB / 认证 / 客户端 ============
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+httpx==0.27.2
+redis==5.2.1
+asyncmy==0.2.9
+SQLAlchemy[asyncio]==2.0.36
+pydantic==2.10.4
+pydantic-settings==2.7.0
+bcrypt==4.2.1
+PyJWT==2.10.1
+python-multipart==0.0.20
+
+# ============ Phase 2: RAG ============
+# pip 无 1.4.4（服务端 chromadb/chroma:latest 版本）；1.4.1 是最接近的同 minor 可用版
+# 0.5.x 客户端与 1.x 服务协议不兼容
+chromadb==1.4.1
+sentence-transformers==3.3.1
+# torch 由 Dockerfile.backend 单独安装 CPU 版（PyPI 默认 CUDA 版过大）
+
+# ============ Phase 3: 状态机 ============
+langgraph==0.2.60
+langchain-core==0.3.25
+
+# ============ Phase 5: 测试 ============
+pytest==8.3.3
+pytest-asyncio==0.24.0

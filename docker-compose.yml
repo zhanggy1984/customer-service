@@ -1,0 +1,111 @@
+# 智能客服系统 — Docker Compose
+#
+# 用法:
+#   docker compose up -d          # 启动全部服务
+#   docker compose down           # 停止
+#
+# 开发模式: 前端跑本地 Vite dev server (localhost:5173, proxy /api -> localhost:8000),
+#           nginx 作为生产入口(静态产物 + /api 反代)。
+services:
+  nginx:
+    image: nginx:latest   # 本地无 nginx:alpine（Docker Hub 拉取超时），用本地已有的 nginx:latest
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      # 前端静态产物。Phase 1 为空占位(见 frontend/dist/.gitkeep)，
+      # 前端构建后 dist 产物挂载到这里即可被 nginx 直接 serve。
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    # 开发阶段 1 个实例。Phase 4 高并发时可扩为 3:
+    #   deploy:
+    #     replicas: 3
+    # 注意: 扩展多实例前需解决 ChromaDB 共享 volume 多实例并发写问题(Phase 2 引入)。
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - CHROMA_HOST=chroma   # 独立 chroma 服务（HttpClient 模式）
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    volumes:
+      # HF 模型缓存 volume，防止 rebuild 后 bge 模型重新下载
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      chroma:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  chroma:
+    image: chromadb/chroma:latest   # 独立向量服务（1.4.4，Rust 重写版）
+    # 映射到 8001：宿主机 8000 已被 backend 占用（chroma 容器内端口 8000）
+    ports:
+      - "8001:8000"
+    environment:
+      - ANONYMIZED_TELEMETRY=FALSE
+      - PERSIST_DIRECTORY=/data
+    volumes:
+      - chroma_data:/data
+    healthcheck:
+      # chroma 1.x 无 version 子命令，改用 bash TCP 探测 8000（服务 API 端口）
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7   # 本地无 redis:7-alpine，用本地已有的 redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: customer_service
+      MYSQL_USER: csuser
+      MYSQL_PASSWORD: cspass
+    # asyncmy 对 mysql_native_password 兼容最稳；mysql:8.0 仍支持该插件
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-prootpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  redis_data:
+  chroma_data:
+  hf_cache:

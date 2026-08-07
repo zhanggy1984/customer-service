@@ -1,0 +1,29 @@
+"""规则引擎：LLM 全部不可用时兜底。
+
+10 条正则规则 O(n) 顺序匹配，零外部依赖，回复含客服热线。
+触发条件: 熔断器判定 KeyPool.all_cooling() == True。
+"""
+import re
+
+RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"退货|退换|不想要"), "您可以申请退货：签收 7 天内支持无理由退货，请提供订单号，我帮您办理。客服热线 400-XXX-XXXX"),
+    (re.compile(r"退款|退钱|仅退款"), "未发货订单可直接申请仅退款；已发货请先拒收。请提供订单号。客服热线 400-XXX-XXXX"),
+    (re.compile(r"订单|物流|快递|到哪|发货"), "您想查询订单或物流吗？请提供订单号，我帮您查询。客服热线 400-XXX-XXXX"),
+    (re.compile(r"投诉|举报|不满意|差评"), "很抱歉给您带来不好的体验，您的反馈已记录，我们会尽快处理。客服热线 400-XXX-XXXX"),
+    (re.compile(r"人工|转人工|客服"), "人工客服热线：400-XXX-XXXX（9:00-21:00）。"),
+    (re.compile(r"政策|规则|条件|时限|多久"), "签收 7 天内支持无理由退货，质量问题 48 小时内可免费退换。客服热线 400-XXX-XXXX"),
+    (re.compile(r"你好|您好|hi|hello|在吗"), "您好！我是智能客服，可以帮您查询订单、办理退货退款。客服热线 400-XXX-XXXX"),
+    (re.compile(r"运费|邮费|包邮"), "质量问题退货运费由商家承担；无理由退货按是否包邮判定。客服热线 400-XXX-XXXX"),
+    (re.compile(r"发票|开票"), "订单签收后可申请电子发票，1 个工作日内开具。客服热线 400-XXX-XXXX"),
+    (re.compile(r"质保|维修|保质|坏了"), "电子产品质保 12 个月，质保期内非人为损坏免费维修。客服热线 400-XXX-XXXX"),
+]
+
+DEFAULT_REPLY = "系统繁忙，请稍后再试，或拨打客服热线 400-XXX-XXXX。"
+
+
+def match_rule(text: str) -> str:
+    """返回命中规则的回复；未命中返回 catch-all。"""
+    for pattern, reply in RULES:
+        if pattern.search(text):
+            return reply
+    return DEFAULT_REPLY
