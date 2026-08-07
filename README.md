@@ -2,7 +2,7 @@
 
 高并发 AI Agent 智能客服系统：面向电商售后场景，支持**退换货政策查询、订单状态查询、退货、仅退款、投诉**等完整业务闭环，并具备从 **Agent 编排、RAG 检索、存储高可用到 LLM 网关治理**的全链路工程化能力。
 
-**架构不妥协**：前端、后端、向量库、存储全部组件化，可独立水平扩展，目标承载 10000 QPS 的峰值流量。
+**架构不妥协**：前端、后端、向量库、存储全部组件化，可独立水平扩展，为大并发峰值流量而设计。
 
 ---
 
@@ -21,7 +21,7 @@
 以真实电商售后的高频场景为蓝本，构建一套**生产级 AI Agent 客服系统**的完整形态：
 
 - **业务深度**：不止于"问答"，而是用状态机驱动**可完成的业务动作**——退货、仅退款、投诉，每一步落到数据库，结果真实可查。
-- **架构高度**：10000 QPS 不是口号——DeepSeek 多 Key 网关、RAG 缓存、存储双写容灾、熔断降级，每一层都为高并发做了针对性设计。
+- **架构高度**：高并发不是口号——DeepSeek 多 Key 网关、RAG 缓存、存储双写容灾、熔断降级，每一层都为高并发做了针对性设计。
 - **工程完整度**：JWT 认证、Admin 管理后台、SSE 流式交互、JSON 结构化日志、单元/集成/组件测试全覆盖。
 
 ## 1.2 核心业务功能
@@ -57,7 +57,7 @@
 ## 2.1 总体架构
 
 ```
-用户 ←── HTTPS ──→ Nginx :80（10000r/s 限流 + SSE 反代）
+用户 ←── HTTPS ──→ Nginx :80（高并发限流 + SSE 反代）
                      ├─ /        → 前端静态文件
                      └─ /api/*   → FastAPI Agent API（可多实例水平扩展）
                                     │
@@ -117,10 +117,90 @@ INPUT → [1.预处理] → [2.意图识别+切换] → [3.上下文装配] → 
 
 **模型路由**：意图分类/响应/闲聊走 `deepseek-chat`（200ms-1s）；退货/退款资格判定、投诉严重性评估走 `deepseek-reasoner`（1-3s），超时降级 chat。
 
+### 状态数据结构（LangGraph State）
+
+状态机的核心是一个**可 JSON 序列化的 dict（TypedDict）**，在节点间流转，由每轮用户输入驱动推进。
+
+**通用字段**（三个流程共用）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `user_id` | int | 会话用户（JWT 鉴权后注入） |
+| `session_id` | str | 会话 ID |
+| `order_id` | str \| 空 | 业务订单号（如 ORD-...，流程中收集） |
+| `user_input` | str | 本轮用户输入（每轮注入） |
+| `stage` | str | **当前节点名**，图的唯一路由依据 |
+| `awaiting` | str \| None | 等待输入的节点名；非空表示正等待用户输入 |
+| `message` | str | 回复文案（追问 / 确认 / 最终结果） |
+| `final` | bool | 是否终态（流程结束） |
+
+**业务字段**（按节点写入）：
+
+| 字段 | 类型 | 何时写入 | 说明 |
+|------|------|---------|------|
+| `order` | dict | verify_order 后 | 订单快照（含商品明细，见下方结构） |
+| `eligibility` | dict | check_eligibility 后 | 退货/退款资格判定结果 |
+| `result` | dict | execute 后 | 退单/退款执行结果 |
+| `reason` | str | collect_reason 后 | 退货/退款原因 |
+| `complaint_type` / `description` / `severity` | str | 投诉流程 | 投诉类型 / 描述 / 严重性（HIGH/MEDIUM/LOW） |
+
+**嵌套结构**（可直接落库/序列化）：
+
+```python
+# order：订单快照（query_order 结果转 dict）
+{
+  "db_id": 47,                          # 内部主键（创建退单时更新商品状态用）
+  "order_id": "ORD-20240801-001",
+  "status": "DELIVERED",
+  "total_amount": 69.70,
+  "shipping_address": "上海市...",
+  "delivered_at": "2026-08-03T15:00:00",   # 参与"超7天退货期"判定
+  "items": [
+    {"item_id": "SKU-001", "name": "手机壳", "price": 29.90,
+     "quantity": 1, "returnable": true, "status": "NORMAL"}
+  ]
+}
+
+# eligibility：资格判定结果（check_eligibility 返回）
+{
+  "eligible": true,
+  "refund_amount": 69.70,
+  "items": [{"item_id": "SKU-001", "name": "手机壳", "price": 29.90, "quantity": 1}]
+}
+
+# result：执行结果（create_return / create_refund 返回）
+{
+  "success": true,
+  "status": "APPROVED",
+  "return_id": "RC-1786097506282",
+  "refund_amount": 69.70,
+  "message": "ok"
+}
+```
+
+**执行模型**（每轮推进一个节点）：
+
+```
+第 N 轮用户输入
+  → 注入 user_input 进 state
+  → START 按 state.stage 路由到目标节点
+  → 节点执行，返回部分更新（LangGraph 自动浅合并，推进 stage）
+  → 节点返回 awaiting（等待输入）或 final（终态）则本轮结束，等待下一轮
+```
+
+以退货流程为例，state 随对话逐节点变化：
+
+| 用户输入 | 经过节点 | stage | awaiting | 关键变化 |
+|---------|---------|-------|----------|---------|
+| 「我要退货 ORD-...」 | collect_order_id → verify_order | verify_order | — | 提取 order_id |
+| （自动） | check_eligibility | collect_reason | reason | 写入 order、eligibility |
+| 「质量问题」 | collect_reason | confirm | confirm | 写入 reason |
+| 「确认」 | confirm → execute → notify | END | — | 写入 result，final=True |
+
 ## 2.4 技术闪光点
 
 ### ① DeepSeek Gateway：多 Key 池化 + 排队背压 + 熔断（高并发核心）
-单 Key RPM ≈200，撑不起万级 QPS，但**控制并发比加连接数更重要**：
+单 Key 有 RPM 上限，撑不起海量并发，但**控制并发比加连接数更重要**：
 - **KeyPool**：多 Key 滑动窗口 RPM 追踪，选负载最低的 healthy Key；429 → 自动冷却，5xx → 换 Key 重试（最多 2 次）。
 - **排队背压**：无 healthy Key 时排队 2s，超时返回容量告警，不无限堆积。
 - **熔断降级**：全部 Key 冷却 → 触发规则引擎（10 条正则，O(n) 匹配，回复含客服热线），**系统永不因 LLM 故障而崩溃**。
