@@ -440,7 +440,7 @@ async def _finalize_node(state: AgentState) -> dict:
 
 
 def _route_after_preprocess(state: AgentState) -> str:
-    return "finalize" if state.get("injection_detected") else "intent"
+    return "finalize" if state.get("injection_detected") else "intent_recognition"
 
 
 def _route_after_intent(state: AgentState) -> str:
@@ -457,7 +457,7 @@ def _route_after_intent(state: AgentState) -> str:
 def _build_agent_graph():
     builder = StateGraph(AgentState)
     builder.add_node("preprocess", _preprocess_node)
-    builder.add_node("intent", _intent_node)
+    builder.add_node("intent_recognition", _intent_node)
     builder.add_node("business_flow", _business_flow_node)
     builder.add_node("order_status", _order_status_node)
     builder.add_node("policy", _policy_node)
@@ -465,10 +465,10 @@ def _build_agent_graph():
     builder.add_node("finalize", _finalize_node)
     builder.add_edge(START, "preprocess")
     builder.add_conditional_edges(
-        "preprocess", _route_after_preprocess, {"finalize": "finalize", "intent": "intent"}
+        "preprocess", _route_after_preprocess, {"finalize": "finalize", "intent_recognition": "intent_recognition"}
     )
     builder.add_conditional_edges(
-        "intent", _route_after_intent,
+        "intent_recognition", _route_after_intent,
         {"business_flow": "business_flow", "order_status": "order_status",
          "policy": "policy", "chitchat": "chitchat"},
     )
