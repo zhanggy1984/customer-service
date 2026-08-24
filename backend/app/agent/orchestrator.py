@@ -9,6 +9,9 @@ INPUT → [1.预处理] → [2.意图识别+切换] → [3.上下文装配] → 
 import re
 import time
 from functools import wraps
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from app.agent import usage
 from app.agent.intent import IntentResult, classify_intent
@@ -278,40 +281,50 @@ async def _handle_chitchat(
     return "".join(buf), True
 
 
-@_rule_engine_fallback
-async def run_agent(session: Session, user_message: str, user_id: int, emit=None) -> str:
-    """单轮对话：6 阶段流水线。emit 为可选的 SSE 事件回调。
+# ==================== 顶层 LangGraph 图（P2）====================
+# 6 阶段命令式流水线的图化编排：preprocess → intent → [business_flow/order_status/
+# policy/chitchat] → finalize。节点函数与下方 run_agent 改造前的 if/else 逻辑逐行对应，
+# 行为逐位等价。langgraph 语义实测验证的硬约束（改动前务必复核）：
+# - usage.begin() 必须在 ainvoke 之前调用：langgraph 每节点 contextvar 上下文拷贝，
+#   节点内 begin()（_ctx.set 新 dict）只影响该节点拷贝、聚合会丢；accumulate() 就地修改
+#   dict（contextvar 值对象共享引用）才对后续节点与调用方可见。
+# - 节点返回 dict 是浅合并（顶层 key 整体替换），只允许返回 AgentState schema 内 key
+#   （schema 外 key 被静默丢弃）；tool_calls/reasoning 的 pop 在状态机 step() 返回的
+#   普通 dict 上做，不进图 state。
+class AgentState(TypedDict, total=False):
+    session: Session  # 跨轮持久状态，可变引用，节点直接改字段
+    user_message: str
+    user_id: int
+    emit: Any  # 每轮 SSE 回调闭包；Any 规避 Callable 推断噪音
+    intent: str  # intent 节点产出 → 路由 + 分支消费
+    intent_result: IntentResult
+    injection_detected: bool  # preprocess 产出 → 路由短路
+    reply: str  # 分支产出 → finalize
+    answer_streamed: bool
 
-    契约透出（评测 §5.1）：
-    - answer.delta：终答增量。LLM 生成（chitchat/policy）逐段流式；静态/规则话术全量补发。
-    - usage：本轮所有 LLM 调用（意图分类/回复生成/severity/policy）token 全计，done 前单条 emit。
-    - tool_call / reasoning：状态机业务动作与查询动作观测式透出，emit 后从 state 移除防累积。
-    """
-    t0 = time.perf_counter()
-    usage.begin()  # 本轮 usage 聚合起点（contextvar 按 task 隔离）
 
-    async def status(stage: str, msg: str) -> None:
-        if emit:
-            await emit({"type": "status", "stage": stage, "message": msg})
+async def _emit_status(state: AgentState, stage: str, msg: str) -> None:
+    emit = state.get("emit")
+    if emit:
+        await emit({"type": "status", "stage": stage, "message": msg})
 
-    async def finalize(reply: str, streamed: bool) -> str:
-        """统一出口：未流式则全量补发 answer.delta；随后发聚合 usage；返回 reply。"""
-        if emit and not streamed:
-            await emit(answer_event(reply))
-        if emit:
-            await emit(usage_event(usage.current()))
-        return reply
 
-    # ===== 阶段 1: 预处理（注入检测）=====
-    await status("preprocess", "正在处理您的问题...")
-    if _detect_injection(user_message):
-        logger.warning("event=injection_detected", extra={"session_id": session.session_id, "user_id": user_id})
-        return await finalize("检测到可能的异常输入，为了安全已忽略。请正常描述您的问题。", False)
+async def _preprocess_node(state: AgentState) -> dict:
+    session = state["session"]
+    await _emit_status(state, "preprocess", "正在处理您的问题...")
+    if _detect_injection(state["user_message"]):
+        logger.warning("event=injection_detected", extra={"session_id": session.session_id, "user_id": state["user_id"]})
+        return {"injection_detected": True,
+                "reply": "检测到可能的异常输入，为了安全已忽略。请正常描述您的问题。",
+                "answer_streamed": False}
+    return {"injection_detected": False}
 
-    # ===== 阶段 2: 意图识别 + 切换判断 =====
-    await status("intent", "正在理解您的问题...")
+
+async def _intent_node(state: AgentState) -> dict:
+    session = state["session"]
+    user_message = state["user_message"]
+    await _emit_status(state, "intent", "正在理解您的问题...")
     in_business_flow = session.intent in FLOWS and bool(session.agent_state)
-
     if in_business_flow:
         # 进行中的业务状态机：分类结果判断推进还是切换
         intent_result = await classify_intent(user_message, _state_context(session))
@@ -330,77 +343,171 @@ async def run_agent(session: Session, user_message: str, user_id: int, emit=None
         intent = intent_result.intent
     usage.accumulate(intent_result.usage)  # 意图分类的 token 计入本轮聚合
     logger.info("event=stage_intent", extra={"session_id": session.session_id, "intent": intent})
+    return {"intent": intent, "intent_result": intent_result}
 
-    # ===== 阶段 3+4+5: 上下文装配 + 状态推进 + 动作执行 =====
-    reply = ""
-    answer_streamed = False  # LLM 路径已逐段透出 answer，末尾不再全量补发
 
-    if intent in FLOWS:
-        # 有快照 → 恢复（用户回到该意图）
-        if not session.agent_state and session.snapshots.get(intent):
-            session.agent_state = session.snapshots.pop(intent)
-            session.intent = intent
-            logger.info("event=snapshot_restored", extra={"session_id": session.session_id, "intent": intent})
-        if not session.agent_state:
-            session.agent_state = _init_state(intent, intent_result, session, user_id)
-            await status("order_query", "正在为您办理...")
-        else:
-            await status("order_query", "正在处理...")
-        # 多轮补充指定退货商品：LLM 在任意推进轮都可能提取 items 槽。若仅 _init_state 注入，
-        # 后轮（如先"我要退货 ORD-001"再"只退手机壳"）会被丢弃且被误当退货原因、按全量确认。
-        # 此处合并本轮 items（LLM 未提取时用"只退/就退/只要退 + 商品名"句式规则兜底）；
-        # 资格已算过（已过 check_eligibility）则回到该节点携带新子集重算。
-        if intent == "RETURN_REQUEST" and session.agent_state:
-            items = (intent_result.slots or {}).get("items") or _extract_partial_items(user_message)
-            if items:
-                merged = {**session.agent_state, "return_items": items}
-                if merged.get("stage") in ("collect_reason", "confirm"):
-                    merged.update({"stage": "check_eligibility", "eligibility": None, "awaiting": None})
-                session.agent_state = merged
-        new_state = await FLOWS[intent].step(session.agent_state, user_message)
-        # 透出观测事件（契约 tool_call/reasoning）：node 返回值携带；无条件取走防 state 残留
-        for call in (new_state.pop("tool_calls", None) or []):
-            if emit:
-                await emit(tool_call_event({"id": str(time.time_ns()), **call}))
-        r = new_state.pop("reasoning", None)
-        if r and emit:
-            await emit(reasoning_event(r))
-        session.agent_state = new_state
+async def _business_flow_node(state: AgentState) -> dict:
+    session = state["session"]
+    intent = state["intent"]
+    intent_result = state["intent_result"]
+    user_message = state["user_message"]
+    user_id = state["user_id"]
+    emit = state.get("emit")
+
+    # 有快照 → 恢复（用户回到该意图）
+    if not session.agent_state and session.snapshots.get(intent):
+        session.agent_state = session.snapshots.pop(intent)
         session.intent = intent
-        reply = new_state.get("message", "")
-        # 到达确认节点 → 通知前端渲染 ConfirmButton。
-        # 注意必须先排除 final：取消时 _confirm 返回 final 但 awaiting 残留旧值 "confirm"，
-        # 若不排除会在取消响应里误发 confirm action，导致前端确认按钮残留。
-        if not new_state.get("final") and new_state.get("awaiting") == "confirm" and emit:
-            await emit({"type": "action", "action": "confirm", "intent": intent})
-        if new_state.get("final"):
-            session.agent_state = None
-            session.intent = None
-
-    elif intent == "ORDER_STATUS":
-        await status("order_query", "正在查询订单...")
-        reply = await _handle_order_status(user_id, intent_result.slots, emit)
-
-    elif intent == "POLICY_INQUIRY":
-        await status("rag", "正在检索政策...")
-        try:
-            reply, answer_streamed = await _handle_policy(user_message, emit)
-        except LLM_FALLBACK_ERRORS:
-            raise  # 熔断 → 传播给装饰器 → 规则引擎
-        except Exception:
-            reply, answer_streamed = "系统繁忙，请稍后再试。", False
+        logger.info("event=snapshot_restored", extra={"session_id": session.session_id, "intent": intent})
+    if not session.agent_state:
+        session.agent_state = _init_state(intent, intent_result, session, user_id)
+        await _emit_status(state, "order_query", "正在为您办理...")
+    else:
+        await _emit_status(state, "order_query", "正在处理...")
+    # 多轮补充指定退货商品：LLM 在任意推进轮都可能提取 items 槽。若仅 _init_state 注入，
+    # 后轮（如先"我要退货 ORD-001"再"只退手机壳"）会被丢弃且被误当退货原因、按全量确认。
+    # 此处合并本轮 items（LLM 未提取时用"只退/就退/只要退 + 商品名"句式规则兜底）；
+    # 资格已算过（已过 check_eligibility）则回到该节点携带新子集重算。
+    if intent == "RETURN_REQUEST" and session.agent_state:
+        items = (intent_result.slots or {}).get("items") or _extract_partial_items(user_message)
+        if items:
+            merged = {**session.agent_state, "return_items": items}
+            if merged.get("stage") in ("collect_reason", "confirm"):
+                merged.update({"stage": "check_eligibility", "eligibility": None, "awaiting": None})
+            session.agent_state = merged
+    new_state = await FLOWS[intent].step(session.agent_state, user_message)
+    # 透出观测事件（契约 tool_call/reasoning）：node 返回值携带；在普通 dict 上 pop 防残留
+    for call in (new_state.pop("tool_calls", None) or []):
+        if emit:
+            await emit(tool_call_event({"id": str(time.time_ns()), **call}))
+    r = new_state.pop("reasoning", None)
+    if r and emit:
+        await emit(reasoning_event(r))
+    session.agent_state = new_state
+    session.intent = intent
+    reply = new_state.get("message", "")
+    # 到达确认节点 → 通知前端渲染 ConfirmButton。
+    # 注意必须先排除 final：取消时 _confirm 返回 final 但 awaiting 残留旧值 "confirm"，
+    # 若不排除会在取消响应里误发 confirm action，导致前端确认按钮残留。
+    if not new_state.get("final") and new_state.get("awaiting") == "confirm" and emit:
+        await emit({"type": "action", "action": "confirm", "intent": intent})
+    if new_state.get("final"):
         session.agent_state = None
         session.intent = None
+    return {"reply": reply, "answer_streamed": False}
 
-    else:  # CHITCHAT
-        reply, answer_streamed = await _handle_chitchat(session, user_message, user_id, emit)
-        session.agent_state = {"chitchat_round": (session.agent_state or {}).get("chitchat_round", 0) + 1}
-        session.intent = intent
 
-    # ===== 阶段 6: 响应生成（统一出口）=====
-    logger.info(
-        "event=request_out",
-        extra={"session_id": session.session_id, "intent": intent,
-               "ms": round((time.perf_counter() - t0) * 1000)},
+async def _order_status_node(state: AgentState) -> dict:
+    await _emit_status(state, "order_query", "正在查询订单...")
+    reply = await _handle_order_status(state["user_id"], state["intent_result"].slots, state.get("emit"))
+    return {"reply": reply, "answer_streamed": False}
+
+
+async def _policy_node(state: AgentState) -> dict:
+    session = state["session"]
+    await _emit_status(state, "rag", "正在检索政策...")
+    try:
+        reply, answer_streamed = await _handle_policy(state["user_message"], state.get("emit"))
+    except LLM_FALLBACK_ERRORS:
+        raise  # 熔断 → 冒泡给装饰器 → 规则引擎
+    except Exception:
+        reply, answer_streamed = "系统繁忙，请稍后再试。", False
+    session.agent_state = None
+    session.intent = None
+    return {"reply": reply, "answer_streamed": answer_streamed}
+
+
+async def _chitchat_node(state: AgentState) -> dict:
+    session = state["session"]
+    reply, answer_streamed = await _handle_chitchat(
+        session, state["user_message"], state["user_id"], state.get("emit")
     )
-    return await finalize(reply, answer_streamed)
+    session.agent_state = {"chitchat_round": (session.agent_state or {}).get("chitchat_round", 0) + 1}
+    session.intent = state["intent"]
+    return {"reply": reply, "answer_streamed": answer_streamed}
+
+
+async def _finalize_node(state: AgentState) -> dict:
+    """统一出口：未流式则全量补发 answer.delta；随后发聚合 usage。"""
+    emit = state.get("emit")
+    reply = state["reply"]
+    streamed = state["answer_streamed"]
+    if emit and not streamed:
+        await emit(answer_event(reply))
+    if emit:
+        await emit(usage_event(usage.current()))
+    return {"reply": reply}
+
+
+def _route_after_preprocess(state: AgentState) -> str:
+    return "finalize" if state.get("injection_detected") else "intent"
+
+
+def _route_after_intent(state: AgentState) -> str:
+    intent = state.get("intent")
+    if intent in FLOWS:
+        return "business_flow"
+    if intent == "ORDER_STATUS":
+        return "order_status"
+    if intent == "POLICY_INQUIRY":
+        return "policy"
+    return "chitchat"
+
+
+def _build_agent_graph():
+    builder = StateGraph(AgentState)
+    builder.add_node("preprocess", _preprocess_node)
+    builder.add_node("intent", _intent_node)
+    builder.add_node("business_flow", _business_flow_node)
+    builder.add_node("order_status", _order_status_node)
+    builder.add_node("policy", _policy_node)
+    builder.add_node("chitchat", _chitchat_node)
+    builder.add_node("finalize", _finalize_node)
+    builder.add_edge(START, "preprocess")
+    builder.add_conditional_edges(
+        "preprocess", _route_after_preprocess, {"finalize": "finalize", "intent": "intent"}
+    )
+    builder.add_conditional_edges(
+        "intent", _route_after_intent,
+        {"business_flow": "business_flow", "order_status": "order_status",
+         "policy": "policy", "chitchat": "chitchat"},
+    )
+    for branch in ("business_flow", "order_status", "policy", "chitchat"):
+        builder.add_edge(branch, "finalize")
+    builder.add_edge("finalize", END)
+    return builder.compile()
+
+
+AGENT_GRAPH = _build_agent_graph()  # 模块加载编译一次（无状态单例，state 每轮独立）
+
+
+@_rule_engine_fallback
+async def run_agent(session: Session, user_message: str, user_id: int, emit=None) -> str:
+    """单轮对话：顶层 LangGraph 图驱动 6 阶段流水线（行为与命令式版本逐位等价）。
+
+    契约透出（评测 §5.1）：
+    - answer.delta：终答增量。LLM 生成（chitchat/policy）逐段流式；静态/规则话术全量补发。
+    - usage：本轮所有 LLM 调用（意图分类/回复生成/severity/policy）token 全计，done 前单条 emit。
+    - tool_call / reasoning：状态机业务动作与查询动作观测式透出，emit 后从 state 移除防累积。
+    """
+    t0 = time.perf_counter()
+    # 硬约束：usage.begin() 必须在 ainvoke 之前。langgraph 每节点 contextvar 上下文拷贝，
+    # 节点内 begin()（_ctx.set 新 dict）只影响该节点拷贝、聚合会丢；accumulate() 就地修改
+    # dict（值对象共享引用）才对后续节点与调用方可见。
+    usage.begin()
+
+    result = await AGENT_GRAPH.ainvoke({
+        "session": session,
+        "user_message": user_message,
+        "user_id": user_id,
+        "emit": emit,
+    })
+    reply = result["reply"]
+    # 注入路径不经过 intent 节点（无 intent key），与旧实现一致不记 request_out
+    if result.get("intent"):
+        logger.info(
+            "event=request_out",
+            extra={"session_id": session.session_id, "intent": result["intent"],
+                   "ms": round((time.perf_counter() - t0) * 1000)},
+        )
+    return reply
