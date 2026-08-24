@@ -42,10 +42,12 @@ export async function streamChat(sid: string, content: string, handlers: SSEHand
     const events = buffer.split('\n\n')
     buffer = events.pop() ?? ''
     for (const chunk of events) {
-      const line = chunk.trim()
-      if (!line.startsWith('data:')) continue
+      // 兼容两种帧格式：旧 `data: {...}` 与契约新格式 `event: <type>\ndata: {...}`。
+      // 逐行取第一条 data: 行，event: 帧头透明忽略。
+      const dataLine = chunk.split('\n').find((l) => l.trim().startsWith('data:'))
+      if (!dataLine) continue
       try {
-        const evt = JSON.parse(line.slice(5))
+        const evt = JSON.parse(dataLine.trim().slice(5))
         if (evt.type === 'status') handlers.onStatus?.(evt.message || '')
         else if (evt.type === 'action') handlers.onAction?.(evt.action, evt.intent || '')
         else if (evt.type === 'done') handlers.onDone?.(evt.content || '', evt.session_id)

@@ -11,9 +11,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.agent import usage
 from app.agent.orchestrator import run_agent
-from app.agent.response import sse_format
+from app.agent.response import answer_event, sse_format, usage_event
 from app.api.deps import get_current_user, require_admin
+from app.config import settings
 from app.infrastructure.mysql import mysql_pool
 from app.rag import kb_store
 from app.session.locks import session_locks
@@ -55,6 +57,18 @@ async def send_message(
         async def emit(evt: dict) -> None:
             await queue.put(evt)
 
+        # 首帧 meta（契约 §5.1，可选）：agent/model/interface/contract_version。
+        # git_sha/knowledge_version 当前无版本管理机制，透出空串。
+        await emit({
+            "type": "meta",
+            "agent": "customer-service",
+            "model": settings.deepseek_model_chat,
+            "interface": "sessions/{sid}/messages",
+            "contract_version": "1.0",
+            "git_sha": "",
+            "knowledge_version": "",
+        })
+
         async def run_and_finish() -> None:
             async with lock:  # 同一 session 串行
                 session = await session_manager.get_session(sid)
@@ -69,6 +83,10 @@ async def send_message(
                 try:
                     if created_new:
                         reply = "您好！请问有什么可以帮您？可以查询订单、退货、退款等。"
+                        # 契约 §5.1：greeting 无 LLM 调用，answer 全量补发（评测端首个 answer.delta 即 TTFT
+                        # 起点，且按 answer.delta 拼接最终回复）+ usage 补发（字段齐全）。
+                        await emit(answer_event(reply))
+                        await emit(usage_event(usage.current()))
                     else:
                         reply = await run_agent(session, req.content, int(user["sub"]), emit)
                     session.messages.append(Message(role="assistant", content=reply))

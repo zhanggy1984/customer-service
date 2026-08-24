@@ -32,6 +32,8 @@ def build_intent_prompt(user_input: str, current_state_context: str | None = Non
 - RETURN_REQUEST 特有可选槽位 items：仅当用户明确指定只退订单中的部分商品时，填要退的商品名数组（如 ["手机壳"]）；用户未指定商品时省略该字段（表示退全部可退商品）
 - REFUND_REQUEST 不提取 items（仅退款针对整单可退金额，商品不单独指定）
 - summary 用中文，10-20 字
+- POLICY_INQUIRY 判定规则：用户用疑问句询问政策可行性/条件/时效/边界/流程（含『可以吗/能吗/可不可以/能不能/多久/怎么办/什么条件/行不行』等），即使句中带『想申请/申请/要/退/退款/投诉』等动作词，只要语义是问政策而非要求立即执行操作，一律归 POLICY_INQUIRY
+- 操作意图边界：RETURN_REQUEST / REFUND_REQUEST / COMPLAINT 仅用于明确的执行性请求（含具体操作对象/已完成办理诉求，如『我要退货 ORD-001』『帮我申请退款』『现在就要投诉』）；问可行性的疑问句不算操作请求
 
 【示例】
 输入: 你好
@@ -48,6 +50,21 @@ def build_intent_prompt(user_input: str, current_state_context: str | None = Non
 
 输入: 退货多久到账
 输出: {{"intent":"POLICY_INQUIRY","confidence":0.95,"slots":{{}},"missing_slots":[],"summary":"咨询退款到账时效"}}
+
+输入: 我买的商品还没发货，想申请仅退款，可以吗？
+输出: {{"intent":"POLICY_INQUIRY","confidence":0.95,"slots":{{}},"missing_slots":[],"summary":"咨询未发货商品能否仅退款"}}
+
+输入: 货已经签收了，我不想要了，能只退款不退货吗？
+输出: {{"intent":"POLICY_INQUIRY","confidence":0.95,"slots":{{}},"missing_slots":[],"summary":"咨询已签收能否仅退款"}}
+
+输入: 我遇到批量质量问题要投诉，多久有人处理？
+输出: {{"intent":"POLICY_INQUIRY","confidence":0.95,"slots":{{}},"missing_slots":[],"summary":"咨询投诉处理时效"}}
+
+输入: 刚签收发现商品有瑕疵，怎么处理？
+输出: {{"intent":"POLICY_INQUIRY","confidence":0.95,"slots":{{}},"missing_slots":[],"summary":"咨询瑕疵商品处理流程"}}
+
+输入: 我想了解一下怎么联系你们的人工客服。
+输出: {{"intent":"CHITCHAT","confidence":0.9,"slots":{{}},"missing_slots":[],"summary":"咨询人工客服联系方式"}}
 
 {state_hint}用户输入: {user_input}
 """

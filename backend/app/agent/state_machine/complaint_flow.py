@@ -9,6 +9,7 @@ from typing import TypedDict
 
 from langgraph.graph import END
 
+from app.agent import usage
 from app.agent.state_machine.base import BaseStateMachine
 from app.agent.state_machine.edges import is_deny
 from app.config import settings
@@ -32,6 +33,8 @@ class ComplaintState(TypedDict, total=False):
     message: str
     awaiting: str
     final: bool
+    reasoning: str  # 契约透出：severity 评估依据（orchestrator 取出 emit reasoning.delta）
+    tool_calls: list  # 契约透出：create_complaint 动作（orchestrator 取出 emit tool_call）
 
 
 def _guess_type(text: str) -> str:
@@ -64,6 +67,7 @@ async def _assess_severity(description: str) -> str:
             model=settings.deepseek_model_reasoner,
             timeout=settings.deepseek_timeout_reasoner,
         )
+        usage.accumulate(data.get("usage"))
         raw = data["choices"][0]["message"]["content"]
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         severity = json.loads(m.group(0)).get("severity", "MEDIUM")
@@ -101,10 +105,24 @@ async def _collect_description(state):
     return {"stage": "collect_description", "awaiting": "description", "message": "请详细描述您遇到的问题，方便我们跟进"}
 
 
+_SEVERITY_BASIS = {
+    "HIGH": "涉及人身安全/批量质量问题/金额较大，需紧急处理",
+    "MEDIUM": "一般服务或质量问题，按标准时限跟进",
+    "LOW": "属于建议反馈类，常规回复即可",
+}
+
+
 async def _severity_assess(state):
     severity = await _assess_severity(state["description"])
     logger.info("event=severity_assessed", extra={"severity": severity})
-    return {"severity": severity, "stage": "execute"}
+    desc = (state.get("description") or "")[:40]
+    # 透出 reasoning（契约）：严重性评估依据，供评测端思考链维度取证。
+    # 由 orchestrator 从 state 取出并 emit reasoning.delta。
+    return {
+        "severity": severity,
+        "stage": "execute",
+        "reasoning": f"投诉『{desc}…』评估为 {severity}：{_SEVERITY_BASIS.get(severity, '')}",
+    }
 
 
 async def _execute(state):
@@ -123,6 +141,20 @@ async def _execute(state):
             "severity": result.severity,
         },
         "stage": "notify",
+        # 观测层外显业务动作（契约 tool_call），由 orchestrator 统一 emit
+        "tool_calls": [{
+            "name": "create_complaint",
+            "args": {
+                "complaint_type": state.get("complaint_type", ""),
+                "order_id": state.get("order_id"),
+            },
+            "result": {
+                "success": result.success,
+                "ticket_id": result.ticket_id,
+                "severity": result.severity,
+            },
+            "status": "success" if result.success else "error",
+        }],
     }
 
 
@@ -132,7 +164,7 @@ async def _notify(state):
         sev_desc = {"HIGH": "紧急处理", "MEDIUM": "24小时内跟进", "LOW": "24小时内回复"}.get(r["severity"], "尽快处理")
         msg = f"投诉工单已创建（工单号 {r['ticket_id']}），严重级别：{r['severity']}，我们将{sev_desc}。"
     else:
-        msg = "投诉工单创建失败，请稍后重试或拨打客服热线 400-XXX-XXXX"
+        msg = "投诉工单创建失败，请稍后重试或通过在线客服转人工处理。"
     return {"stage": END, "final": True, "message": msg}
 
 

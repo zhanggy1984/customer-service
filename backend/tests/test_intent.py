@@ -15,7 +15,7 @@ def test_extract_json_trailing_text():
 
 @pytest.mark.asyncio
 async def test_classify_return_request(monkeypatch):
-    async def fake_chat(messages, model=None, timeout=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None):
         return {"choices": [{"message": {"content": '{"intent":"RETURN_REQUEST","confidence":0.98,"slots":{},"missing_slots":["order_id"],"summary":"退货"}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
     r = await classify_intent("我要退货")
@@ -25,7 +25,7 @@ async def test_classify_return_request(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_classify_chitchat(monkeypatch):
-    async def fake_chat(messages, model=None, timeout=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None):
         return {"choices": [{"message": {"content": '{"intent":"CHITCHAT","confidence":0.99,"slots":{},"missing_slots":[],"summary":"问候"}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
     r = await classify_intent("你好")
@@ -36,7 +36,7 @@ async def test_classify_chitchat(monkeypatch):
 async def test_classify_invalid_json_retries_then_fallback(monkeypatch):
     calls = {"n": 0}
 
-    async def fake_chat(messages, model=None, timeout=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None):
         calls["n"] += 1
         return {"choices": [{"message": {"content": "这不是JSON"}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
@@ -47,7 +47,7 @@ async def test_classify_invalid_json_retries_then_fallback(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_classify_invalid_intent_fallback(monkeypatch):
-    async def fake_chat(messages, model=None, timeout=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None):
         return {"choices": [{"message": {"content": '{"intent":"UNKNOWN_TYPE","confidence":0.9,"slots":{},"missing_slots":[],"summary":""}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
     r = await classify_intent("x")
@@ -56,3 +56,18 @@ async def test_classify_invalid_intent_fallback(monkeypatch):
 
 def test_fallback():
     assert _chitchat_fallback().intent == "CHITCHAT"
+
+
+@pytest.mark.asyncio
+async def test_classify_passes_low_temperature(monkeypatch):
+    """#238：classify_intent 调用 chat 时透传 temperature=0.1（意图分类确定性）。"""
+    captured = {}
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+        captured["temperature"] = temperature
+        return {"choices": [{"message": {"content": '{"intent":"POLICY_INQUIRY","confidence":0.95,"slots":{},"missing_slots":[],"summary":"政策咨询"}'}}]}
+
+    monkeypatch.setattr(deepseek_client, "chat", fake_chat)
+    r = await classify_intent("能只退款不退货吗？")
+    assert r.intent == "POLICY_INQUIRY"
+    assert captured["temperature"] == 0.1

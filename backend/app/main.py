@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import auth, routes
+from app.api import auth, contracts, routes
 from app.infrastructure.deepseek import deepseek_client
 from app.infrastructure.mysql import mysql_pool
 from app.rag.init import init_knowledge
@@ -39,6 +39,7 @@ app = FastAPI(title="AI 智能客服", version="0.1.0", lifespan=lifespan)
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(routes.router, prefix="/api/v1")
+app.include_router(contracts.router, prefix="/api")
 
 
 @app.get("/healthz")

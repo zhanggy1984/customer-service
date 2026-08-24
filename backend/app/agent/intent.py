@@ -29,6 +29,7 @@ class IntentResult:
     slots: dict = field(default_factory=dict)
     missing_slots: list = field(default_factory=list)
     summary: str = ""
+    usage: dict | None = None  # 本轮分类调用的 token 消耗（计入聚合 usage）
 
 
 def _extract_json(text: str) -> str:
@@ -56,6 +57,7 @@ async def classify_intent(
             data = await deepseek_client.chat(
                 [{"role": "system", "content": prompt}],
                 model=settings.deepseek_model_chat,
+                temperature=0.1,  # 意图分类需确定性，低温度抑制同 query 分类抖动
             )
             raw = data["choices"][0]["message"]["content"]
             json_str = _extract_json(raw)
@@ -67,6 +69,7 @@ async def classify_intent(
                 slots=parsed.get("slots", {}) or {},
                 missing_slots=parsed.get("missing_slots", []) or [],
                 summary=parsed.get("summary", "") or "",
+                usage=data.get("usage"),
             )
             if result.intent not in VALID_INTENTS:
                 result.intent = "CHITCHAT"

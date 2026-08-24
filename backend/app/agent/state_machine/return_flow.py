@@ -33,6 +33,7 @@ class ReturnState(TypedDict, total=False):
     message: str
     awaiting: str
     final: bool
+    tool_calls: list  # 契约透出：query_order/create_return 动作（orchestrator 取出 emit tool_call）
 
 
 def _is_confirm(text: str) -> bool:
@@ -85,7 +86,17 @@ async def _verify_order(state):
     order = await order_service.query_order(state["order_id"], state["user_id"])
     if not order:
         return {"stage": END, "final": True, "message": "订单不存在或不属于您的账号"}
-    return {"order": _order_to_dict(order), "stage": "check_eligibility"}
+    return {
+        "order": _order_to_dict(order),
+        "stage": "check_eligibility",
+        # 观测层外显业务动作（契约 tool_call），由 orchestrator 统一 emit
+        "tool_calls": [{
+            "name": "query_order",
+            "args": {"order_id": state["order_id"]},
+            "result": {"status": order.status, "total_amount": order.total_amount},
+            "status": "success",
+        }],
+    }
 
 
 async def _check_eligibility(state):
@@ -168,6 +179,21 @@ async def _execute(state):
             "message": result.message,
         },
         "stage": "notify",
+        # 观测层外显业务动作（契约 tool_call），由 orchestrator 统一 emit
+        "tool_calls": [{
+            "name": "create_return",
+            "args": {
+                "order_id": order.order_id,
+                "item_ids": item_ids,
+                "reason": state.get("reason", ""),
+            },
+            "result": {
+                "success": result.success,
+                "return_id": result.return_id,
+                "refund_amount": result.refund_amount,
+            },
+            "status": "success" if result.success else "error",
+        }],
     }
 
 
