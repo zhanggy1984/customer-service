@@ -120,6 +120,27 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     KEY idx_user (user_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
+-- ---------- tool_call_log（P5：护栏判定观测）----------
+-- 决策轮每次 guardrail.check 判定落一条（含 allow/reject/override/dedupe）。
+-- args_json 存原始入参；result_summary 存结果摘要（前 N 字 + 命中数），空串=工具空结果。
+CREATE TABLE IF NOT EXISTS tool_call_log (
+    id             BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    session_id     VARCHAR(64) NOT NULL,
+    user_id        INT         NOT NULL,
+    round_no       INT         NOT NULL,              -- agent_loop 内第几轮
+    tool_name      VARCHAR(64) NOT NULL,              -- override 时记最终执行工具
+    args_json      JSON        NULL,
+    result_summary VARCHAR(512) NULL,                 -- 空 = 工具返回空结果（search 无命中/not_found）
+    latency_ms     INT         NULL,                  -- 真执行工具耗时；reject/dedupe 记 0
+    verdict        VARCHAR(16) NOT NULL,              -- allow / reject / override
+    verdict_reason VARCHAR(255) NULL,                 -- side_effect/trivial_query/dedupe/...
+    llm_confidence FLOAT       NULL,                  -- 暂无置信度来源，预留
+    query_text     VARCHAR(500) NULL,                 -- 本轮用户输入，便于请求分析
+    created_at     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_session (session_id),
+    KEY idx_tool_time (tool_name, created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
 -- =============================================================
 -- 种子数据
 -- =============================================================

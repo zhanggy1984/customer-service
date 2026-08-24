@@ -279,6 +279,36 @@ async def test_call_limit_truncates_loop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decision_loop_writes_tool_call_log(monkeypatch):
+    """P5 落库接入：决策循环真执行工具后应写 tool_call_log（收集 write_tool_call 调用）。"""
+    calls = []
+
+    async def fake_log(**kwargs):
+        calls.append(kwargs)
+
+    async def fake_execute(name, params, user_id, session_id):
+        return {"order": {"order_id": "ORD-1", "status": "PAID"}}
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
+        if any(m.get("role") == "tool" for m in messages):
+            return _resp(content="订单状态如下")
+        return _resp(tool_calls=[_tool("query_order", {"order_id": "ORD-1"})])
+
+    monkeypatch.setattr(al, "write_tool_call", fake_log)  # 覆盖 conftest 的 no-op，改为收集
+    monkeypatch.setattr(al, "execute", fake_execute)
+    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    out = await al.run_decision_loop("查 ORD-1", "ORDER_STATUS", _Session(), 1)
+    assert out["route"] == "order"
+    assert len(calls) == 1  # query_order 真执行 → 恰好落 1 条
+    entry = calls[0]
+    assert entry["tool_name"] == "query_order"
+    assert entry["verdict"] == "allow"
+    assert entry["round_no"] == 1
+    assert entry["session_id"] == "sess-1"
+    assert entry["query_text"] == "查 ORD-1"
+
+
+@pytest.mark.asyncio
 async def test_call_limit_truncates_before_final_round(monkeypatch):
     """P4 规则6：默认 max_rounds=3 下提前达上限 → 截断并终止 LLM 轮次循环。
 

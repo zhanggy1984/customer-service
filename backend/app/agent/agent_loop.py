@@ -19,6 +19,7 @@ import time
 from app.agent.function_calling.executor import execute
 from app.agent.function_calling.guardrail import ToolGuardrail
 from app.agent.function_calling.registry import TOOL_SCHEMAS
+from app.agent.function_calling.tool_call_log import write_tool_call
 from app.config import settings
 from app.infrastructure.deepseek import (
     AllKeysDownError,
@@ -98,7 +99,13 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
     guardrail = ToolGuardrail()
     limit_hit = False  # 累计工具调用达上限 → 终止整个决策循环强制出路由
 
-    for _ in range(settings.agent_loop_max_rounds):
+    async def _log_call(tool_name, args, result, latency, verdict, reason):
+        """护栏判定落库（P5）：观测层失败静默，不阻断决策。"""
+        await write_tool_call(session_id=session_id, user_id=user_id, round_no=round_no,
+                              tool_name=tool_name, args=args, result=result, latency_ms=latency,
+                              verdict=verdict, reason=reason, query_text=user_message)
+
+    for round_no in range(1, settings.agent_loop_max_rounds + 1):
         try:
             data = await deepseek_client.chat(
                 messages,
@@ -141,6 +148,7 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
             # orchestrator 据此重映射真实业务意图（如 ORDER_STATUS 误分类 + create_return_order
             # → RETURN_REQUEST），否则 business_flow 索引 FLOWS 对非业务意图抛 KeyError。
             if decision.verdict == "reject" and decision.reason == "side_effect":
+                await _log_call(name, params, None, 0, decision.verdict, decision.reason)
                 return {"route": "business", "blocked_tool": name, "blocked_args": params,
                         "tool_results": tool_results, "tool_events": tool_events,
                         "usage": decision_usage, "direct_reply": ""}
@@ -149,12 +157,14 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
                 # 终止外层 LLM 轮次循环——否则下一轮 chat 携带未闭环的 tool_call 引用
                 # （OpenAI 兼容 400），且"强制出路由"落空（还会多跑一轮）。
                 logger.info("event=fc_call_limit_reached", extra={"tool": name})
+                await _log_call(name, params, None, 0, decision.verdict, decision.reason)
                 limit_hit = True
                 break
             if decision.verdict == "reject":
                 # 软拒绝（trivial_query）：跳过执行，但回灌"被拒"占位结果——assistant 消息已
                 # 携带全部 tool_calls，若不给对应 tool 响应，下一轮消息格式悬空（OpenAI 兼容
                 # 服务会校验 400），且 LLM 需要看到被拒理由才改查询或放弃。
+                await _log_call(name, params, None, 0, decision.verdict, decision.reason)
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
                                  "content": json.dumps({"error": f"该工具调用被护栏拒绝：{decision.reason}"},
                                                        ensure_ascii=False)})
@@ -164,6 +174,7 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
             if decision.cached_result is not None:
                 # dedupe：复用首次结果，不重复执行、不透出事件（观测层只透实际执行动作）。
                 # 仍回灌 tool result 闭环 LLM 的 tool_call 引用，避免下一轮消息格式悬空。
+                await _log_call(name, params, decision.cached_result, 0, "allow", "dedupe")
                 tool_results[name] = decision.cached_result
                 messages.append({
                     "role": "tool",
@@ -171,9 +182,14 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
                     "content": json.dumps(decision.cached_result, ensure_ascii=False),
                 })
                 continue
+            start = time.time_ns()
             result = await execute(name, params, user_id, session_id)
             guardrail.record(name, params, result)
             tool_results[name] = result
+            # override 判定如实记录（本次调用被护栏改写后才执行），否则仅 log 丢失该判定事实
+            await _log_call(name, params, result, (time.time_ns() - start) // 1_000_000,
+                            decision.verdict if decision.verdict == "override" else "allow",
+                            decision.reason if decision.verdict == "override" else "")
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.get("id", ""),
