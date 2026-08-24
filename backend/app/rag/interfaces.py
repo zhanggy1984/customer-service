@@ -1,7 +1,6 @@
 """向量存储抽象接口。
 
-当前实现: ChromaVectorStore（ChromaDB 磁盘持久化）。
-未来可切换: MilvusVectorStore（实现同一接口，改 __init__.py 一行）。
+当前实现: MilvusVectorStore（LlamaIndex MilvusVectorStore 封装，独立 Milvus 服务）。
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field

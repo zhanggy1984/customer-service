@@ -1,10 +1,10 @@
 """RAG 向量存储工厂。
 
-VECTOR_STORE 环境变量决定实现：
-- chroma → ChromaVectorStore（当前）
-- milvus → 未来接入 Milvus（实现同一 IVectorStore 接口）
+MilvusVectorStore（LlamaIndex MilvusVectorStore 封装，独立 Milvus 服务）为唯一实现，
+遵循 IVectorStore 接口，调用方（retriever/kb_store）无感。
 """
-from app.rag.chroma_impl import ChromaVectorStore
 from app.rag.interfaces import IVectorStore
+from app.rag.milvus_impl import MilvusVectorStore
 
-vector_store: IVectorStore = ChromaVectorStore()
+
+vector_store: IVectorStore = MilvusVectorStore()

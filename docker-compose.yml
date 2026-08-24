@@ -27,13 +27,13 @@ services:
     # 开发阶段 1 个实例。Phase 4 高并发时可扩为 3:
     #   deploy:
     #     replicas: 3
-    # 注意: 扩展多实例前需解决 ChromaDB 共享 volume 多实例并发写问题(Phase 2 引入)。
+    # 注意: 扩展多实例前需解决向量库共享 volume 多实例并发写问题。
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      - CHROMA_HOST=chroma   # 独立 chroma 服务（HttpClient 模式）
+      - MILVUS_URI=http://milvus:19530
     logging:
       driver: json-file
       options:
@@ -43,7 +43,7 @@ services:
       # HF 模型缓存 volume，防止 rebuild 后 bge 模型重新下载
       - hf_cache:/root/.cache/huggingface
     depends_on:
-      chroma:
+      milvus:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -51,23 +51,60 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  chroma:
-    image: chromadb/chroma:latest   # 独立向量服务（1.4.4，Rust 重写版）
-    # 映射到 8001：宿主机 8000 已被 backend 占用（chroma 容器内端口 8000）
-    ports:
-      - "8001:8000"
+  # ---- Milvus standalone（milvus + etcd + minio，本地已拉取对应镜像）----
+  # 内部仅容器网络可达：backend 走 milvus:19530。宿主机如需 attu 联调，
+  # 在 docker-compose.override.yml 加 ports: "19533:19530"（host 19530 已被他项目占用）。
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.14
     environment:
-      - ANONYMIZED_TELEMETRY=FALSE
-      - PERSIST_DIRECTORY=/data
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - chroma_data:/data
+      - milvus_etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
-      # chroma 1.x 无 version 子命令，改用 bash TCP 探测 8000（服务 API 端口）
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - milvus_minio:/minio_data
+    command: minio server /minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.5.4   # 与 pymilvus 2.6.x 客户端配套（本地镜像已存在）
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      milvus-etcd:
+        condition: service_healthy
+      milvus-minio:
+        condition: service_healthy
     restart: unless-stopped
 
   redis:
@@ -107,5 +144,7 @@ services:
 volumes:
   mysql_data:
   redis_data:
-  chroma_data:
   hf_cache:
+  milvus_data:
+  milvus_etcd:
+  milvus_minio:

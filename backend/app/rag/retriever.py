@@ -1,6 +1,7 @@
 """RAG 检索器。
 
-流程: query → embedding → ChromaDB Top-10 → Re-rank Top-3 → score≥0.3 过滤。
+流程: query → embedding → 向量库检索 Top-10 → 交叉编码重排 Top-3 → score≥0.3 过滤。
+向量库实现为 MilvusVectorStore（chroma 已移除），此处只面向 IVectorStore 接口。
 缓存: Redis L1 精确缓存 rag_cache:{md5}，TTL 600s。
 空结果兜底: score < 0.3 或 0 条 → 返回空列表，上层不注入 prompt。
 """
@@ -13,6 +14,7 @@ from app.config import settings
 from app.rag import vector_store
 from app.rag.embedder import embedder
 from app.rag.interfaces import SearchResult
+from app.rag.reranker import reranker
 from app.utils.logger import logger
 
 TOP_K = 10
@@ -51,10 +53,14 @@ class Retriever:
             logger.info("event=rag_cache_hit:L1", extra={"query_len": len(query), "count": len(data)})
             return [SearchResult(**item) for item in data]
 
-        # 检索
+        # 检索 + 交叉编码重排（bge-reranker 真重排；失败降级按相似度排序，不阻断检索）
         query_vec = await embedder.embed_query(query)
         results = await vector_store.search(query_vec, top_k=TOP_K)
-        results = sorted(results, key=lambda r: r.score, reverse=True)[:RE_RANK_K]
+        try:
+            results = await reranker.rerank(query, results)
+        except Exception:
+            logger.warning("event=rag_rerank_fallback", extra={"query_len": len(query)})
+            results = sorted(results, key=lambda r: r.score, reverse=True)[:RE_RANK_K]
         results = [r for r in results if r.score >= SCORE_THRESHOLD]
 
         if not results:

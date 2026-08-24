@@ -4,7 +4,13 @@ import pytest
 from app.rag.interfaces import SearchResult
 from app.rag.retriever import Retriever
 from app.rag.retriever import embedder as embedder_mod
+from app.rag.retriever import reranker as reranker_mod
 from app.rag.retriever import vector_store as vs_mod
+
+
+async def fake_rerank(query, results):
+    """单测不加载 bge-reranker 模型，重排退化为原序。"""
+    return results
 
 
 class FakeRedis:
@@ -34,6 +40,7 @@ async def test_search_hit(monkeypatch):
 
     monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
     monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
 
     results = await r.search("退货时限")
     assert len(results) == 1
@@ -53,6 +60,7 @@ async def test_search_empty_below_threshold(monkeypatch):
 
     monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
     monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
 
     results = await r.search("量子物理")
     assert results == []  # score < 0.3 过滤

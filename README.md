@@ -209,14 +209,14 @@ cp .env.example .env
 #   JWT_SECRET_KEY=<随机长字符串>            # 生产必须替换，如 python -c "import secrets;print(secrets.token_urlsafe(48))"
 ```
 
-### 第 2 步：一键启动全栈（5 个容器）
+### 第 2 步：一键启动全栈容器
 
 ```bash
 docker compose up -d
 docker compose ps          # 等待全部 healthy
 ```
 
-启动 `nginx` / `backend` / `chroma` / `redis` / `mysql` 5 个容器。MySQL 首次启动自动建表 + 灌入种子数据（5 个订单覆盖全场景），ChromaDB 自动灌入 4 篇预置政策文档。
+启动 `nginx` / `backend` / `redis` / `mysql` 与 Milvus 套件（`milvus` / `etcd` / `minio`）。MySQL 首次启动自动建表 + 灌入种子数据（5 个订单覆盖全场景），Milvus 由知识库启动同步自动灌入 4 篇预置政策文档。
 
 ### 第 3 步：构建前端并访问
 
@@ -243,15 +243,14 @@ npm run build             # 生产：构建产物挂载到 nginx
 | 前端（开发热更新） | http://localhost:5173 | Vite dev server |
 | **MySQL** | `localhost:3306`（csuser/cspass，库 `customer_service`） | 外部工具验证数据 |
 | **Redis** | `localhost:6379` | 外部工具验证数据 |
-| **ChromaDB** | http://localhost:8001 | 外部工具验证向量库 |
+| **Milvus** | 容器内 `milvus:19530`（宿主机联调经 override 映射 19533） | 外部工具验证向量库 |
 
-> **端口冲突**：若宿主机 80/8001/3306 已被其他项目占用，无需改 `docker-compose.yml`，创建本地 `docker-compose.override.yml` 覆盖端口即可（docker compose 自动合并，且已 gitignore 不入库）：
+> **端口冲突**：若宿主机 80/3306 已被其他项目占用，无需改 `docker-compose.yml`，创建本地 `docker-compose.override.yml` 覆盖端口即可（docker compose 自动合并，且已 gitignore 不入库）：
 >
 > ```yaml
 > # docker-compose.override.yml（本机专用，可提交到个人分支或忽略）
 > services:
 >   nginx:  { ports: ["8081:80"] }      # 标准 80:80
->   chroma: { ports: ["8002:8000"] }    # 标准 8001:8000
 >   mysql:  { ports: ["3308:3306"] }    # 标准 3306:3306
 > ```
 
@@ -306,7 +305,7 @@ customer-service/
 │   │   │   ├── function_calling/ # 工具（order/return/refund/complaint tools）
 │   │   │   └── prompts/          # prompt 模板（意图/闲聊/政策…）
 │   │   ├── infrastructure/       # DeepSeek Gateway（keypool/熔断/网关）+ MySQL
-│   │   ├── rag/                  # RAG（embedder/retriever/chroma/kb_store/knowledge）
+│   │   ├── rag/                  # RAG（embedder/retriever/milvus_impl/kb_store/knowledge）
 │   │   ├── services/             # 业务服务（interfaces 抽象 + local_impl + 重试）
 │   │   ├── session/              # 会话管理（Redis 主存 + MySQL 兜底 + 消息截断）
 │   │   └── utils/

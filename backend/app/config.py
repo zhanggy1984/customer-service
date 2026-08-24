@@ -29,7 +29,6 @@ class Settings(BaseSettings):
 
     # ---------- 运行模式 ----------
     service_mode: str = "local"          # local | remote（对接层）
-    vector_store: str = "chroma"         # chroma | milvus
 
     # ---------- 基础设施 ----------
     redis_url: str = "redis://redis:6379/0"
@@ -48,14 +47,17 @@ class Settings(BaseSettings):
     session_max_messages: int = 40
 
     # ---------- RAG ----------
-    chroma_persist_dir: str = "./data/chroma"
-    # 空 → 嵌入式 PersistentClient（开发单机）；非空 → HttpClient 连接独立 chroma 服务
-    chroma_host: str = ""
-    chroma_port: int = 8000
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     embedding_dim: int = 512
+    # 交叉编码重排模型（bge-reranker 真重排，约 1GB，懒加载）
+    rerank_model: str = "BAAI/bge-reranker-base"
     rag_cache_ttl: int = 600
     intent_cache_ttl: int = 60
+
+    # ---------- Milvus（VECTOR_STORE=milvus 时生效） ----------
+    milvus_uri: str = "http://milvus:19530"          # compose 内服务名；本地开发改 http://localhost:19533
+    milvus_collection: str = "knowledge"
+    milvus_token: str = ""
 
     # ---------- Admin 默认账号 ----------
     admin_default_username: str = "admin"
