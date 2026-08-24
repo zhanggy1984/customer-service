@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     # 会话消息体保存上限（条数）：超出截断，仅保留首条 user 消息 + 最近 N-1 条
     session_max_messages: int = 40
 
+    # ---------- Agent 工具决策循环（P3） ----------
+    # LLM 工具决策循环最大轮数（每轮一次 LLM 调用 + 若干工具执行）
+    agent_loop_max_rounds: int = 3
+    # 回退闸门：置 True 时 POLICY_INQUIRY 意图决策循环强制补一次 search_policy
+    # （纯 LLM 自主导致评测扣分时一键回退，默认关闭）
+    agent_loop_force_policy_search: bool = False
+
     # ---------- RAG ----------
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     embedding_dim: int = 512

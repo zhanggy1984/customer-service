@@ -53,11 +53,15 @@ class DeepSeekGateway:
         model: str | None = None,
         timeout: float | None = None,
         temperature: float | None = None,
+        tools: list | None = None,
+        tool_choice: str | dict | None = None,
     ) -> dict:
         """兼容旧 DeepSeekClient.chat 签名。Key 池化 + 排队 + 背压。
 
         temperature 可选：不传（None）不加该字段，走 DeepSeek 默认采样；
         意图分类等确定性场景传低温度（如 0.1）。
+        tools/tool_choice 可选（工具决策循环用）：不传（None）则不加
+        tools 字段，OpenAI 兼容格式原样透传给 DeepSeek，现有调用方无感。
         """
         try:
             # 排队（背压）：并发超过容量时等待，超时抛容量不足
@@ -69,7 +73,7 @@ class DeepSeekGateway:
             logger.warning("event=queue_wait_timeout")
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
         try:
-            return await self._call(messages, model, timeout, temperature)
+            return await self._call(messages, model, timeout, temperature, tools, tool_choice)
         finally:
             self._semaphore.release()
 
@@ -79,6 +83,8 @@ class DeepSeekGateway:
         model: str | None,
         timeout: float | None,
         temperature: float | None = None,
+        tools: list | None = None,
+        tool_choice: str | dict | None = None,
     ) -> dict:
         payload = {
             "model": model or settings.deepseek_model_chat,
@@ -87,6 +93,10 @@ class DeepSeekGateway:
         }
         if temperature is not None:
             payload["temperature"] = temperature
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
         request_timeout = timeout or settings.deepseek_timeout_chat
 
         for attempt in range(3):  # 换 Key 最多重试 2 次

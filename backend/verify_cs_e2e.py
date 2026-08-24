@@ -3,7 +3,7 @@
 覆盖契约事件（§5.1）：meta/status/reasoning/tool_call/answer.delta/usage/done/error。
 - 场景 1 闲聊（CHITCHAT）    ：流式 answer.delta 多帧 + usage
 - 场景 2 订单查询（ORDER_STATUS）：tool_call(query_order) + 静态 answer（未找到路径）
-- 场景 3 政策查询（POLICY_INQUIRY）：tool_call(policy_search) + 流式 answer
+- 场景 3 政策查询（POLICY_INQUIRY）：tool_call(search_policy) + 流式 answer
 - 场景 4 投诉（COMPLAINT）   ：reasoning（severity 评估）+ tool_call(create_complaint) + 静态 answer
 
 在容器内运行：docker compose exec -T backend python verify_cs_e2e.py

@@ -1,10 +1,14 @@
-"""Agent 编排器（完整版 6 阶段流水线）。
+"""Agent 编排器（LangGraph 顶层图）。
 
-INPUT → [1.预处理] → [2.意图识别+切换] → [3.上下文装配] → [4.状态推进] → [5.动作执行] → [6.响应生成] → OUTPUT
+图拓扑：preprocess → intent_recognition → agent_loop → [business_flow / order_answer /
+policy_answer / chitchat] → finalize。
 
+- agent_loop（P3）：LLM 工具决策循环。ORDER_STATUS/POLICY 由 LLM 自主决定调用工具
+  （只读白名单）；业务意图/CHITCHAT 短路；副作用工具决策被护栏拦截路由 business_flow
+  （状态机是确定性权威）。工具动作事件与决策 usage 在此透出/聚合。
 - 有进行中的业务状态机时，分类结果判断"推进"还是"切换"（保存快照）
 - CHITCHAT 前 2 轮 LLM 自由回复，第 3 轮收束，第 4 轮规则话术
-- POLICY_INQUIRY 走 RAG 检索注入
+- POLICY_INQUIRY 由 LLM 决策 search_policy 检索，生成节点基于文档依据流式生成
 """
 import re
 import time
@@ -14,6 +18,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from app.agent import usage
+from app.agent.agent_loop import run_decision_loop
 from app.agent.intent import IntentResult, classify_intent
 from app.agent.response import answer_event, reasoning_event, tool_call_event, usage_event
 from app.agent.rule_engine import match_rule
@@ -27,7 +32,6 @@ from app.infrastructure.deepseek import (
     LLMUnavailableError,
     deepseek_client,
 )
-from app.services import order_service
 from app.session.models import Session
 from app.utils.logger import logger
 
@@ -44,6 +48,33 @@ FLOWS = {
     "REFUND_REQUEST": RefundFlow(),
     "COMPLAINT": ComplaintFlow(),
 }
+
+# 护栏拦截的副作用工具 → 真实业务意图映射：LLM 在 ORDER/POLICY 决策轮调副作用工具
+# （如"我要退货"被误分为 ORDER_STATUS 时决策 create_return_order），说明用户真实意图是
+# 业务流。状态机是确定性权威，重映射后接手；否则 business_flow 用非 FLOWS 意图索引
+# FLOWS 会 KeyError。
+_SIDE_EFFECT_TO_INTENT = {
+    "check_return_eligibility": "RETURN_REQUEST",
+    "create_return_order": "RETURN_REQUEST",
+    "create_refund_order": "REFUND_REQUEST",
+    "create_complaint": "COMPLAINT",
+}
+
+
+def _remap_slots(intent: str, args: dict) -> dict:
+    """被拦工具参数 → 状态机初始槽，只透传语义一致的字段。
+
+    - order_id：RETURN/REFUND 跳过 collect_order_id 直达 verify_order（_init_state 消费）；
+    - complaint_type：COMPLAINT 预填投诉类型；
+    - 丢弃 create_return_order 的 items：那是 SKU 列表，而状态机 return_items 按商品名
+      匹配（check_eligibility `req in item.name`），注入 SKU 会匹配失败误判
+      "指定商品不支持退货" 走 final。让状态机走自然流程（退全部可退），用户确认前可再指定。
+    """
+    if intent == "COMPLAINT":
+        return {"complaint_type": args["complaint_type"]} if args.get("complaint_type") else {}
+    if intent in ("RETURN_REQUEST", "REFUND_REQUEST") and args.get("order_id"):
+        return {"order_id": args["order_id"]}
+    return {}
 
 STATUS_DESC = {"PAID": "已付款待发货", "SHIPPED": "已发货运输中", "DELIVERED": "已签收", "CANCELLED": "已取消"}
 SWITCH_THRESHOLD = 0.8
@@ -114,6 +145,13 @@ def _rule_engine_fallback(fn):
                 "event=rule_engine_triggered",
                 extra={"session_id": session.session_id, "user_id": user_id},
             )
+            # 熔断接管：生成节点（policy/chitchat）的正常清理被 raise 跳过，此处补清非状态机残留
+            # （如闲聊轮次）。业务状态机（有 stage）保留进度，不清——中途熔断不应丢流程。
+            # 实测教训：政策熔断走规则引擎兜底后 agent_state 残留 chitchat_round，后续业务状态机
+            # 拿到无 user_id 的脏 state → execute KeyError。
+            if session.agent_state and "stage" not in session.agent_state:
+                session.agent_state = None
+                session.intent = None
             fallback = match_rule(user_message)
             reply = "".join(streamed_parts) + fallback
             # 兜底降级：已流部分已逐段透出，此处只补发兜底话术段，answer 拼接与 done.content 一致
@@ -154,64 +192,43 @@ def _init_state(intent: str, result: IntentResult, session: Session, user_id: in
     return {}
 
 
-async def _handle_order_status(user_id: int, slots: dict, emit=None) -> str:
-    order_id = slots.get("order_id")
-    if not order_id:
-        # 无订单号时列出最近订单辅助定位；空列表友好提示
-        orders = await order_service.list_user_orders(user_id, limit=5)
-        if not orders:
-            return "您最近没有订单，请直接告诉我订单号。"
-        if emit:
-            await emit(tool_call_event({
-                "id": str(time.time_ns()),
-                "name": "list_user_orders",
-                "args": {"limit": 5},
-                "result": [{"order_id": o.order_id, "status": o.status} for o in orders],
-                "status": "success",
-            }))
-        lines = "、".join(f"{o.order_id}（{STATUS_DESC.get(o.status, o.status)}）" for o in orders)
-        return f"请提供订单号。您最近的订单：{lines}。"
-    order = await order_service.query_order(order_id, user_id)
-    # 观测层外显动作（找到与否都透出，status 如实反映业务结果：未找到 → error）
-    if emit:
-        await emit(tool_call_event({
-            "id": str(time.time_ns()),
-            "name": "query_order",
-            "args": {"order_id": order_id},
-            "result": None if not order else {
-                "status": order.status,
-                "total_amount": order.total_amount,
-                "items": [{"name": i.name, "quantity": i.quantity} for i in order.items],
-            },
-            "status": "error" if not order else "success",
-        }))
-    if not order:
+def _compose_order_answer(tool_results: dict, direct_reply: str = "") -> str:
+    """基于决策循环的工具结果组装订单回复（静态组装，无 LLM 调用）。
+
+    tool_results 由 agent_loop 决策循环产出（query_order/list_user_orders 结果）；
+    无工具结果且 LLM 直接作答（direct_reply）时透出作答，否则引导提供订单号。
+    工具调用事件已由 agent_loop 节点透出，此处不再 emit。
+    """
+    order_result = tool_results.get("query_order") or {}
+    if order_result.get("order"):
+        order = order_result["order"]
+        items = "、".join(f"{i['name']}×{i['quantity']}" for i in order.get("items", []))
+        return (
+            f"订单 {order['order_id']} 当前状态：{STATUS_DESC.get(order['status'], order['status'])}。"
+            f"商品：{items}；金额：¥{order['total_amount']}。"
+        )
+    if order_result.get("not_found"):
         return "未找到该订单，请核对订单号。也可以让我列出您最近的订单。"
-    items = "、".join(f"{i.name}×{i.quantity}" for i in order.items)
-    return (
-        f"订单 {order.order_id} 当前状态：{STATUS_DESC.get(order.status, order.status)}。"
-        f"商品：{items}；金额：¥{order.total_amount}。"
-    )
+    orders = (tool_results.get("list_user_orders") or {}).get("orders") or []
+    if not orders:
+        if direct_reply:
+            return direct_reply  # LLM 无工具直接作答（纯自主语义）
+        return "您最近没有订单，请直接告诉我订单号。"
+    lines = "、".join(f"{o['order_id']}（{STATUS_DESC.get(o['status'], o['status'])}）" for o in orders)
+    return f"请提供订单号。您最近的订单：{lines}。"
 
 
-async def _handle_policy(user_message: str, emit=None) -> tuple[str, bool]:
-    """政策问答（RAG 检索 + LLM 流式生成）。返回 (reply, 是否已流式透出 answer)。"""
-    from app.rag.retriever import retriever
+async def _compose_policy_answer(tool_results: dict, user_message: str, emit=None) -> tuple[str, bool]:
+    """基于决策循环的 search_policy 结果组装政策回复（文档注入 + 流式生成）。
 
-    results = await retriever.search(user_message)
+    返回 (reply, 是否已流式透出 answer)。工具结果由 agent_loop 决策循环产出
+    （search_policy 的 results），检索动作的事件已在 agent_loop 节点透出，此处不再重复。
+    """
+    results = (tool_results.get("search_policy") or {}).get("results") or []
     if not results:
         # 不带占位热线（评测 judge 对 X 占位扣分）；引导转人工入口与 _handle_chitchat 模板一致
         return "您的问题暂未收录到知识库，建议通过在线客服或留言转人工确认。", False
-    # 观测层外显检索动作（契约 tool_call）
-    if emit:
-        await emit(tool_call_event({
-            "id": str(time.time_ns()),
-            "name": "policy_search",
-            "args": {"query": user_message[:50]},
-            "result": [{"source": r.metadata.get("source", "")} for r in results],
-            "status": "success",
-        }))
-    ctx = "\n\n".join(f"[{r.metadata.get('source', '')}] {r.text}" for r in results)
+    ctx = "\n\n".join(f"[{r.get('source', '')}] {r.get('text')}" for r in results)
     sys = (
         "你是电商客服，基于以下政策文档回答用户问题。只依据文档内容回答，"
         "文档未覆盖的请说明需人工确认。\n\n【政策文档】\n" + ctx
@@ -301,6 +318,9 @@ class AgentState(TypedDict, total=False):
     injection_detected: bool  # preprocess 产出 → 路由短路
     reply: str  # 分支产出 → finalize
     answer_streamed: bool
+    route: str  # agent_loop 产出 → 路由到生成节点
+    tool_results: dict  # agent_loop 产出 → 生成节点注入组装
+    direct_reply: str  # agent_loop 无工具直接作答的 content（纯自主语义）
 
 
 async def _emit_status(state: AgentState, stage: str, msg: str) -> None:
@@ -341,6 +361,12 @@ async def _intent_node(state: AgentState) -> dict:
     else:
         intent_result = await classify_intent(user_message, _state_context(session))
         intent = intent_result.intent
+        # 残留非状态机 agent_state（如闲聊轮次 chitchat_round）在意图切换出 CHITCHAT 时清空。
+        # 状态机 state 必有 stage；chitchat_round 无 stage 且只对 CHITCHAT 有意义，残留会污染
+        # 后续业务状态机（投诉/退货/退款拿到无 user_id 的脏 state → execute KeyError）。
+        # 根因修复：源头清除，business_flow 入口的 stage 防御仅作最终兜底。
+        if intent != "CHITCHAT" and session.agent_state and "stage" not in session.agent_state:
+            session.agent_state = None
     usage.accumulate(intent_result.usage)  # 意图分类的 token 计入本轮聚合
     logger.info("event=stage_intent", extra={"session_id": session.session_id, "intent": intent})
     return {"intent": intent, "intent_result": intent_result}
@@ -359,7 +385,13 @@ async def _business_flow_node(state: AgentState) -> dict:
         session.agent_state = session.snapshots.pop(intent)
         session.intent = intent
         logger.info("event=snapshot_restored", extra={"session_id": session.session_id, "intent": intent})
-    if not session.agent_state:
+    # 状态机 state 的 stage 必须是当前意图状态机的合法节点（FLOWS[intent].NODES）。
+    # 仅查"stage 存在"不足以防污染：残留可能带其他状态机的 stage（如 RETURN 的 collect_reason
+    # 残留到 COMPLAINT，agent_state 与 intent 字段配对被破坏的脏会话），直接续推会路由到
+    # 不存在的节点 → LangGraph 条件路由 KeyError。空/非状态机残留（chitchat_round 无 stage）同理。
+    # 实测教训：政策走规则引擎兜底（熔断）后 agent_state 残留闲聊轮次，投诉状态机拿到
+    # 无 user_id 的 state，推进到 execute 时 KeyError('user_id')。
+    if not session.agent_state or session.agent_state.get("stage") not in FLOWS[intent].NODES:
         session.agent_state = _init_state(intent, intent_result, session, user_id)
         await _emit_status(state, "order_query", "正在为您办理...")
     else:
@@ -397,17 +429,80 @@ async def _business_flow_node(state: AgentState) -> dict:
     return {"reply": reply, "answer_streamed": False}
 
 
-async def _order_status_node(state: AgentState) -> dict:
+async def _agent_loop_node(state: AgentState) -> dict:
+    """P3：LLM 工具决策循环。业务意图/CHITCHAT 短路；ORDER_STATUS/POLICY 跑决策循环。
+
+    - 业务意图：状态机是契约钉死的确定性权威，LLM 参与决策破坏顺序保证，短路；
+    - CHITCHAT：无工具可调，短路；
+    - ORDER_STATUS/POLICY_INQUIRY：LLM 自主决定调工具（≤AGENT_LOOP_MAX_ROUNDS 轮），
+      护栏拦截副作用工具决策 → route=business。工具动作事件在此透出，usage 计入本轮。
+    """
+    session = state["session"]
+    intent = state["intent"]
+    user_message = state["user_message"]
+    user_id = state["user_id"]
+    emit = state.get("emit")
+
+    if intent in FLOWS:
+        return {"route": "business"}
+    if intent == "CHITCHAT":
+        return {"route": "chitchat"}
+
+    await _emit_status(state, "agent_loop", "正在分析您的问题...")
+    try:
+        decision = await run_decision_loop(user_message, intent, session, user_id)
+    except LLM_FALLBACK_ERRORS:
+        raise  # 熔断 → 冒泡给装饰器 → 规则引擎
+    except Exception:
+        # 非 LLM 异常（防御）：降级按意图路由，不阻断本轮
+        logger.warning("event=agent_loop_fallback", extra={"intent": intent})
+        decision = {"route": "policy" if intent == "POLICY_INQUIRY" else "order",
+                    "tool_results": {}, "tool_events": [], "usage": None, "direct_reply": ""}
+    usage.accumulate(decision.get("usage"))  # 决策轮 LLM 调用 token 计入本轮聚合
+    for evt in decision.get("tool_events", []):  # 观测层外显工具动作（契约 tool_call）
+        if emit:
+            await emit(tool_call_event(evt))
+    # 副作用工具决策被护栏拦截 → route=business：重映射到真实业务意图（LLM 在查单/问政策
+    # 轮决策了退货/退款/投诉，说明用户真实意图是业务流而非查单/问政策），确定性状态机接手。
+    # 若不可映射（SIDE_EFFECT_TOOLS 之外的工具不会走到护栏，理论不可达，但防御）则退化为
+    # 按当前意图路由，避免 business_flow 用非 FLOWS 意图索引抛 KeyError。
+    if decision["route"] == "business":
+        mapped = _SIDE_EFFECT_TO_INTENT.get(decision.get("blocked_tool"))
+        if mapped:
+            session.intent = mapped  # session 引用持久化，供后续轮次上下文一致性
+            return {"route": "business", "intent": mapped, "tool_results": decision.get("tool_results") or {},
+                    "direct_reply": "",
+                    # 被拦工具参数注入状态机初始槽（_remap_slots 只透传语义一致的字段），
+                    # 如 create_return_order 的 order_id 进 RETURN_REQUEST 跳过 collect_order_id
+                    "intent_result": IntentResult(intent=mapped, confidence=1.0,
+                                                  slots=_remap_slots(mapped, decision.get("blocked_args") or {}),
+                                                  missing_slots=[], summary="")}
+        logger.warning("event=agent_loop_blocked_unknown",
+                       extra={"blocked_tool": decision.get("blocked_tool"), "intent": intent})
+        return {"route": "policy" if intent == "POLICY_INQUIRY" else "order",
+                "tool_results": decision.get("tool_results") or {},
+                "direct_reply": decision.get("direct_reply", "")}
+    return {"route": decision["route"], "tool_results": decision.get("tool_results") or {},
+            "direct_reply": decision.get("direct_reply", "")}
+
+
+async def _order_answer_node(state: AgentState) -> dict:
     await _emit_status(state, "order_query", "正在查询订单...")
-    reply = await _handle_order_status(state["user_id"], state["intent_result"].slots, state.get("emit"))
+    reply = _compose_order_answer(state.get("tool_results") or {}, state.get("direct_reply", ""))
     return {"reply": reply, "answer_streamed": False}
 
 
-async def _policy_node(state: AgentState) -> dict:
+async def _policy_answer_node(state: AgentState) -> dict:
     session = state["session"]
     await _emit_status(state, "rag", "正在检索政策...")
+    tool_results = state.get("tool_results") or {}
     try:
-        reply, answer_streamed = await _handle_policy(state["user_message"], state.get("emit"))
+        if "search_policy" not in tool_results and state.get("direct_reply"):
+            # LLM 未检索直接作答（纯自主语义）：直接透出 LLM 作答
+            reply, answer_streamed = state["direct_reply"], False
+        else:
+            reply, answer_streamed = await _compose_policy_answer(
+                tool_results, state["user_message"], state.get("emit"))
     except LLM_FALLBACK_ERRORS:
         raise  # 熔断 → 冒泡给装饰器 → 规则引擎
     except Exception:
@@ -443,36 +538,40 @@ def _route_after_preprocess(state: AgentState) -> str:
     return "finalize" if state.get("injection_detected") else "intent_recognition"
 
 
-def _route_after_intent(state: AgentState) -> str:
-    intent = state.get("intent")
-    if intent in FLOWS:
-        return "business_flow"
-    if intent == "ORDER_STATUS":
-        return "order_status"
-    if intent == "POLICY_INQUIRY":
-        return "policy"
-    return "chitchat"
+ROUTE_TO_NODE = {
+    "order": "order_answer",
+    "policy": "policy_answer",
+    "business": "business_flow",
+    "chitchat": "chitchat",
+}
+
+
+def _route_after_agent_loop(state: AgentState) -> str:
+    """按 agent_loop 产出 route 路由到生成节点（未知值防御兜底 chitchat）。"""
+    return ROUTE_TO_NODE.get(state.get("route"), "chitchat")
 
 
 def _build_agent_graph():
     builder = StateGraph(AgentState)
     builder.add_node("preprocess", _preprocess_node)
     builder.add_node("intent_recognition", _intent_node)
+    builder.add_node("agent_loop", _agent_loop_node)
     builder.add_node("business_flow", _business_flow_node)
-    builder.add_node("order_status", _order_status_node)
-    builder.add_node("policy", _policy_node)
+    builder.add_node("order_answer", _order_answer_node)
+    builder.add_node("policy_answer", _policy_answer_node)
     builder.add_node("chitchat", _chitchat_node)
     builder.add_node("finalize", _finalize_node)
     builder.add_edge(START, "preprocess")
     builder.add_conditional_edges(
         "preprocess", _route_after_preprocess, {"finalize": "finalize", "intent_recognition": "intent_recognition"}
     )
+    builder.add_edge("intent_recognition", "agent_loop")
     builder.add_conditional_edges(
-        "intent_recognition", _route_after_intent,
-        {"business_flow": "business_flow", "order_status": "order_status",
-         "policy": "policy", "chitchat": "chitchat"},
+        "agent_loop", _route_after_agent_loop,
+        {"business_flow": "business_flow", "order_answer": "order_answer",
+         "policy_answer": "policy_answer", "chitchat": "chitchat"},
     )
-    for branch in ("business_flow", "order_status", "policy", "chitchat"):
+    for branch in ("business_flow", "order_answer", "policy_answer", "chitchat"):
         builder.add_edge(branch, "finalize")
     builder.add_edge("finalize", END)
     return builder.compile()
@@ -487,8 +586,8 @@ async def run_agent(session: Session, user_message: str, user_id: int, emit=None
 
     契约透出（评测 §5.1）：
     - answer.delta：终答增量。LLM 生成（chitchat/policy）逐段流式；静态/规则话术全量补发。
-    - usage：本轮所有 LLM 调用（意图分类/回复生成/severity/policy）token 全计，done 前单条 emit。
-    - tool_call / reasoning：状态机业务动作与查询动作观测式透出，emit 后从 state 移除防累积。
+    - usage：本轮所有 LLM 调用（意图分类/决策循环/回复生成）token 全计，done 前单条 emit。
+    - tool_call / reasoning：状态机业务动作与决策循环工具动作观测式透出，emit 后从 state 移除防累积。
     """
     t0 = time.perf_counter()
     # 硬约束：usage.begin() 必须在 ainvoke 之前。langgraph 每节点 contextvar 上下文拷贝，
