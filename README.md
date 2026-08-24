@@ -2,7 +2,7 @@
 
 > **高并发 AI Agent 智能客服系统**：面向电商售后场景，从**退换货政策问答、订单状态查询**，到**退货、仅退款、投诉**等可完成的业务动作，在对话内一站式闭环，并具备从 **Agent 编排、LangGraph 状态机、RAG 检索、存储高可用到 LLM 网关治理**的全链路工程化能力。
 
-本系统是**生产级全栈演示项目**：5 个容器一键启动、4 大售后场景数据开箱即演示、96 项后端测试 + 41 项前端测试全绿、SSE 契约化流式全链路可观测、DeepSeek 多 Key 网关 + 熔断降级**永不因 LLM 故障崩溃**。
+本系统是**生产级全栈演示项目**：一键启动全栈容器（backend/nginx/mysql/redis/Milvus）、4 大售后场景数据开箱即演示、138 项后端测试 + 41 项前端测试全绿、SSE 契约化流式全链路可观测、LLM 工具决策 + 实时护栏（P3-P5）、DeepSeek 多 Key 网关 + 熔断降级**永不因 LLM 故障崩溃**。
 
 ---
 
@@ -37,7 +37,7 @@
 | 能力 | 实现 | 对应痛点 |
 |------|------|---------|
 | **对话式业务办理** | LangGraph 状态机驱动退货/仅退款/投诉，每步落库真实可查，支持部分退货多轮指定 | 人力成本 |
-| **政策问答** | MySQL 原文源 + ChromaDB 向量 + RAG 检索，命中/未命中都有兜底，绝不编造 | 口径不一 |
+| **政策问答** | MySQL 原文源 + Milvus 向量 + RAG 检索，命中/未命中都有兜底，绝不编造 | 口径不一 |
 | **订单/进度查询** | 对接层抽象 + 意图切换快照，对话内随时查单、中途切流、断点恢复 | 业务断层 |
 | **高可用工程** | DeepSeek 多 Key 网关 + StorageRouter 双写 + 熔断降级，LLM/存储故障系统不崩 | 峰值崩溃 |
 
@@ -51,7 +51,7 @@
 - **政策有依据**：RAG 检索知识库 → LLM 结合政策回答，空结果明确引导人工而非编造。
 
 ### 对客服运营 / 管理员（`role=admin`）
-- **知识库自助维护**：文档级上传 / 编辑 / 删除 / 全量同步，MySQL 存原文、ChromaDB 存向量，一致性强；
+- **知识库自助维护**：文档级上传 / 编辑 / 删除 / 全量同步，MySQL 存原文、Milvus 存向量，一致性强；
 - **订单数据可控**：订单 + 商品明细增删改，可模拟任意订单状态用于测试；
 - **一键重置测试数据**：清空业务流水、恢复种子订单，测试无限重跑；
 - **降级保障**：LLM 熔断走规则引擎 10 条正则兜底，系统永不因 AI 故障崩溃。
@@ -77,10 +77,10 @@
 - Redis 故障 → 自动切 MySQL 模式；后台 5s 探测 Redis，恢复后自动切回，日志记录 `storage_mode_switch`；
 - MySQL 兜底读取时重建最近 10 条消息 + 摘要，保证 LLM 上下文完整。
 
-### 3. RAG 一致性：MySQL 为源 + ChromaDB 派生索引（数据完整性）
-- **根除行业通病**：纯向量库方案下 chunks 是"可变快照"，改过就无法还原原文；本项目改为 **MySQL 存原始 Markdown（source of truth），ChromaDB 只存分块向量快照**，每次从源重新生成，不独立演进；
+### 3. RAG 一致性：MySQL 为源 + Milvus 派生索引（数据完整性）
+- **根除行业通病**：纯向量库方案下 chunks 是"可变快照"，改过就无法还原原文；本项目改为 **MySQL 存原始 Markdown（source of truth），Milvus 只存分块向量快照（LlamaIndex 管理）**，每次从源重新生成，不独立演进；
 - **一致性策略**：写向量失败 → 标记 `pending` → 下次写操作增量补偿（O(失败数)），全量对账仅异常恢复时 admin 手动触发；
-- **检索链路**：Embedding(bge-small-zh) → ChromaDB Top-10 → Re-rank Top-3 → Redis 精确缓存（TTL 600s）；空结果（score<0.3）不注入 prompt，回复引导人工。
+- **检索链路**：Embedding(bge-small-zh) → Milvus Top-10 → Re-rank Top-3 → Redis 精确缓存（TTL 600s）；空结果（score<0.3）不注入 prompt，回复引导人工。
 
 ### 4. LangGraph 状态机：可完成的业务动作 + 全局可打断
 - **三个业务流**（退货/仅退款/投诉）各为一张图，每轮用户输入推进一节点，停在 `awaiting`（等待输入）或 `final`（终态）；
@@ -123,9 +123,14 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 - **会话消息体截断**：`SESSION_MAX_MESSAGES`（默认 40 条）超限截断为「首条 user 消息 + 最近 N-1 条」，防止会话无限增长（LLM/状态机不读消息全文，截断仅影响前端历史展示）。
 
 ### 9. 工程化质量
-- **后端 96 项测试全绿**（另 3 项环境相关跳过）：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性）、SSE 契约（帧格式/usage 必选/answer-done 一致）、DeepSeek Gateway（429/5xx/超时重试、首 delta 后不重试）、部分退货规则兜底、RAG、StorageRouter、会话历史/消息截断、contracts 端点；
+- **后端 138 项测试全绿**（另 3 项环境相关跳过）：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/answer-done 一致）、DeepSeek Gateway（429/5xx/超时重试、首 delta 后不重试）、部分退货规则兜底、RAG、StorageRouter、tool_call_log 落库、会话历史/消息截断、contracts 端点；
 - **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
 - **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
+
+### 10. LLM 工具决策循环 + 实时护栏（P3-P5）
+- **决策循环**：`ORDER_STATUS` / `POLICY_INQUIRY` 意图下，LLM 自主决定调只读工具（`search_policy` / `query_order` / `list_user_orders`），工具结果回灌后由生成节点组装回复；业务副作用工具（建退货/退款/投诉单、资格判定）的决策被护栏拦截，转由 LangGraph 状态机确定性接手——决策与执行分离，LLM 不裸调业务动作；
+- **实时护栏 ToolGuardrail**：决策与执行之间的确定性规则校验，输出 `allow / reject / override` 三态 + 机器可读理由——副作用工具 reject→business、`search_policy` 过短/纯问候 reject、`query_order` 缺单号 override 为列最近订单、同轮同参数 dedupe 复用首次结果、累计工具调用 >3 截断强制出路由；
+- **观测落库**：每次护栏判定写 `tool_call_log`（session / round / tool / verdict / reason / 结果摘要 / 延迟），落库失败静默不阻断决策；为管理侧调用分析预留数据底座。
 
 ---
 
@@ -149,7 +154,7 @@ graph TB
     subgraph 数据层
         MYSQL[(MySQL 8<br/>业务事实 + 知识库原文源)]
         REDIS[(Redis<br/>会话主存 + 快照 + RAG 缓存)]
-        CHROMA[(ChromaDB<br/>知识向量派生索引)]
+        MILVUS[(Milvus<br/>知识向量派生索引)]
     end
 
     WEB --> NGINX
@@ -161,7 +166,7 @@ graph TB
     GW --> BGE
     API --> MYSQL
     API --> REDIS
-    API --> CHROMA
+    API --> MILVUS
 ```
 
 **核心链路（以退货为例）**：
@@ -189,10 +194,10 @@ graph TB
 | 前端 | Vue3 + Vite + Element Plus + Pinia | 客服聊天 + Admin 管理后台，SSE 逐帧消费 |
 | 关系数据库 | MySQL 8 | 业务权威数据 + 知识库原文源（source of truth） |
 | 缓存/会话 | Redis 7 | 会话主存 / 快照 / RAG 精确缓存 |
-| 向量库 | ChromaDB + bge-small-zh | 知识库派生索引，Top-10 → Re-rank Top-3 |
+| 向量库 | Milvus + LlamaIndex + bge-small-zh | 知识库派生向量索引，Top-10 → Re-rank Top-3 |
 | LLM | DeepSeek（openai 兼容） | chat 意图/响应/闲聊 + reasoner 资格/严重性，超时降级 |
 | 网关 | 自研 KeyPool + 熔断 | 多 Key 滑动窗口 RPM + 排队背压 + 规则引擎兜底 |
-| 测试 | pytest + pytest-asyncio + vitest | 后端 96 / 前端 41，集成测试真实链路可重跑 |
+| 测试 | pytest + pytest-asyncio + vitest | 后端 138 / 前端 41，集成测试真实链路可重跑 |
 
 ---
 
@@ -302,7 +307,7 @@ customer-service/
 │   │   │   ├── rule_engine.py    # 规则引擎兜底（10 条正则，LLM 熔断时生效）
 │   │   │   ├── usage.py          # token 用量聚合（contextvar，按 asyncio task 隔离）
 │   │   │   ├── state_machine/    # 退货/退款/投诉状态机（LangGraph）
-│   │   │   ├── function_calling/ # 工具（order/return/refund/complaint tools）
+│   │   │   ├── function_calling/ # 工具 + 护栏（order/return/refund/policy tools、guardrail、tool_call_log）
 │   │   │   └── prompts/          # prompt 模板（意图/闲聊/政策…）
 │   │   ├── infrastructure/       # DeepSeek Gateway（keypool/熔断/网关）+ MySQL
 │   │   ├── rag/                  # RAG（embedder/retriever/milvus_impl/kb_store/knowledge）
@@ -310,7 +315,7 @@ customer-service/
 │   │   ├── session/              # 会话管理（Redis 主存 + MySQL 兜底 + 消息截断）
 │   │   └── utils/
 │   ├── sql/init.sql              # 建表 + 种子数据
-│   └── tests/                    # 96 项单元/契约/集成测试
+│   └── tests/                    # 138 项单元/契约/集成测试
 ├── frontend/                     # 前端（Vue3 + Vite + Element Plus）
 │   ├── src/
 │   │   ├── api/                  # axios 接口模块
@@ -322,7 +327,7 @@ customer-service/
 │   └── vitest.config.ts
 ├── docker/                       # Dockerfile.backend / nginx.conf
 ├── docs/
-├── docker-compose.yml            # 5 容器编排（一键启动）
+├── docker-compose.yml            # 全栈容器编排（一键启动）
 ├── .env.example                  # 环境变量模板（每项含注释）
 ├── solution.md                   # 技术方案（设计依据）
 ├── task.md                       # 任务拆分与验收标准
@@ -335,7 +340,7 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图 / 状态机 / 编排器 / SSE 契约 / Gateway / usage / RAG / 会话 / 路由 / contracts | **96 passed, 3 skipped** |
+| 后端单元/契约 | 意图 / 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway / usage / RAG / 会话 / tool_call_log / contracts | **138 passed, 3 skipped** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 可重复运行 |
 | E2E | 浏览器端到端（真实容器 + SSE 流式渲染） | 已验证通过 |
@@ -347,7 +352,7 @@ customer-service/
 docker compose exec backend python -m pytest tests/ -q
 
 # 后端（本地执行需先装 backend/requirements.txt，并把 .env 中
-# REDIS_URL/MYSQL_URL/CHROMA_HOST 改为本机可达；如遇 pytest_html 缺 py 包报错，加 -p no:html）
+# REDIS_URL/MYSQL_URL/MILVUS_URI 改为本机可达；如遇 pytest_html 缺 py 包报错，加 -p no:html）
 cd backend && python -m pytest tests/ -q -p no:html
 
 # 前端（需在 frontend 目录下执行，vitest 才能解析 @ 别名）
@@ -371,7 +376,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 - 改 `.env` 配置后 `docker compose up -d` 重启容器即可。
 
 ### 跑测试 / 验收
-- 提交前先跑后端 `pytest tests/ -q` 与前端 `vitest run`，确保不破坏既有 96 + 41 项；
+- 提交前先跑后端 `pytest tests/ -q` 与前端 `vitest run`，确保不破坏既有 138 + 41 项；
 - 集成测试需服务在跑（`docker compose up -d`），未启动自动跳过不误报。
 
 ### 新增 API
@@ -388,7 +393,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 现象 | 处理 |
 |------|------|
-| 首次启动慢 | MySQL 建表灌种子、ChromaDB 下载 embedding 模型（bge-small-zh）需要时间，等 `docker compose ps` 全 healthy 再访问 |
+| 首次启动慢 | MySQL 建表灌种子、backend 首次加载 embedding 模型（bge-small-zh）需要时间，等 `docker compose ps` 全 healthy 再访问 |
 | 没有 DeepSeek Key | `DEEPSEEK_API_KEYS` 留空时系统可正常启动，所有 LLM 调用走规则引擎兜底（仅能回复预置话术） |
 | 端口冲突 80/8001/3306 | 修改 `docker-compose.yml` 对应 `ports`（本仓库已因占用临时映射为 8081/8002/3308，见文件内注释） |
 | 改了 backend 代码不生效 | backend 容器无源码挂载，需 `docker compose build backend && docker compose up -d backend` 重建 |
