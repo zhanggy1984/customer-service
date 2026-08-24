@@ -17,6 +17,7 @@ import json
 import time
 
 from app.agent.function_calling.executor import execute
+from app.agent.function_calling.guardrail import ToolGuardrail
 from app.agent.function_calling.registry import TOOL_SCHEMAS
 from app.config import settings
 from app.infrastructure.deepseek import (
@@ -28,16 +29,6 @@ from app.infrastructure.deepseek import (
 from app.utils.logger import logger
 
 LLM_FALLBACK_ERRORS = (LLMUnavailableError, CapacityExceededError, AllKeysDownError)
-
-# 决策循环内只执行只读白名单工具；其余工具决策由护栏拦截
-READONLY_TOOLS = {"query_order", "list_user_orders", "search_policy"}
-# 副作用工具：LLM 决策到这些工具 → 不执行、不透出，route=business（状态机确定性接手）
-SIDE_EFFECT_TOOLS = {
-    "check_return_eligibility",
-    "create_return_order",
-    "create_refund_order",
-    "create_complaint",
-}
 
 DECISION_PROMPT = (
     "你是电商客服助手，负责决定是否调用工具来回答用户问题。\n"
@@ -65,33 +56,6 @@ def _merge_usage(acc: dict, usage: dict | None) -> dict:
     for k in _EMPTY_USAGE:
         acc[k] += usage.get(k, 0) or 0
     return acc
-
-
-async def _execute_guarded(
-    name: str,
-    params: dict,
-    user_id: int,
-    session_id: str,
-    tool_events: list,
-) -> dict | None:
-    """护栏包装执行。返回结果 dict；副作用工具被拦返回 None（调用方据此 route=business）。"""
-    if name in SIDE_EFFECT_TOOLS:
-        logger.info("event=fc_guard_side_effect", extra={"tool": name})
-        return None
-    if name == "query_order" and not (params.get("order_id") or "").strip():
-        # 无订单号 → 兜底列最近订单（沿用既有"无单号列订单辅助定位"语义）
-        name = "list_user_orders"
-        params = {"limit": 5}
-        logger.info("event=fc_guard_override", extra={"from": "query_order", "to": "list_user_orders"})
-    result = await execute(name, params, user_id, session_id)
-    tool_events.append({
-        "id": str(time.time_ns()),
-        "name": name,
-        "args": params,
-        "result": result,
-        "status": "error" if result.get("error") else "success",
-    })
-    return result
 
 
 def _decide_route(intent: str, tool_results: dict) -> str:
@@ -130,6 +94,10 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
         {"role": "user", "content": user_message},
     ]
 
+    # 护栏 per 决策循环实例化：dedupe 缓存与调用计数跨轮有效（P4 独立规则校验器）
+    guardrail = ToolGuardrail()
+    limit_hit = False  # 累计工具调用达上限 → 终止整个决策循环强制出路由
+
     for _ in range(settings.agent_loop_max_rounds):
         try:
             data = await deepseek_client.chat(
@@ -165,21 +133,61 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
                 params = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
                 params = {}
-            result = await _execute_guarded(name, params, user_id, session_id, tool_events)
-            # 副作用工具决策 → 护栏拦截，route=business（状态机确定性接手）。丢弃已读结果，
-            # 但透出被拦工具名与参数：orchestrator 据此重映射真实业务意图（如 ORDER_STATUS
-            # 误分类 + create_return_order → RETURN_REQUEST），否则 business_flow 索引 FLOWS
-            # 对非业务意图抛 KeyError。
-            if result is None:
+            # P4 实时护栏：决策与执行之间确定性校验，输出 allow/reject/override + 理由
+            decision = guardrail.check(name, params)
+            logger.info("event=guardrail_verdict", extra={
+                "tool": name, "verdict": decision.verdict, "reason": decision.reason, "params": params})
+            # 副作用工具 → 拦截 route=business（状态机确定性接手）。透出被拦工具名与参数：
+            # orchestrator 据此重映射真实业务意图（如 ORDER_STATUS 误分类 + create_return_order
+            # → RETURN_REQUEST），否则 business_flow 索引 FLOWS 对非业务意图抛 KeyError。
+            if decision.verdict == "reject" and decision.reason == "side_effect":
                 return {"route": "business", "blocked_tool": name, "blocked_args": params,
                         "tool_results": tool_results, "tool_events": tool_events,
                         "usage": decision_usage, "direct_reply": ""}
+            if decision.verdict == "reject" and decision.reason == "too_many_calls":
+                # 截断：达工具调用上限强制出路由。此处 break 只出内层 call 循环，须 flag
+                # 终止外层 LLM 轮次循环——否则下一轮 chat 携带未闭环的 tool_call 引用
+                # （OpenAI 兼容 400），且"强制出路由"落空（还会多跑一轮）。
+                logger.info("event=fc_call_limit_reached", extra={"tool": name})
+                limit_hit = True
+                break
+            if decision.verdict == "reject":
+                # 软拒绝（trivial_query）：跳过执行，但回灌"被拒"占位结果——assistant 消息已
+                # 携带全部 tool_calls，若不给对应 tool 响应，下一轮消息格式悬空（OpenAI 兼容
+                # 服务会校验 400），且 LLM 需要看到被拒理由才改查询或放弃。
+                messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
+                                 "content": json.dumps({"error": f"该工具调用被护栏拒绝：{decision.reason}"},
+                                                       ensure_ascii=False)})
+                continue
+            if decision.verdict == "override":
+                name, params = decision.tool_name, decision.params
+            if decision.cached_result is not None:
+                # dedupe：复用首次结果，不重复执行、不透出事件（观测层只透实际执行动作）。
+                # 仍回灌 tool result 闭环 LLM 的 tool_call 引用，避免下一轮消息格式悬空。
+                tool_results[name] = decision.cached_result
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": json.dumps(decision.cached_result, ensure_ascii=False),
+                })
+                continue
+            result = await execute(name, params, user_id, session_id)
+            guardrail.record(name, params, result)
             tool_results[name] = result
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.get("id", ""),
                 "content": json.dumps(result, ensure_ascii=False),
             })
+            tool_events.append({
+                "id": str(time.time_ns()),
+                "name": name,
+                "args": params,
+                "result": result,
+                "status": "error" if result.get("error") else "success",
+            })
+        if limit_hit:
+            break  # 截断生效：终止整个决策循环，按已有 tool_results 出路由
 
     # 回退闸门：policy 意图强制补一次 search_policy（评测扣分时一键回退）
     if (intent == "POLICY_INQUIRY" and settings.agent_loop_force_policy_search
