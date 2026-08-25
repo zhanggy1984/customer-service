@@ -45,6 +45,17 @@ class MilvusVectorStore(IVectorStore):
                 settings.milvus_uri,
                 settings.milvus_collection,
             )
+            # 显式 load：restore/共享 milvus 重启后 collection 回到未加载态，
+            # 查询会报 "collection not loaded"（Milvus load 状态不持久，须应用自 load）
+            try:
+                self._client.load_collection(self._collection)
+                logger.info("event=milvus_loaded collection=%s", self._collection)
+            except Exception as exc:
+                logger.warning(
+                    "event=milvus_load_skipped collection=%s error=%s",
+                    self._collection,
+                    exc,
+                )
         return self._store
 
     @property

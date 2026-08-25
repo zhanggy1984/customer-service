@@ -6,6 +6,17 @@
 
 ---
 
+> ## ⚠️ 前置依赖：共享 infra
+>
+> 本 agent **不自带任何中间件**，运行前须先部署共享 infra（MySQL/Redis/Milvus/MinIO 等）。
+>
+> ```bash
+> # 发布物：clone infra 独立仓库后启动
+> git clone https://github.com/zhanggy1984/share-infra && cd infra && docker compose up -d
+> # 本地开发：infra 位于 ../infra
+> cd ../infra && docker compose up -d
+> ```
+
 ## 目录
 
 - [一、项目简介：解决什么痛点](#一项目简介解决什么痛点)
@@ -204,6 +215,7 @@ graph TB
 ## 六、快速开始（3 步跑起来）
 
 > 前置：Docker + Docker Compose（`docker compose` v2 语法）、Node.js ≥ 18。
+> **共享 infra**：本 agent 不自带任何中间件（MySQL/Redis/Milvus/MinIO 全在共享 infra）。启动前先部署 infra（见 infra 仓库 README：`docker compose up -d`）。
 
 ### 第 1 步：配置环境变量
 
@@ -214,14 +226,14 @@ cp .env.example .env
 #   JWT_SECRET_KEY=<随机长字符串>            # 生产必须替换，如 python -c "import secrets;print(secrets.token_urlsafe(48))"
 ```
 
-### 第 2 步：一键启动全栈容器
+### 第 2 步：启动应用容器（nginx + backend）
 
 ```bash
 docker compose up -d
-docker compose ps          # 等待全部 healthy
+docker compose ps          # customer-service-nginx / backend 全部 Up + healthy
 ```
 
-启动 `nginx` / `backend` / `redis` / `mysql` 与 Milvus 套件（`milvus` / `etcd` / `minio`）。MySQL 首次启动自动建表 + 灌入种子数据（5 个订单覆盖全场景），Milvus 由知识库启动同步自动灌入 4 篇预置政策文档。
+> 本 agent 只起应用容器；中间件（MySQL/Redis/Milvus/MinIO）全在共享 infra。应用启动幂等自建表 + 种子（5 个订单覆盖全场景），知识库启动幂等灌入 4 篇预置政策文档。
 
 ### 第 3 步：构建前端并访问
 
@@ -243,21 +255,14 @@ npm run build             # 生产：构建产物挂载到 nginx
 
 | 入口 | 地址 | 用途 |
 |------|------|------|
-| 前端（生产） | http://localhost:80 | nginx 统一入口，含 API 反代 |
+| 前端（生产） | http://localhost:8081 | nginx 统一入口，含 API 反代 |
 | 后端 API | http://localhost:8000/api/v1 | 开发调试（含 SSE） |
 | 前端（开发热更新） | http://localhost:5173 | Vite dev server |
-| **MySQL** | `localhost:3306`（csuser/cspass，库 `customer_service`） | 外部工具验证数据 |
-| **Redis** | `localhost:6379` | 外部工具验证数据 |
-| **Milvus** | 容器内 `milvus:19530`（宿主机联调经 override 映射 19533） | 外部工具验证向量库 |
+| **MySQL** | `localhost:33061`（共享 infra，库 `customer_service`） | 外部工具验证数据 |
+| **Redis** | `localhost:36379`（共享 infra） | 外部工具验证数据 |
+| **Milvus** | `localhost:39530`（共享 infra） | 外部工具验证向量库 |
 
-> **端口冲突**：若宿主机 80/3306 已被其他项目占用，无需改 `docker-compose.yml`，创建本地 `docker-compose.override.yml` 覆盖端口即可（docker compose 自动合并，且已 gitignore 不入库）：
->
-> ```yaml
-> # docker-compose.override.yml（本机专用，可提交到个人分支或忽略）
-> services:
->   nginx:  { ports: ["8081:80"] }      # 标准 80:80
->   mysql:  { ports: ["3308:3306"] }    # 标准 3306:3306
-> ```
+> **端口冲突**：宿主端口固定（前端 8081 / 后端 8000），如需改动 `docker-compose.yml` 的 `ports` 即可；中间件端口由共享 infra 管理，本仓库不涉及。
 
 ---
 
@@ -367,7 +372,7 @@ cd frontend && npx vitest run
 
 ```bash
 cp .env.example .env              # 配 DEEPSEEK_API_KEYS / JWT_SECRET_KEY
-docker compose up -d              # 起中间件
+docker compose up -d              # 起共享 infra（MySQL/Redis/Milvus/MinIO）
 docker compose exec backend bash  # 进入后端容器开发/调试
 ```
 

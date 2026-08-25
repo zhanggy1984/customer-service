@@ -1,0 +1,49 @@
+"""init_schema 切分与执行测试（P3.3：共享 mysql 不跑 init.sql，应用启动自建表+种子）
+
+守护修复：init.sql 每个语句前带 `-- ---------- xxx ----------` 注释行，切分不得按"段以
+-- 开头"丢弃含 SQL 的段——否则 fresh infra 上建表+种子全被跳过（应用无表可用）。
+"""
+import asyncio
+
+from app.infrastructure import schema
+
+
+class _FakePool:
+    """记录被执行的 SQL，不连真实 MySQL"""
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    async def execute(self, sql: str) -> None:
+        self.executed.append(sql)
+
+
+def test_init_schema_executes_all_statements(monkeypatch):
+    """init.sql 全部 14 条语句（SET/USE + 9 建表 + 3 种子）均被切分并执行"""
+    fake = _FakePool()
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema.init_schema())
+
+    assert len(fake.executed) == 14, f"应为 14 条语句，实际 {len(fake.executed)}"
+    joined = "\n".join(fake.executed)
+    # 建表（抽查关键表）
+    assert "CREATE TABLE IF NOT EXISTS users" in joined
+    assert "CREATE TABLE IF NOT EXISTS orders" in joined
+    assert "CREATE TABLE IF NOT EXISTS tool_call_log" in joined
+    # 种子（幂等插入：用户/订单/订单项）
+    assert "INSERT IGNORE INTO users" in joined
+    assert "INSERT IGNORE INTO orders" in joined
+    assert "INSERT INTO order_items" in joined
+    # 库上下文
+    assert "USE customer_service" in joined
+
+
+def test_init_schema_skips_missing_file(monkeypatch):
+    """init.sql 不存在时不抛错，仅告警跳过"""
+    fake = _FakePool()
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    monkeypatch.setattr(
+        schema, "INIT_SQL_PATH", schema.INIT_SQL_PATH.parent / "no-such-init.sql"
+    )
+    asyncio.run(schema.init_schema())
+    assert fake.executed == []

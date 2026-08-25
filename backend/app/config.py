@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     service_mode: str = "local"          # local | remote（对接层）
 
     # ---------- 基础设施 ----------
-    redis_url: str = "redis://redis:6379/0"
+    redis_url: str = "redis://redis:6379/1"   # 共享 Redis db index 1（隔离规范 cs=/1）
     mysql_url: str = "mysql+asyncmy://csuser:cspass@mysql:3306/customer_service"
     mysql_pool_size: int = 20
     mysql_max_overflow: int = 40
@@ -63,7 +63,7 @@ class Settings(BaseSettings):
 
     # ---------- Milvus（VECTOR_STORE=milvus 时生效） ----------
     milvus_uri: str = "http://milvus:19530"          # compose 内服务名；本地开发改 http://localhost:19533
-    milvus_collection: str = "knowledge"
+    milvus_collection: str = "cs_knowledge"   # 共享 Milvus 加 cs_ 前缀（隔离规范）
     milvus_token: str = ""
 
     # ---------- Admin 默认账号 ----------

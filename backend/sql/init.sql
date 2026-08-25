@@ -145,13 +145,15 @@ CREATE TABLE IF NOT EXISTS tool_call_log (
 -- 种子数据
 -- =============================================================
 -- 密码: admin/admin123, user_1/user_2 均为 123456（bcrypt 预生成 hash）
-INSERT INTO users (username, password_hash, role, phone) VALUES
+-- 幂等：INSERT IGNORE 依赖 username UNIQUE，重复启动不重复插入
+INSERT IGNORE INTO users (username, password_hash, role, phone) VALUES
     ('admin',  '$2b$12$K3vOmcMr0lF8hKB1.tfecu.22mtv6RK01l7B/.eR4kgryCclvflSW', 'admin', '13800000000'),
     ('user_1', '$2b$12$jl38CVX4S2zf2sdwxweUyuN/WMk2zbCifYtx.EPJfnxUyLAmTDvdC', 'user',  '13800000001'),
     ('user_2', '$2b$12$jl38CVX4S2zf2sdwxweUyuN/WMk2zbCifYtx.EPJfnxUyLAmTDvdC', 'user',  '13800000002');
 
 -- 订单（user_1 -> id=2, user_2 -> id=3）
-INSERT INTO orders (order_id, user_id, status, total_amount, shipping_address, created_at, delivered_at) VALUES
+-- 幂等：INSERT IGNORE 依赖 order_id UNIQUE
+INSERT IGNORE INTO orders (order_id, user_id, status, total_amount, shipping_address, created_at, delivered_at) VALUES
     ('ORD-20240801-001', 2, 'DELIVERED',  69.70,  '上海市浦东新区示例路1号', '2026-08-03 10:00:00', '2026-08-03 15:00:00'), -- 4天前, 正常退货/部分退货
     ('ORD-20240805-002', 2, 'SHIPPED',    228.90, '上海市浦东新区示例路1号', '2026-08-05 10:00:00', NULL),                  -- 2天前, 多商品/仅退款被拒
     ('ORD-20240806-003', 2, 'PAID',       89.85,  '上海市浦东新区示例路1号', '2026-08-06 10:00:00', NULL),                  -- 1天前, 仅退款成功+不可退商品
@@ -159,12 +161,17 @@ INSERT INTO orders (order_id, user_id, status, total_amount, shipping_address, c
     ('ORD-20240725-005', 2, 'DELIVERED',  88.00,  '上海市浦东新区示例路1号', '2026-07-25 10:00:00', '2026-07-25 16:00:00'); -- 13天前, 超7天退货期
 
 -- 商品明细（8 种商品，SKU-006 为定制商品不可退）
-INSERT INTO order_items (order_id, item_id, name, price, quantity, returnable) VALUES
-    (1, 'SKU-001', '手机壳',         29.90,  1, 1),
-    (1, 'SKU-002', '钢化膜',         19.90,  2, 1),
-    (2, 'SKU-003', '蓝牙耳机',       199.00, 1, 1),
-    (2, 'SKU-004', '耳机收纳盒',     29.90,  1, 1),
-    (3, 'SKU-005', '数据线',         29.95,  2, 1),
-    (3, 'SKU-006', '定制手机支架',   29.95,  1, 0),
-    (4, 'SKU-007', '充电宝',         150.00, 1, 1),
-    (5, 'SKU-008', '台灯',           88.00,  1, 1);
+-- 幂等：order_items 无唯一 key，用空表守卫（仅当表为空才插入种子，防重复启动重复插入）
+INSERT INTO order_items (order_id, item_id, name, price, quantity, returnable)
+SELECT * FROM (
+    -- 首个 SELECT 起唯一别名：字面量列默认列名重复（多个 1）时 MySQL 8 派生表报 1060 Duplicate column name
+    SELECT 1 AS order_id, 'SKU-001' AS item_id, '手机壳' AS name, 29.90 AS price, 1 AS quantity, 1 AS returnable UNION ALL
+    SELECT 1, 'SKU-002', '钢化膜',         19.90,  2, 1 UNION ALL
+    SELECT 2, 'SKU-003', '蓝牙耳机',       199.00, 1, 1 UNION ALL
+    SELECT 2, 'SKU-004', '耳机收纳盒',     29.90,  1, 1 UNION ALL
+    SELECT 3, 'SKU-005', '数据线',         29.95,  2, 1 UNION ALL
+    SELECT 3, 'SKU-006', '定制手机支架',   29.95,  1, 0 UNION ALL
+    SELECT 4, 'SKU-007', '充电宝',         150.00, 1, 1 UNION ALL
+    SELECT 5, 'SKU-008', '台灯',           88.00,  1, 1
+) seed_items
+WHERE (SELECT COUNT(*) FROM order_items) = 0;

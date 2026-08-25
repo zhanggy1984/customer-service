@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from app.api import auth, contracts, routes
 from app.infrastructure.deepseek import deepseek_client
 from app.infrastructure.mysql import mysql_pool
+from app.infrastructure.schema import init_schema
 from app.rag.init import init_knowledge
 from app.rag.retriever import retriever
 from app.session.manager import session_manager
@@ -21,6 +22,7 @@ async def lifespan(_: FastAPI):
     logger.info("event=app_startup")
     await session_manager.init()
     await mysql_pool.init()
+    await init_schema()   # 共享 mysql 不跑 init.sql，应用启动自建表+种子（幂等）
     await init_knowledge()
     await retriever.init()
     await deepseek_client.init()
