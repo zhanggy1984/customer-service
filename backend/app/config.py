@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     conversation_max_rounds: int = 10
     # 会话消息体保存上限（条数）：超出截断，仅保留首条 user 消息 + 最近 N-1 条
     session_max_messages: int = 40
+    # 数据保留：会话/tool_call_log 超期清理（回收 MySQL 存储）。判据全部在 MySQL 侧
+    # NOW() 与 created_at 的 CURRENT_TIMESTAMP 同基准，Python 不生成 cutoff（避免时区错位）。
+    session_retention_days: int = 30               # 保留天数，超期清理
+    session_cleanup_interval_seconds: int = 3600   # 定时清理周期
+    session_cleanup_batch_size: int = 500          # 单批删除行数，控制事务大小
 
     # ---------- Agent 工具决策循环（P3） ----------
     # LLM 工具决策循环最大轮数（每轮一次 LLM 调用 + 若干工具执行）

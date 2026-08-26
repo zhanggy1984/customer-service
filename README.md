@@ -248,6 +248,7 @@ docker compose exec -T backend python verify_cs_e2e.py   # E2E：4 场景契约�
 - Redis 为主存储（会话/快照/缓存），MySQL 异步兜底双写；
 - Redis 故障 → 自动切 MySQL 模式；后台 5s 探测 Redis，恢复后自动切回，日志记录 `storage_mode_switch`；
 - MySQL 兜底读取时重建最近 10 条消息 + 摘要，保证 LLM 上下文完整。
+- **数据保留（TTL 回收）**：会话/护栏判定日志默认保留 30 天（`SESSION_RETENTION_DAYS`），超期回收 MySQL 存储——后台定时 sweep（`conversation_history`/`tool_call_log` 按 `created_at` 分批删除）+ `get_session` 惰性过期（Redis miss 走 MySQL 恢复时判超期即物理回收），`delete_session` 级联清 tool_call_log。判据全在 MySQL 侧 `NOW()`（与 `created_at` 的 `CURRENT_TIMESTAMP` 同基准，无时区错位）。
 
 ### 3. RAG 一致性：MySQL 为源 + Milvus 派生索引（数据完整性）
 - **根除行业通病**：纯向量库方案下 chunks 是"可变快照"，改过就无法还原原文；本项目改为 **MySQL 存原始 Markdown（source of truth），Milvus 只存分块向量快照（LlamaIndex 管理）**，每次从源重新生成，不独立演进；
@@ -346,6 +347,9 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | `JWT_EXPIRE_HOURS` | token 有效期（小时） | `2` |
 | `SESSION_TTL` | 会话 TTL（秒） | `3600` |
 | `CONVERSATION_MAX_ROUNDS` | 对话最大轮次 | `10` |
+| `SESSION_RETENTION_DAYS` | 会话/工具判定日志保留天数，超期定时+惰性回收（回收 MySQL 存储） | `30` |
+| `SESSION_CLEANUP_INTERVAL_SECONDS` | 定时清理周期（秒） | `3600` |
+| `SESSION_CLEANUP_BATCH_SIZE` | 单批删除行数（控制事务大小） | `500` |
 | `MILVUS_URI` / `MILVUS_COLLECTION` | Milvus 连接 / collection（共享 Milvus 加 `cs_` 前缀隔离） | `http://milvus:19530` / `cs_knowledge` |
 | `RAG_CACHE_TTL` / `INTENT_CACHE_TTL` | RAG 检索缓存 / 意图分类缓存 TTL（秒） | `600` / `60` |
 | `ADMIN_DEFAULT_USERNAME` / `ADMIN_DEFAULT_PASSWORD` | 管理端默认账号 | `admin` / `admin123` |
@@ -399,7 +403,7 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图 / 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 | **300 passed** |
+| 后端单元/契约 | 意图 / 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 / TTL 清理 | **309 passed** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 可重复运行 |
 | E2E | `backend/verify_cs_e2e.py`：4 场景契约断言（闲聊/订单/政策/投诉，token 拼接 == done.content） | 已验证通过 |
@@ -480,6 +484,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.2.3** | 2026-08-26 | 会话数据 TTL 清理（回收 MySQL 存储）：conversation_history/tool_call_log 保留 30 天超期回收，后台定时分批 sweep + get_session 惰性过期，delete_session 级联清 tool_call_log，补 idx_created_at 索引；SSE 内容帧对齐 good-question（answer→token，content+delta 双字段）；测试扩充至 309 项 |
 | **2.2.2** | 2026-08-26 | LLM 网关熔断 + 换 Key 重试退避 + 流中断隔离 + 空返回兜底 + 兜底异常元组去重；管理端文件上传（覆盖更新复用 upsert）；异常治理收尾（写路径幂等、检索冷却、DB 熔断）；RAG 增量跳检（content_hash）+ 章节级检索扩充；测试扩充至 297 项 |
 | **2.2.1** | 2026-08-26 | prompt 五维度法防注入（三层防护 + system prompt 结构化）；FC 契约优化（全量 `{ok,data,error}` 信封 + schema 规范化 + query 清洗）；分块前文本清洗 + 检索 query 归一化 |
 | **2.2** | 2026-08-26 | P6 回合缓存：无状态政策轮次短路整图复用答案（`search_policy.ok` 门控）；标题层级切分 + 章节级检索扩充 |

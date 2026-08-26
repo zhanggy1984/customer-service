@@ -36,7 +36,16 @@ class SessionManager:
         return session
 
     async def get_session(self, sid: str) -> Session | None:
-        return await self._router.load(sid)
+        session = await self._router.load(sid)
+        if session is None:
+            return None
+        # 惰性过期：Redis miss 走 MySQL 兜底恢复时，最后活跃超保留期 → 物理回收 + 视作不存在。
+        # 覆盖定时任务间隙（会话 30 天无活跃后 Redis key 早已过期，用户回访触达 MySQL 残留行）。
+        if await self._router.is_expired(sid, settings.session_retention_days):
+            await self._router.delete(sid)
+            logger.info("event=session_lazy_expire", extra={"session_id": sid})
+            return None
+        return session
 
     async def update_session(self, session: Session) -> None:
         session.trim(settings.session_max_messages)  # 消息体截断，防无限增长

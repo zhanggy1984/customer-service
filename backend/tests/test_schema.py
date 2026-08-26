@@ -18,7 +18,7 @@ class _FakePool:
     async def execute(self, sql: str) -> None:
         self.executed.append(sql)
 
-    async def fetchone(self, sql: str) -> dict | None:
+    async def fetchone(self, sql: str, params: tuple | None = None) -> dict | None:
         return self.one
 
 
@@ -132,3 +132,28 @@ def test_ensure_ticket_idempotency_key_skips_when_present(monkeypatch):
     monkeypatch.setattr(schema, "mysql_pool", fake)
     asyncio.run(schema._ensure_ticket_idempotency_key())
     assert not any("ALTER TABLE complaint_tickets" in s for s in fake.executed)
+
+
+def test_ensure_created_at_index_migrates_when_missing(monkeypatch):
+    """存量库缺 idx_created_at → 两表各 ALTER 补索引（TTL 清理按时间删除，缺索引会全表扫）"""
+    fake = _FakePool()
+    fake.one = {"c": 0}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_created_at_index())
+    assert any(
+        "ALTER TABLE conversation_history ADD KEY idx_created_at" in s
+        for s in fake.executed
+    )
+    assert any(
+        "ALTER TABLE tool_call_log ADD KEY idx_created_at" in s
+        for s in fake.executed
+    )
+
+
+def test_ensure_created_at_index_skips_when_present(monkeypatch):
+    """idx_created_at 已存在 → 不执行 ALTER（幂等）"""
+    fake = _FakePool()
+    fake.one = {"c": 1}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_created_at_index())
+    assert not any("ADD KEY idx_created_at" in s for s in fake.executed)

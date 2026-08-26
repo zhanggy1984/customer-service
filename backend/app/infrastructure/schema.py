@@ -43,6 +43,7 @@ async def init_schema() -> None:
     await _ensure_knowledge_hash_column()
     await _ensure_refund_order_unique()
     await _ensure_ticket_idempotency_key()
+    await _ensure_created_at_index()
     logger.info("schema init done（%s 条语句）", len(statements))
 
 
@@ -108,3 +109,21 @@ async def _ensure_ticket_idempotency_key() -> None:
             "ADD UNIQUE KEY uk_ticket_idempotency (idempotency_key)"
         )
         logger.info("schema: complaint_tickets 补 idempotency_key 列 + 唯一约束（存量库迁移）")
+
+
+async def _ensure_created_at_index() -> None:
+    """存量库迁移：conversation_history / tool_call_log 补 idx_created_at（TTL 清理按时间范围删除）。
+
+    CREATE TABLE IF NOT EXISTS 不会给已存在表加索引，旧库两表缺 created_at 索引时
+    清理 DELETE 会全表扫。用 information_schema.STATISTICS 检查缺则 ALTER，幂等。
+    """
+    for table in ("conversation_history", "tool_call_log"):
+        row = await mysql_pool.fetchone(
+            "SELECT COUNT(*) AS c FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+            "AND INDEX_NAME = 'idx_created_at'",
+            (table,),
+        )
+        if (row or {}).get("c", 0) == 0:
+            await mysql_pool.execute(f"ALTER TABLE {table} ADD KEY idx_created_at (created_at)")
+            logger.info("schema: %s 补 idx_created_at 索引（存量库迁移）", table)

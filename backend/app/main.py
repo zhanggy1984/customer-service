@@ -13,6 +13,7 @@ from app.infrastructure.mysql import mysql_pool
 from app.infrastructure.schema import init_schema
 from app.rag.init import init_knowledge
 from app.rag.retriever import retriever
+from app.session.cleaner import session_cleaner
 from app.session.manager import session_manager
 from app.utils.logger import logger
 
@@ -26,10 +27,12 @@ async def lifespan(_: FastAPI):
     await init_knowledge()
     await retriever.init()
     await deepseek_client.init()
+    session_cleaner.start()  # TTL 清理：依赖 mysql_pool 已就绪
     yield
     # ---- 优雅关闭 ----
     logger.info("event=shutdown_start 停止接受新请求，等待活跃请求完成")
     # 活跃会话已实时双写 MySQL（StorageRouter.save），无需额外 checkpoint
+    await session_cleaner.stop()
     await session_manager.close()
     await mysql_pool.close()
     await retriever.close()

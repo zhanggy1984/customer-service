@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     result     TEXT         NULL,
     created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_session (session_id),
-    KEY idx_user (user_id)
+    KEY idx_user (user_id),
+    KEY idx_created_at (created_at)   -- TTL 清理按时间范围删除（cleaner.py）
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 -- ---------- tool_call_log（P5：护栏判定观测）----------
@@ -142,7 +143,8 @@ CREATE TABLE IF NOT EXISTS tool_call_log (
     query_text     VARCHAR(500) NULL,                 -- 本轮用户输入，便于请求分析
     created_at     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_session (session_id),
-    KEY idx_tool_time (tool_name, created_at)
+    KEY idx_tool_time (tool_name, created_at),
+    KEY idx_created_at (created_at)   -- TTL 清理按时间范围删除（cleaner.py）
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 -- =============================================================

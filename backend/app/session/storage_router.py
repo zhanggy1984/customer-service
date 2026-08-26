@@ -81,6 +81,22 @@ class StorageRouter:
         except Exception:
             pass
         await mysql_pool.execute("DELETE FROM conversation_history WHERE session_id=%s", (sid,))
+        # 级联回收护栏判定日志（既有缺口：原实现只删会话，tool_call_log 残留无限累积）
+        await mysql_pool.execute("DELETE FROM tool_call_log WHERE session_id=%s", (sid,))
+
+    async def is_expired(self, sid: str, days: int) -> bool:
+        """会话最后活跃是否超保留期（仅 MySQL 兜底恢复场景）。
+
+        Redis 命中=1h 内活跃必然未超期，这里只为 Redis miss 走 _load_mysql 的会话判断。
+        判据落在 MySQL 侧：NOW() 与 created_at 的 CURRENT_TIMESTAMP 同会话时区基准，
+        Python 不生成 cutoff，避免 aware/naive 混比及时区错位。
+        """
+        row = await mysql_pool.fetchone(
+            "SELECT created_at FROM conversation_history WHERE session_id=%s "
+            "AND created_at < NOW() - INTERVAL %s DAY ORDER BY id DESC LIMIT 1",
+            (sid, days),
+        )
+        return row is not None
 
     # ---------- MySQL 存取 ----------
 
