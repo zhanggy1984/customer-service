@@ -6,6 +6,16 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 
+def source_label(metadata: dict) -> str:
+    """溯源标签：source 拼 heading_path（如 "return_policy > 退货时限"）。
+
+    chunk 带标题路径时提示来自哪篇文档哪个章节；无标题数据退化为纯 source。
+    """
+    src = metadata.get("source", "")
+    path = metadata.get("heading_path") or []
+    return " > ".join([src] + list(path)) if path else src
+
+
 @dataclass
 class Document:
     id: str

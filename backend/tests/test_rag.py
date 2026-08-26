@@ -77,3 +77,147 @@ async def test_search_cache_hit(monkeypatch):
     results = await r.search("退款多久到账")
     assert len(results) == 1
     assert results[0].text == "缓存内容"
+
+
+@pytest.mark.asyncio
+async def test_search_expands_section_siblings(monkeypatch):
+    """章节扩充：命中 chunk 的同 section 兄弟 chunk 合并进 context。"""
+    from app.rag.interfaces import Document
+
+    r = Retriever()
+    r._redis = FakeRedis()
+
+    async def fake_embed(text):
+        return [0.1] * 10
+
+    async def fake_search(vec, top_k):
+        return [
+            SearchResult(
+                id="c2", text="非质量问题运费自理。", score=0.9,
+                metadata={"source": "return_policy", "section_id": "return_policy:1",
+                          "heading_path": ["退换货政策", "运费规则"], "chunk_index": 1},
+            )
+        ]
+
+    def fake_get_all():
+        return [
+            Document(id="c1", text="退货运费由买家承担。",
+                     metadata={"source": "return_policy", "section_id": "return_policy:1",
+                               "heading_path": ["退换货政策", "运费规则"], "chunk_index": 0}),
+            Document(id="c3", text="签收后 7 天内可退。",
+                     metadata={"source": "return_policy", "section_id": "return_policy:2",
+                               "heading_path": ["退换货政策", "退货时限"], "chunk_index": 2}),
+        ]
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(vs_mod, "get_all", fake_get_all)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
+
+    results = await r.search("运费谁出")
+    ids = {res.id for res in results}
+    assert ids == {"c1", "c2"}  # c3 属其他 section 不扩充
+    # 扩充 chunk：score 复用命中分数（不引入 0），且打 is_expanded 标记供观测区分
+    c1 = next(x for x in results if x.id == "c1")
+    assert c1.score == 0.9
+    assert c1.metadata.get("is_expanded") is True
+    c2 = next(x for x in results if x.id == "c2")
+    assert c2.metadata.get("is_expanded") is None  # 真命中无标记
+
+
+@pytest.mark.asyncio
+async def test_search_section_expand_degraded_without_section_id(monkeypatch):
+    """旧数据无 section_id → 不触发扩充，get_all 不被调用。"""
+    r = Retriever()
+    r._redis = FakeRedis()
+
+    async def fake_embed(text):
+        return [0.1] * 10
+
+    async def fake_search(vec, top_k):
+        return [SearchResult(id="1", text="旧数据", score=0.9, metadata={"source": "faq"})]
+
+    calls = {"get_all": 0}
+
+    def fake_get_all():
+        calls["get_all"] += 1
+        return []
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(vs_mod, "get_all", fake_get_all)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
+
+    results = await r.search("旧数据")
+    assert len(results) == 1
+    assert calls["get_all"] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_section_expand_total_limit(monkeypatch):
+    """扩充总量上限：同 section 兄弟很多时 context 不超 _SECTION_EXPAND_TOTAL。"""
+    from app.rag.interfaces import Document
+
+    r = Retriever()
+    r._redis = FakeRedis()
+
+    async def fake_embed(text):
+        return [0.1] * 10
+
+    async def fake_search(vec, top_k):
+        return [
+            SearchResult(id="hit", text="命中", score=0.9,
+                         metadata={"source": "s", "section_id": "s:0"}),
+        ]
+
+    def fake_get_all():
+        return [
+            Document(id=f"sib-{i}", text=f"兄弟 {i}",
+                     metadata={"source": "s", "section_id": "s:0"})
+            for i in range(20)
+        ]
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(vs_mod, "get_all", fake_get_all)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
+
+    results = await r.search("章节")
+    assert len(results) <= 6  # _SECTION_EXPAND_TOTAL
+
+
+@pytest.mark.asyncio
+async def test_search_section_expand_prefers_nearby_chunk(monkeypatch):
+    """邻近度排序：兄弟 chunk 按与命中 chunk 的 chunk_index 距离补齐，近者优先。"""
+    from app.rag.interfaces import Document
+
+    r = Retriever()
+    r._redis = FakeRedis()
+
+    async def fake_embed(text):
+        return [0.1] * 10
+
+    async def fake_search(vec, top_k):
+        return [
+            SearchResult(id="hit", text="命中", score=0.8,
+                         metadata={"source": "s", "section_id": "s:0", "chunk_index": 3}),
+        ]
+
+    def fake_get_all():
+        # 兄弟 chunk 0/1/4/5（命中 3），距命中分别为 3/2/1/2
+        return [
+            Document(id=f"c{i}", text=f"块{i}",
+                     metadata={"source": "s", "section_id": "s:0", "chunk_index": i})
+            for i in (0, 1, 4, 5)
+        ]
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(vs_mod, "get_all", fake_get_all)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
+
+    results = await r.search("章节")
+    expanded = [x.id for x in results if x.metadata.get("is_expanded")]
+    assert expanded[0] == "c4"  # 距命中最近的兄弟最先
+    # 近邻(c4，距1) 排在远邻(c0，距3) 之前
+    assert expanded.index("c4") < expanded.index("c0")

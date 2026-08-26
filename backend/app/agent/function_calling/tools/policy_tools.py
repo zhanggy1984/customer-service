@@ -1,4 +1,5 @@
 """政策检索工具。内部调用 RAG Retriever。"""
+from app.rag.interfaces import source_label
 from app.rag.retriever import retriever
 
 
@@ -12,7 +13,7 @@ async def search_policy(params: dict, user_id: int, session_id: str) -> dict:
             {
                 "text": r.text,
                 "score": round(r.score, 3),
-                "source": r.metadata.get("source", ""),
+                "source": source_label(r.metadata),  # 带标题路径溯源，SSE 透出可观测
             }
             for r in results
         ]

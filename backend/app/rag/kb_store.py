@@ -19,7 +19,7 @@ from app.rag import vector_store
 from app.rag.embedder import embedder
 from app.rag.interfaces import Document
 from app.rag.retriever import retriever
-from app.rag.splitter import split_text
+from app.rag.splitter import chunk_document
 from app.utils.logger import logger
 
 KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
@@ -34,14 +34,19 @@ async def _clear_rag_cache() -> None:
 
 
 def _make_docs(source: str, content: str) -> list[Document]:
-    """文档内容分段生成 Document（doc_id = md5(source:chunk) 保证可寻址）。"""
-    chunks = split_text(content)
+    """文档内容结构化切分生成 Document（doc_id = md5(source:chunk) 保证可寻址）。
+
+    chunk_document 返回带 heading_path/section_id 等 metadata 的块，这里合并 source
+    （kb_store 层概念）后透传给向量库；检索溯源与章节扩充均依赖这些字段。
+    """
     docs = []
-    for i, chunk in enumerate(chunks):
-        if not chunk.strip():
+    for c in chunk_document(content, source):
+        text = c["content"]
+        if not text.strip():
             continue
-        doc_id = hashlib.md5(f"{source}:{i}".encode()).hexdigest()
-        docs.append(Document(id=doc_id, text=chunk, metadata={"source": source, "chunk": i}))
+        meta = {"source": source, **c["metadata"]}
+        doc_id = hashlib.md5(f"{source}:{c['metadata']['chunk_index']}".encode()).hexdigest()
+        docs.append(Document(id=doc_id, text=text, metadata=meta))
     return docs
 
 
