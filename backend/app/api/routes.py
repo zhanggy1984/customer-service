@@ -19,7 +19,7 @@ from app.api.deps import get_current_user, require_admin
 from app.config import settings
 from app.infrastructure.mysql import mysql_pool
 from app.rag import kb_store
-from app.session.locks import session_locks
+from app.session.locks import SessionLockTimeoutError, SessionLockUnavailableError, session_locks
 from app.session.manager import session_manager
 from app.session.models import Message
 from app.utils.logger import logger
@@ -71,33 +71,41 @@ async def send_message(
         })
 
         async def run_and_finish() -> None:
-            async with lock:  # 同一 session 串行
-                session = await session_manager.get_session(sid)
-                created_new = False
-                if session is None:
-                    session = await session_manager.create_session(int(user["sub"]))
-                    created_new = True
-                elif session.user_id != int(user["sub"]):
-                    await emit({"type": "error", "message": "无权访问该会话"})
-                    return
-                session.messages.append(Message(role="user", content=req.content))
-                try:
-                    if created_new:
-                        reply = "您好！请问有什么可以帮您？可以查询订单、退货、退款等。"
-                        # 契约 §5.1：greeting 无 LLM 调用，token 全量补发（评测端首个 token.delta 即 TTFT
-                        # 起点，且按 token.delta 拼接最终回复）+ usage 补发（字段齐全）。
-                        await emit(token_event(reply))
-                        await emit(usage_event(usage.current()))
-                    else:
-                        reply = await run_agent(session, req.content, int(user["sub"]), emit)
-                    session.messages.append(Message(role="assistant", content=reply))
-                    await session_manager.update_session(session)
-                except Exception as exc:
-                    logger.error("event=agent_error", extra={"session_id": sid, "error": str(exc)})
-                    await emit({"type": "error", "message": "系统出问题了，请稍后重试"})
-                    return
-                # done 事件携带完整回复文本 + 实际 session_id（会话重建时前端需更新）
-                await emit({"type": "done", "intent": session.intent or "", "content": reply, "session_id": session.session_id})
+            # 锁获取失败（锁 Redis 挂 / 同会话长时间占用）→ SSE error 事件收尾，不走 done
+            try:
+                async with lock:  # 同一 session 串行（Redis 分布式锁，多节点共享）
+                    session = await session_manager.get_session(sid)
+                    created_new = False
+                    if session is None:
+                        session = await session_manager.create_session(int(user["sub"]))
+                        created_new = True
+                    elif session.user_id != int(user["sub"]):
+                        await emit({"type": "error", "message": "无权访问该会话"})
+                        return
+                    session.messages.append(Message(role="user", content=req.content))
+                    try:
+                        if created_new:
+                            reply = "您好！请问有什么可以帮您？可以查询订单、退货、退款等。"
+                            # 契约 §5.1：greeting 无 LLM 调用，token 全量补发（评测端首个 token.delta 即 TTFT
+                            # 起点，且按 token.delta 拼接最终回复）+ usage 补发（字段齐全）。
+                            await emit(token_event(reply))
+                            await emit(usage_event(usage.current()))
+                        else:
+                            reply = await run_agent(session, req.content, int(user["sub"]), emit)
+                        session.messages.append(Message(role="assistant", content=reply))
+                        await session_manager.update_session(session)
+                    except Exception as exc:
+                        logger.error("event=agent_error", extra={"session_id": sid, "error": str(exc)})
+                        await emit({"type": "error", "message": "系统出问题了，请稍后重试"})
+                        return
+                    # done 事件携带完整回复文本 + 实际 session_id（会话重建时前端需更新）
+                    await emit({"type": "done", "intent": session.intent or "", "content": reply, "session_id": session.session_id})
+            except SessionLockUnavailableError:
+                logger.warning("event=session_lock_unavailable", extra={"session_id": sid})
+                await emit({"type": "error", "message": "系统繁忙，请稍后重试"})
+            except SessionLockTimeoutError:
+                logger.warning("event=session_lock_timeout", extra={"session_id": sid})
+                await emit({"type": "error", "message": "该会话正在处理中，请稍后重试"})
 
         task = asyncio.create_task(run_and_finish())
         while True:
@@ -201,13 +209,18 @@ async def delete_session(sid: str, user: dict = Depends(get_current_user)) -> di
     与 send_message 同锁串行化：防止删除后同会话并发 send 重新 save 复活（TOCTOU）。
     """
     lock = await session_locks.get(sid)
-    async with lock:
-        session = await session_manager.get_session(sid)
-        if session is None:
-            raise HTTPException(status_code=404, detail="会话不存在")
-        if session.user_id != int(user["sub"]):
-            raise HTTPException(status_code=403, detail="无权删除该会话")
-        await session_manager.close_session(sid)
+    try:
+        async with lock:
+            session = await session_manager.get_session(sid)
+            if session is None:
+                raise HTTPException(status_code=404, detail="会话不存在")
+            if session.user_id != int(user["sub"]):
+                raise HTTPException(status_code=403, detail="无权删除该会话")
+            await session_manager.close_session(sid)
+    except SessionLockUnavailableError:
+        raise HTTPException(status_code=503, detail="系统繁忙，请稍后重试")
+    except SessionLockTimeoutError:
+        raise HTTPException(status_code=429, detail="该会话正在处理中，请稍后重试")
     logger.info("event=api_delete_session", extra={"session_id": sid, "user_id": user["sub"]})
     return {"msg": "已删除"}
 

@@ -89,6 +89,32 @@ async def test_breaker_reset_on_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reset_only_clears_shared_breaker_for_local_broadcaster(monkeypatch):
+    """改动3 语义：仅本地广播方 reset 才 close 共享熔断信号，他节点成功不 DEL。
+
+    广播方本地冷却期内被 _breaker_open 拒绝、到不了成功路径，实际触发 close 的
+    只有"他节点成功"——其 DEL 会撤销他人广播的共享降级信号，故未广播（open_until=0）
+    时 reset 不 close。直接调 _breaker_reset 单测判断逻辑（chat 会因冷却被拒）。
+    """
+    gw = _mk_gateway()
+    close_calls = []
+
+    async def spy_close():
+        close_calls.append(1)
+
+    monkeypatch.setattr(gw._cooldown, "close", spy_close)
+
+    # 他节点（本地未广播）：成功 reset 不 close
+    await gw._breaker_reset()
+    assert close_calls == []
+
+    # 对照：本地广播方（open_until 未来）reset 才 close
+    gw._breaker["open_until"] = time.time() + 100
+    await gw._breaker_reset()
+    assert len(close_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_breaker_not_counted_for_capacity_or_allkeys_down(monkeypatch):
     """CapacityExceeded / AllKeysDown 不累计熔断（本地排队/429 限流，非上游持续故障）。"""
     gw = _mk_gateway()

@@ -13,6 +13,7 @@ from functools import wraps
 
 from asyncmy.errors import InterfaceError, OperationalError
 
+from app.infrastructure.cooldown import RedisCooldown
 from app.services.exceptions import ServiceUnavailableException
 from app.utils.logger import logger
 
@@ -23,11 +24,15 @@ DB_BREAKER_FAIL_THRESHOLD = 5  # 连续失败次数触发熔断
 DB_BREAKER_COOLDOWN_SECONDS = 30  # 熔断冷却时长（秒），到期后半开放行一次尝试
 
 _breaker = {"failures": 0, "open_until": 0.0}
+# 冷却期广播到 Redis：MySQL 挂时任一节点熔断，其他节点不必各自试 5 次才降级
+_db_cooldown = RedisCooldown("db", DB_BREAKER_COOLDOWN_SECONDS)
 
 
-def _breaker_open() -> bool:
-    """熔断是否 open：冷却期内直接拒绝；冷却到期后重置计数放行（半开探测）。"""
+async def _breaker_open() -> bool:
+    """熔断是否 open：本地冷却期内，或任一节点已广播熔断 → 快速失败。"""
     if time.time() < _breaker["open_until"]:
+        return True
+    if await _db_cooldown.is_open():  # 共享信号：他节点已熔断 → 本节点提前降级
         return True
     if _breaker["failures"] >= DB_BREAKER_FAIL_THRESHOLD:
         _breaker["failures"] = 0  # 冷却到期：重置计数放行，靠下一次调用探测恢复
@@ -37,18 +42,22 @@ def _breaker_open() -> bool:
 def _retry_on_db_error(fn):
     @wraps(fn)
     async def wrapper(*args, **kwargs):
-        if _breaker_open():
+        if await _breaker_open():
             logger.warning("event=db_circuit_rejected", extra={"fn": fn.__name__})
             raise ServiceUnavailableException("数据库暂时不可用，请稍后重试")
         for attempt in range(len(BACKOFF_DELAYS) + 1):
             try:
                 result = await fn(*args, **kwargs)
                 _breaker["failures"] = 0  # 成功重置连续失败计数
+                if _breaker["open_until"] > time.time():
+                    # 仅本地广播方成功时清除共享熔断信号：他节点成功不 DEL，防撤销他人广播
+                    await _db_cooldown.close()
                 return result
             except RETRYABLE_ERRORS as exc:
                 _breaker["failures"] += 1
                 if _breaker["failures"] >= DB_BREAKER_FAIL_THRESHOLD:
                     _breaker["open_until"] = time.time() + DB_BREAKER_COOLDOWN_SECONDS
+                    await _db_cooldown.open()  # 广播：其他节点不必再各自试 5 次
                     logger.error(
                         "event=db_circuit_open",
                         extra={"fn": fn.__name__, "cooldown": DB_BREAKER_COOLDOWN_SECONDS},

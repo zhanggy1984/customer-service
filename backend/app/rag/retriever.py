@@ -133,7 +133,7 @@ class Retriever:
         if not hits:
             return results
         try:
-            all_docs = vector_store.get_all()
+            all_docs = await vector_store.get_all()
         except Exception as exc:
             logger.warning("event=rag_section_expand_fail error=%s", str(exc))
             return results

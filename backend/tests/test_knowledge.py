@@ -54,7 +54,7 @@ class FakeVectorStore:
     def count_by_source(self, source):
         return sum(1 for d in self.docs if d.metadata["source"] == source)
 
-    def get_all(self):
+    async def get_all(self):
         return list(self.docs)
 
 

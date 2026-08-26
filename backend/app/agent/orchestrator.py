@@ -28,6 +28,7 @@ from app.agent.state_machine.refund_flow import RefundFlow
 from app.agent.state_machine.return_flow import ReturnFlow
 from app.config import settings
 from app.infrastructure import turn_cache
+from app.infrastructure.cooldown import RedisCooldown
 from app.infrastructure.deepseek import LLM_FALLBACK_ERRORS, deepseek_client
 from app.services.exceptions import ServiceUnavailableException
 from app.session.models import Session
@@ -236,6 +237,8 @@ _KB_FAULT_COOLDOWN = 60.0  # 冷却时长（秒），到期后半开放行一次
 _KB_COOLDOWN_REPLY = "知识库暂时不可用，请稍后重试，或通过在线客服/留言转人工处理。"
 _kb_fault_streak = 0
 _kb_fault_cooldown_until = 0.0
+# 冷却期广播到 Redis：检索故障任一节点触发，其他节点直接固定话术不调 LLM 兜底（省 token）
+_kb_cooldown = RedisCooldown("kb", _KB_FAULT_COOLDOWN)
 
 
 async def _compose_policy_fallback_answer(user_message: str, emit=None,
@@ -316,20 +319,24 @@ async def _compose_policy_answer(tool_results: dict, user_message: str, emit=Non
     global _kb_fault_streak, _kb_fault_cooldown_until
     sp = tool_results.get("search_policy") or {}
     if sp.get("error"):
-        if time.time() < _kb_fault_cooldown_until:
-            # 冷却期：不再调 LLM 兜底，固定话术（检索故障语义，sp.ok=False 天然不写缓存）
+        # 本地冷却 或 任一节点已广播冷却 → 不再调 LLM 兜底，固定话术（防正文流式烧 token）
+        if time.time() < _kb_fault_cooldown_until or await _kb_cooldown.is_open():
             return _KB_COOLDOWN_REPLY, False
         _kb_fault_streak += 1
         if _kb_fault_streak >= _KB_FAULT_THRESHOLD:
             _kb_fault_cooldown_until = time.time() + _KB_FAULT_COOLDOWN
             _kb_fault_streak = 0
+            await _kb_cooldown.open()  # 广播：其他节点直接固定话术，不各自烧 token
             logger.warning("event=kb_fault_cooldown_triggered",
                            extra={"cooldown": _KB_FAULT_COOLDOWN})
         # 检索故障 ≠ 检索空：走 LLM 自身知识兜底 + 声明 + 转人工。
         return await _compose_policy_fallback_answer(
             user_message, emit, injection_detected=injection_detected), True
-    # 检索成功（含空）：重置故障连续计数，避免冷却误触发
+    # 检索成功（含空）：重置故障连续计数；仅本地广播方成功时清除共享冷却信号
+    # （他节点成功不 DEL，防撤销他人广播，避免冷却误触发）
     _kb_fault_streak = 0
+    if time.time() < _kb_fault_cooldown_until:
+        await _kb_cooldown.close()
     data = sp.get("data") or {}  # 防御 data=None（internal_error 信封），避免 None.get 抛错
     results = data.get("results") or []
     if not results:

@@ -216,7 +216,7 @@ async def test_search_expands_section_siblings(monkeypatch):
             )
         ]
 
-    def fake_get_all():
+    async def fake_get_all():
         return [
             Document(id="c1", text="退货运费由买家承担。",
                      metadata={"source": "return_policy", "section_id": "return_policy:1",
@@ -256,7 +256,7 @@ async def test_search_section_expand_degraded_without_section_id(monkeypatch):
 
     calls = {"get_all": 0}
 
-    def fake_get_all():
+    async def fake_get_all():
         calls["get_all"] += 1
         return []
 
@@ -287,7 +287,7 @@ async def test_search_section_expand_total_limit(monkeypatch):
                          metadata={"source": "s", "section_id": "s:0"}),
         ]
 
-    def fake_get_all():
+    async def fake_get_all():
         return [
             Document(id=f"sib-{i}", text=f"兄弟 {i}",
                      metadata={"source": "s", "section_id": "s:0"})
@@ -320,7 +320,7 @@ async def test_search_section_expand_prefers_nearby_chunk(monkeypatch):
                          metadata={"source": "s", "section_id": "s:0", "chunk_index": 3}),
         ]
 
-    def fake_get_all():
+    async def fake_get_all():
         # 兄弟 chunk 0/1/4/5（命中 3），距命中分别为 3/2/1/2
         return [
             Document(id=f"c{i}", text=f"块{i}",

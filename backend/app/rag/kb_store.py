@@ -231,7 +231,7 @@ async def sync_full(force: bool = False) -> dict:
             )
     # 孤儿清理：ChromaDB 的 source 集合 - MySQL 的 source 集合
     mysql_sources = {r["source"] for r in rows}
-    chroma_sources = {d.metadata.get("source", "") for d in vector_store.get_all()}
+    chroma_sources = {d.metadata.get("source", "") for d in await vector_store.get_all()}
     orphan_removed = 0
     for source in sorted(chroma_sources - mysql_sources):
         if not source:

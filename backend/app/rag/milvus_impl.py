@@ -7,6 +7,8 @@
 - score 口径（P1.5 冒烟已校准）：Milvus COSINE 的 hit.distance 即余弦相似度（同向量=1.0），
   直接作相似度返回，与 Chroma 的 (1 - cosine_distance) 同口径，0.3 阈值语义一致。
 """
+import asyncio
+
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 from llama_index.core.vector_stores.types import VectorStoreQuery, VectorStoreQueryMode
 from llama_index.vector_stores.milvus import MilvusVectorStore as _LiMilvus
@@ -91,17 +93,8 @@ class MilvusVectorStore(IVectorStore):
         self.store.add(nodes)
         logger.info("event=rag_add_docs store=milvus count=%s", len(docs))
 
-    async def search(self, query_embedding: list[float], top_k: int = 10) -> list[SearchResult]:
-        if self.count() <= 0:
-            return []
-        # Milvus store.query 需要 VectorStoreQuery（QueryBundle 无 .mode 会报错，P1.5 冒烟发现）。
-        # COSINE 度量下 hit.distance 即余弦相似度本身（同向量=1.0，实测），越高越相似，
-        # 与 Chroma 的 (1 - cosine_distance) 同口径；0.3 阈值与 rerank 降级排序均按"高=相似"。
-        qb = VectorStoreQuery(
-            query_embedding=query_embedding,
-            similarity_top_k=top_k,
-            mode=VectorStoreQueryMode.DEFAULT,
-        )
+    def _query_sync(self, qb: VectorStoreQuery) -> list[SearchResult]:
+        """同步检索（to_thread 包装后线程池执行，不阻塞事件循环/锁看门狗）。"""
         res = self.store.query(qb)
         return [
             SearchResult(
@@ -112,6 +105,19 @@ class MilvusVectorStore(IVectorStore):
             )
             for n, s in zip(res.nodes, res.similarities)
         ]
+
+    async def search(self, query_embedding: list[float], top_k: int = 10) -> list[SearchResult]:
+        if await asyncio.to_thread(self.count) <= 0:
+            return []
+        # Milvus store.query 需要 VectorStoreQuery（QueryBundle 无 .mode 会报错，P1.5 冒烟发现）。
+        # COSINE 度量下 hit.distance 即余弦相似度本身（同向量=1.0，实测），越高越相似，
+        # 与 Chroma 的 (1 - cosine_distance) 同口径；0.3 阈值与 rerank 降级排序均按"高=相似"。
+        qb = VectorStoreQuery(
+            query_embedding=query_embedding,
+            similarity_top_k=top_k,
+            mode=VectorStoreQueryMode.DEFAULT,
+        )
+        return await asyncio.to_thread(self._query_sync, qb)
 
     async def delete(self, ids: list[str]) -> None:
         if ids:
@@ -133,8 +139,8 @@ class MilvusVectorStore(IVectorStore):
         )
         return len(res)
 
-    def get_all(self) -> list[Document]:
-        """全量拉取（admin 全量对账的孤儿清理用）。metadata 以 JSON 字段存储，需还原 dict。"""
+    def _get_all_sync(self) -> list[Document]:
+        """同步全量拉取（to_thread 包装后线程池执行）。metadata 以 JSON 字段存储，需还原 dict。"""
         import json
 
         res = self.client.query(
@@ -155,3 +161,7 @@ class MilvusVectorStore(IVectorStore):
                     meta = {}
             docs.append(Document(id=row.get("id", ""), text=row.get("text", ""), metadata=meta))
         return docs
+
+    async def get_all(self) -> list[Document]:
+        """全量拉取（admin 全量对账 + 章节扩充用）。同步调用包 to_thread 防阻塞事件循环。"""
+        return await asyncio.to_thread(self._get_all_sync)
