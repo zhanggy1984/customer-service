@@ -88,7 +88,7 @@ graph TB
     API --> MILVUS
 ```
 
-**对外链路（统一 API 网关）**：浏览器只访问前端 nginx；nginx 将 `/api/v1` 反代到共享网关 `api-gateway:8099`（`Host: cs.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。
+**对外链路（统一 API 网关）**：浏览器只访问前端 nginx；nginx 将 `/api/v1` 反代到共享网关 `api-gateway:8099`（`Host: cs.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。宿主端口映射的 backend 地址（如 `localhost:8000`）仅供开发调试 / 评测直连，绕过网关。
 
 **核心链路（以退货为例）**：
 
