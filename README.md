@@ -2,7 +2,7 @@
 
 > **高并发 AI Agent 智能客服系统**：面向电商售后场景，从**退换货政策问答、订单状态查询**，到**退货、仅退款、投诉**等可完成的业务动作，在对话内一站式闭环，并具备从 **Agent 编排、LangGraph 状态机、RAG 检索、存储高可用到 LLM 网关治理**的全链路工程化能力。
 
-本系统是**生产级全栈演示项目**：一键启动全栈容器（backend/nginx/mysql/redis/Milvus）、4 大售后场景数据开箱即演示、138 项后端测试 + 41 项前端测试全绿、SSE 契约化流式全链路可观测、LLM 工具决策 + 实时护栏（P3-P5）、DeepSeek 多 Key 网关 + 熔断降级**永不因 LLM 故障崩溃**。
+本系统是**生产级全栈演示项目**：一键启动全栈容器（backend/nginx/mysql/redis/Milvus）、4 大售后场景数据开箱即演示、140 项后端测试 + 41 项前端测试全绿、SSE 契约化流式全链路可观测、LLM 工具决策 + 实时护栏（P3-P5）、DeepSeek 多 Key 网关 + 熔断降级**永不因 LLM 故障崩溃**。
 
 ---
 
@@ -134,7 +134,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 - **会话消息体截断**：`SESSION_MAX_MESSAGES`（默认 40 条）超限截断为「首条 user 消息 + 最近 N-1 条」，防止会话无限增长（LLM/状态机不读消息全文，截断仅影响前端历史展示）。
 
 ### 9. 工程化质量
-- **后端 138 项测试全绿**（另 3 项环境相关跳过）：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/answer-done 一致）、DeepSeek Gateway（429/5xx/超时重试、首 delta 后不重试）、部分退货规则兜底、RAG、StorageRouter、tool_call_log 落库、会话历史/消息截断、contracts 端点；
+- **后端 140 项测试全绿**（另 3 项环境相关跳过）：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/answer-done 一致）、DeepSeek Gateway（429/5xx/超时重试、首 delta 后不重试）、部分退货规则兜底、RAG、StorageRouter、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、会话历史/消息截断、contracts 端点；
 - **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
 - **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
 
@@ -208,7 +208,7 @@ graph TB
 | 向量库 | Milvus + LlamaIndex + bge-small-zh | 知识库派生向量索引，Top-10 → Re-rank Top-3 |
 | LLM | DeepSeek（openai 兼容） | chat 意图/响应/闲聊 + reasoner 资格/严重性，超时降级 |
 | 网关 | 自研 KeyPool + 熔断 | 多 Key 滑动窗口 RPM + 排队背压 + 规则引擎兜底 |
-| 测试 | pytest + pytest-asyncio + vitest | 后端 138 / 前端 41，集成测试真实链路可重跑 |
+| 测试 | pytest + pytest-asyncio + vitest | 后端 140 / 前端 41，集成测试真实链路可重跑 |
 
 ---
 
@@ -314,13 +314,13 @@ customer-service/
 │   │   │   ├── state_machine/    # 退货/退款/投诉状态机（LangGraph）
 │   │   │   ├── function_calling/ # 工具 + 护栏（order/return/refund/policy tools、guardrail、tool_call_log）
 │   │   │   └── prompts/          # prompt 模板（意图/闲聊/政策…）
-│   │   ├── infrastructure/       # DeepSeek Gateway（keypool/熔断/网关）+ MySQL
+│   │   ├── infrastructure/       # DeepSeek Gateway（keypool/熔断/网关）+ MySQL + schema（应用自建表+种子）
 │   │   ├── rag/                  # RAG（embedder/retriever/milvus_impl/kb_store/knowledge）
 │   │   ├── services/             # 业务服务（interfaces 抽象 + local_impl + 重试）
 │   │   ├── session/              # 会话管理（Redis 主存 + MySQL 兜底 + 消息截断）
 │   │   └── utils/
 │   ├── sql/init.sql              # 建表 + 种子数据
-│   └── tests/                    # 138 项单元/契约/集成测试
+│   └── tests/                    # 140 项单元/契约/集成测试
 ├── frontend/                     # 前端（Vue3 + Vite + Element Plus）
 │   ├── src/
 │   │   ├── api/                  # axios 接口模块
@@ -345,7 +345,7 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图 / 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway / usage / RAG / 会话 / tool_call_log / contracts | **138 passed, 3 skipped** |
+| 后端单元/契约 | 意图 / 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 | **140 passed, 3 skipped** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 可重复运行 |
 | E2E | 浏览器端到端（真实容器 + SSE 流式渲染） | 已验证通过 |
@@ -381,7 +381,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 - 改 `.env` 配置后 `docker compose up -d` 重启容器即可。
 
 ### 跑测试 / 验收
-- 提交前先跑后端 `pytest tests/ -q` 与前端 `vitest run`，确保不破坏既有 138 + 41 项；
+- 提交前先跑后端 `pytest tests/ -q` 与前端 `vitest run`，确保不破坏既有 140 + 41 项；
 - 集成测试需服务在跑（`docker compose up -d`），未启动自动跳过不误报。
 
 ### 新增 API
