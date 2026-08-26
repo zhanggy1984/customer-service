@@ -93,9 +93,9 @@ async def test_injection_continues_with_guard_prefix(monkeypatch):
         return IntentResult(intent="CHITCHAT", confidence=0.5, summary="注入尝试")
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "收到，", None
+        yield "收到，", None, None
         yield "请问还有什么可以帮您？", {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8,
-                                         "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                                         "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     monkeypatch.setattr(orch, "classify_intent", fake_classify)
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
@@ -329,9 +329,9 @@ async def test_chitchat_keyword_not_overbroad(monkeypatch):
     _reset_usage()
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "我是智能客服助手", None
+        yield "我是智能客服助手", None, None
         yield "，有什么可以帮您？", {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8,
-                                     "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                                     "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
     session = _mk_session()  # rounds=0，走问候 LLM 路径
@@ -446,6 +446,40 @@ async def test_agent_loop_non_llm_error_fallback(monkeypatch):
     # 降级无工具结果：_compose_order_answer 引导提供订单号，而非 500/KeyError
     assert "请直接告诉我订单号" in reply
     assert emit.events[-1]["type"] == "usage"  # 仍以 usage 收尾（契约必选）
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_node_emits_decision_reasoning(monkeypatch):
+    """决策循环 reasoning 透出：decision.reasoning → reasoning 事件（思考过程对用户可见）。
+
+    覆盖非流式决策路径的思考链（direct_reply 与 tool_calls 聚合后的 reasoning 字段），
+    _agent_loop_node 在拿到 decision 后一次性 emit 全文（非逐 token 增量）。
+    """
+    _reset_usage()
+    from app.agent.intent import IntentResult
+
+    async def fake_classify(msg, ctx=None, **kw):
+        return IntentResult(intent="POLICY_INQUIRY", confidence=0.99, slots={},
+                            missing_slots=[], summary="问退货")
+
+    decision = {
+        "route": "policy",
+        "tool_results": {"search_policy": {"ok": True, "data": {"results": [
+            {"text": "签收后 7 天内支持无理由退货。", "score": 0.9, "source": "x.md"}]}, "error": None}},
+        "tool_events": [],
+        "usage": None, "direct_reply": "",
+        "reasoning": "用户问退货政策，属政策/FAQ 类，须检索政策文档。\n工具结果已足够，直接作答。",
+    }
+    monkeypatch.setattr(orch, "classify_intent", fake_classify)
+    monkeypatch.setattr(orch, "run_decision_loop", AsyncMock(return_value=decision))
+    emit = EmitCollector()
+    session = _mk_session()
+    await run_agent(session, "退货政策是什么？", 1, emit)
+    rs = [e for e in emit.events if e["type"] == "reasoning"]
+    assert rs  # 决策思考至少 emit 一次
+    # 决策路径一次性 emit 全文：content 与 delta 均为完整思考链（对齐 reasoning_event 双字段契约）
+    assert rs[0]["content"] == decision["reasoning"]
+    assert rs[0]["delta"] == decision["reasoning"]
 
 
 @pytest.mark.asyncio
@@ -610,9 +644,9 @@ async def test_policy_search_tool_call_and_no_result(monkeypatch):
     }
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "签收后", None
+        yield "签收后", None, None
         yield "7天内可无理由退货。", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
-                                      "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                                      "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     monkeypatch.setattr(orch, "classify_intent", fake_classify)
     monkeypatch.setattr(orch, "run_decision_loop", AsyncMock(return_value=decision))
@@ -640,7 +674,7 @@ async def test_compose_policy_answer_retrieval_failure_llm_fallback(monkeypatch)
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
         captured["sys"] = messages[0]["content"]
-        yield "退货一般需满足签收后7天内", None
+        yield "退货一般需满足签收后7天内", None, None
 
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
     emit = EmitCollector()
@@ -662,7 +696,7 @@ async def test_compose_policy_answer_retrieval_failure_llm_fallback(monkeypatch)
 async def test_compose_policy_answer_internal_error_no_attribute_error(monkeypatch):
     """search_policy data=None（internal_error 信封）：防御式取值不抛 AttributeError，走 LLM 兜底。"""
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "基于常识回答", None
+        yield "基于常识回答", None, None
 
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
     reply, streamed = await _compose_policy_answer(
@@ -704,9 +738,9 @@ async def test_chitchat_llm_path_streams_answer(monkeypatch):
     _reset_usage()
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "你好", None
+        yield "你好", None, None
         yield "呀", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
-                     "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                     "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
     # 意图分类：归类为 CHITCHAT
@@ -769,7 +803,7 @@ async def test_turn_cache_read_key_action_prefix_no_collision(monkeypatch):
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
         yield "按规则处理。", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
-                                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     monkeypatch.setattr(orch, "classify_intent", fake_classify)
     monkeypatch.setattr(orch, "run_decision_loop", AsyncMock(return_value=_policy_decision()))
@@ -837,9 +871,9 @@ async def test_turn_cache_write_on_policy_turn(monkeypatch):
     }
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "签收后", None
+        yield "签收后", None, None
         yield "7天内可无理由退货。", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
-                                      "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                                      "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     async def fake_get(key):
         return None  # 未命中
@@ -915,7 +949,7 @@ async def test_turn_cache_not_written_low_confidence(monkeypatch):
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
         yield "签收后7天内可退。", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
-                                    "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                                    "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     written = _install_write_capture(monkeypatch, _policy_decision(), fake_classify, fake_stream)
     await run_agent(_mk_session(), "这个能不能退？", 1, EmitCollector())
@@ -953,7 +987,7 @@ async def test_turn_cache_not_written_stream_midway_degraded(monkeypatch):
                             missing_slots=[], summary="问政策")
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "部分答案内容", None
+        yield "部分答案内容", None, None
         raise RuntimeError("模拟流式中途异常")
 
     written = _install_write_capture(monkeypatch, _policy_decision(), fake_classify, fake_stream)
@@ -985,7 +1019,7 @@ async def test_turn_cache_not_written_retrieval_failure(monkeypatch):
     }
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "基于常识回答", None
+        yield "基于常识回答", None, None
 
     written = _install_write_capture(monkeypatch, decision, fake_classify, fake_stream)
     emit = EmitCollector()
@@ -1004,7 +1038,7 @@ async def test_compose_policy_cooldown_reply_no_llm(monkeypatch):
 
     async def fake_stream(*a, **kw):
         called["n"] += 1
-        yield "", None
+        yield "", None, None
 
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
 
@@ -1024,7 +1058,7 @@ async def test_compose_policy_fault_streak_triggers_cooldown(monkeypatch):
     import time as _time
 
     async def fake_stream(*a, **kw):
-        yield "", None
+        yield "", None, None
 
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
 

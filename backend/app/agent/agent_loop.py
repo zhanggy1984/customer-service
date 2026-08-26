@@ -163,6 +163,7 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
     tool_events: list = []
     decision_usage = dict(_EMPTY_USAGE)
     direct_reply = ""  # LLM 无工具调用直接作答的 content（纯自主语义，生成节点透出）
+    reasoning_parts: list[str] = []  # 各轮决策 LLM 的思考链聚合（开启 thinking 时返回）
 
     messages = [
         {"role": "system", "content": DECISION_PROMPT.format(
@@ -200,6 +201,9 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
         message = choice.get("message") or {}
         content = (message.get("content") or "").strip()
         tool_calls = message.get("tool_calls") or []
+        rc = (message.get("reasoning_content") or "").strip()
+        if rc:
+            reasoning_parts.append(rc)  # 思考链聚合（决策直接作答路径透出）
 
         if not tool_calls:
             direct_reply = content  # 纯自主：LLM 认为无需工具直接作答，透出给生成节点
@@ -226,7 +230,8 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
                 await _log_call(name, params, None, 0, decision.verdict, decision.reason)
                 return {"route": "business", "blocked_tool": name, "blocked_args": params,
                         "tool_results": tool_results, "tool_events": tool_events,
-                        "usage": decision_usage, "direct_reply": ""}
+                        "usage": decision_usage, "direct_reply": "",
+                        "reasoning": "\n".join(reasoning_parts)}
             if decision.verdict == "reject" and decision.reason == "too_many_calls":
                 # 截断：达工具调用上限强制出路由。此处 break 只出内层 call 循环，须 flag
                 # 终止外层 LLM 轮次循环——否则下一轮 chat 携带未闭环的 tool_call 引用
@@ -297,4 +302,5 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
 
     route = _decide_route(intent, tool_results)
     return {"route": route, "tool_results": tool_results, "tool_events": tool_events,
-            "usage": decision_usage, "direct_reply": direct_reply}
+            "usage": decision_usage, "direct_reply": direct_reply,
+            "reasoning": "\n".join(reasoning_parts)}

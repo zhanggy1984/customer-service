@@ -5,9 +5,33 @@
     </div>
 
     <div v-for="m in messages" :key="m.id" class="msg-row" :class="m.role">
-      <div class="bubble">
-        {{ m.content }}
-        <span v-if="m.streaming" class="cursor">▌</span>
+      <div class="msg-col">
+        <!-- 思考过程折叠块：默认收起，点击展开全文；reasoning 事件实时累积，仅终答消息有值 -->
+        <div v-if="m.reasoning" class="reasoning">
+          <button class="reasoning-toggle" @click="toggleReasoning(m.id)">
+            💭 思考过程 {{ expandedReasoning.has(m.id) ? '收起' : '展开' }}
+          </button>
+          <div v-if="expandedReasoning.has(m.id)" class="reasoning-content">{{ m.reasoning }}</div>
+        </div>
+        <!-- 检索来源列表：默认收起，点击展开全文；序号与回答中 [来源N] 对应 -->
+        <div v-if="m.sources?.length" class="sources">
+          <button class="sources-toggle" @click="toggleSources(m.id)">
+            📎 来源（{{ m.sources.length }}） {{ expandedSources.has(m.id) ? '收起' : '展开' }}
+          </button>
+          <div v-if="expandedSources.has(m.id)" class="sources-body">
+            <div v-for="(s, i) in m.sources" :key="i" class="source-item">
+              <div class="source-line">
+                <span class="source-ref">[来源{{ i + 1 }}]</span>
+                <span class="source-path">{{ s.source }}</span>
+              </div>
+              <div class="source-text">{{ s.text }}</div>
+            </div>
+          </div>
+        </div>
+        <div class="bubble">
+          {{ m.content }}
+          <span v-if="m.streaming" class="cursor">▌</span>
+        </div>
       </div>
     </div>
 
@@ -27,6 +51,23 @@ import type { ChatMessage } from '@/composables/useChat'
 const props = defineProps<{ messages: ChatMessage[]; sending: boolean; progress: string }>()
 
 const listEl = ref<HTMLElement>()
+// 折叠状态：思考过程与来源列表各自独立，默认收起（Set 存已展开的消息 id）
+const expandedReasoning = ref<Set<string>>(new Set())
+const expandedSources = ref<Set<string>>(new Set())
+
+function toggleReasoning(id: string) {
+  const next = new Set(expandedReasoning.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedReasoning.value = next
+}
+
+function toggleSources(id: string) {
+  const next = new Set(expandedSources.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedSources.value = next
+}
 
 watch(
   () => `${props.messages.length}-${props.progress}`,
@@ -58,6 +99,91 @@ watch(
 }
 .msg-row.assistant {
   justify-content: flex-start;
+}
+.msg-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  max-width: 85%;
+}
+.msg-row.user .msg-col {
+  align-items: flex-end;
+}
+.reasoning {
+  margin-bottom: 8px;
+}
+.reasoning-toggle {
+  background: none;
+  border: 1px solid #d9ecff;
+  color: #409eff;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.reasoning-toggle:hover {
+  border-color: #409eff;
+}
+.reasoning-content {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: #f0f2f5;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.sources {
+  width: 100%;
+  margin: 8px 0;
+  font-size: 12px;
+  color: #8a6d3b;
+  line-height: 1.6;
+}
+.sources-toggle {
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  color: #e6a23c;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sources-toggle:hover {
+  border-color: #e6a23c;
+}
+.sources-body {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 6px;
+}
+.source-item {
+  margin-bottom: 6px;
+}
+.source-item:last-child {
+  margin-bottom: 0;
+}
+.source-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.source-ref {
+  color: #e6a23c;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.source-path {
+  word-break: break-all;
+}
+.source-text {
+  color: #8a6d3b;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .bubble {
   max-width: 70%;

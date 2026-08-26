@@ -45,7 +45,7 @@ async def test_assess_severity_uses_chat_model(monkeypatch):
     from app.config import settings
     captured = {}
 
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         captured["model"] = model
         captured["timeout"] = timeout
         return {"choices": [{"message": {"content": '{"severity":"HIGH"}'}}], "usage": None}
@@ -66,7 +66,7 @@ async def test_assess_severity_uses_chat_model(monkeypatch):
 ])
 async def test_assess_severity_levels(monkeypatch, payload, expected):
     """三档 severity 透出。"""
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         return {"choices": [{"message": {"content": payload}}], "usage": None}
     monkeypatch.setattr(complaint_flow.deepseek_client, "chat", fake_chat)
     assert await complaint_flow._assess_severity("test") == expected
@@ -75,7 +75,7 @@ async def test_assess_severity_levels(monkeypatch, payload, expected):
 @pytest.mark.asyncio
 async def test_assess_severity_invalid_falls_back_medium(monkeypatch):
     """非法 severity 值 → 降级 MEDIUM。"""
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         return {"choices": [{"message": {"content": '{"severity":"URGENT"}'}}], "usage": None}
     monkeypatch.setattr(complaint_flow.deepseek_client, "chat", fake_chat)
     assert await complaint_flow._assess_severity("test") == "MEDIUM"
@@ -84,7 +84,7 @@ async def test_assess_severity_invalid_falls_back_medium(monkeypatch):
 @pytest.mark.asyncio
 async def test_assess_severity_exception_falls_back_medium(monkeypatch):
     """LLM 异常 → 降级 MEDIUM。"""
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         raise RuntimeError("upstream down")
     monkeypatch.setattr(complaint_flow.deepseek_client, "chat", fake_chat)
     assert await complaint_flow._assess_severity("test") == "MEDIUM"

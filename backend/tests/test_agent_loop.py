@@ -18,10 +18,12 @@ POLICY_USAGE = {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7,
                 "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
 
 
-def _resp(content: str = "", tool_calls: list | None = None) -> dict:
+def _resp(content: str = "", tool_calls: list | None = None, reasoning: str = "") -> dict:
     msg: dict = {"content": content}
     if tool_calls:
         msg["tool_calls"] = tool_calls
+    if reasoning:
+        msg["reasoning_content"] = reasoning  # thinking 开启时非流式响应携带思考链
     return {"choices": [{"message": msg}], "usage": dict(POLICY_USAGE)}
 
 
@@ -95,6 +97,51 @@ async def test_no_tool_direct_reply(monkeypatch):
     assert out["route"] == "order"
     assert out["tool_results"] == {}
     assert "发货" in out["direct_reply"]
+
+
+@pytest.mark.asyncio
+async def test_decision_reasoning_aggregated(monkeypatch):
+    """thinking 透出：多轮决策的 reasoning_content 按轮次聚合为 reasoning 字段。
+
+    决策循环开启 thinking 后，各轮 chat 的 message.reasoning_content 携带思考链；
+    循环内逐轮累积，最终以换行 join 透出（direct_reply 无工具作答轮同样携带，
+    生成节点据此在决策直接回答时也展示思考过程）。
+    """
+    calls = {"round": 0}
+
+    async def fake_execute(name, params, user_id, session_id):
+        return {"ok": True, "data": {"results": [{"text": "政策文档", "score": 0.9, "source": "x.md"}]}, "error": None}
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
+        if calls["round"] == 0:
+            calls["round"] += 1
+            # 首轮：思考后决定调 search_policy
+            return _resp(tool_calls=[_tool("search_policy", {"query": "退货政策"})],
+                         reasoning="用户问退货政策，属政策/FAQ 类，须检索政策文档。")
+        # 次轮：拿到工具结果后直接作答（含第二段思考）
+        return _resp(content="基于政策文档回答...", reasoning="工具结果已足够，直接作答。")
+
+    monkeypatch.setattr(al, "execute", fake_execute)
+    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    out = await al.run_decision_loop("退货政策是什么？", "POLICY_INQUIRY", _Session(), 1)
+    assert out["route"] == "policy"
+    assert "search_policy" in out["tool_results"]
+    # 两轮思考按轮次顺序 join（非覆盖，非乱序）
+    assert out["reasoning"] == "用户问退货政策，属政策/FAQ 类，须检索政策文档。\n工具结果已足够，直接作答。"
+
+
+@pytest.mark.asyncio
+async def test_decision_direct_reply_reasoning(monkeypatch):
+    """无工具直接作答路径：单轮 LLM 思考 + 作答，reasoning 透出（决策直接回答同样可见思考）。"""
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
+        return _resp(content="订单已发货，预计明天送达。", reasoning="用户问物流进度，无工具可查，直接告知。")
+
+    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    out = await al.run_decision_loop("我订单到哪了", "ORDER_STATUS", _Session(), 1)
+    assert out["route"] == "order"
+    assert out["direct_reply"] == "订单已发货，预计明天送达。"
+    assert out["reasoning"] == "用户问物流进度，无工具可查，直接告知。"
 
 
 @pytest.mark.asyncio

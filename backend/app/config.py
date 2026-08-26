@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model_chat: str = "deepseek-chat"
     deepseek_model_reasoner: str = "deepseek-reasoner"
+    # 思考过程开关：deepseek-chat 默认不返回 reasoning_content，须显式开启 thinking
+    # 才输出思考过程（V3.1+ 支持）。开启会额外计费思考 token、延迟略增，需关时设 false 即可。
+    deepseek_thinking_enabled: bool = True
     deepseek_per_key_rpm: int = 200
     deepseek_queue_max_size: int = 500
     deepseek_queue_timeout: float = 2.0
