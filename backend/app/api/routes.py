@@ -6,8 +6,9 @@
 """
 import asyncio
 import json
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -225,6 +226,51 @@ class KnowledgeUpdateRequest(BaseModel):
     content: str = Field(min_length=1)
 
 
+KB_UPLOAD_EXTENSIONS = {".md", ".txt"}
+KB_UPLOAD_MAX_BYTES = 1024 * 1024  # 1MB
+_KB_UPLOAD_CHUNK_SIZE = 64 * 1024  # 流式读分块，防全量进内存
+
+
+async def _read_limited(file: UploadFile, max_bytes: int) -> bytes:
+    """流式分块读取上传文件，累计超限即拒绝（内存峰值≈max_bytes+分块）。
+
+    UploadFile.read() 一次性全量读入内存，先读后校验会让超大文件在 413 之前
+    占满内存（multipart 解析阶段的 SpooledTemporaryFile 只挡解析不挡 handler）。
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_KB_UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=413, detail="文件过大，仅支持 1MB 以内")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _parse_knowledge_upload(filename: str, source_name: str, raw: bytes) -> tuple[str, str]:
+    """校验并解析上传的知识库文件，返回 (source, content)。
+
+    - 扩展名：按 filename 判断，仅 .md/.txt（纯文本；pdf/docx 需解析器，超出范围）→ 415
+    - 编码：utf-8 解码失败 → 400
+    - 内容：strip 后为空 → 400
+    - source：source_name（表单 title，可空）否则文件名 stem，截断到 100（source VARCHAR(100)）
+    """
+    ext = Path(filename).suffix.lower()
+    if ext not in KB_UPLOAD_EXTENSIONS:
+        raise HTTPException(status_code=415, detail=f"仅支持 {'/'.join(sorted(KB_UPLOAD_EXTENSIONS))} 文本文件")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="文件编码必须为 UTF-8")
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    source = (source_name or Path(filename).stem).strip() or filename
+    return source[:100], content
+
+
 @router.post("/admin/knowledge", status_code=201)
 async def upload_knowledge(req: KnowledgeUploadRequest, admin: dict = Depends(require_admin)) -> dict:
     try:
@@ -258,6 +304,29 @@ async def sync_knowledge(force: bool = Query(False), admin: dict = Depends(requi
     result = await kb_store.sync_full(force=force)
     logger.info("event=admin_sync_knowledge", extra={"admin": admin["username"], **result})
     return result
+
+
+@router.post("/admin/knowledge/upload", status_code=201)
+async def upload_knowledge_file(
+    file: UploadFile = File(...),
+    title: str | None = Form(None),  # 可选：显式标题作 source，否则用文件名 stem
+    admin: dict = Depends(require_admin),
+) -> dict:
+    """上传/覆盖一篇知识库文档（multipart 文件，仅 .md/.txt）。
+
+    落库复用 kb_store.upsert：同 source 再次上传即覆盖更新，同内容幂等跳过，
+    一致性（pending 补偿 / 全量对账）天然继承。
+    """
+    raw = await _read_limited(file, KB_UPLOAD_MAX_BYTES)
+    source, content = _parse_knowledge_upload(file.filename or "", title or "", raw)
+    try:
+        chunk_count = await kb_store.upsert(source, content, admin["username"])
+    except Exception as exc:
+        logger.error("event=admin_upload_file_fail", extra={"admin": admin["username"], "source": source, "error": str(exc)})
+        raise HTTPException(status_code=502, detail="知识库同步失败，请稍后重试或点击「同步」按钮")
+    await kb_store.reconcile_pending()
+    logger.info("event=admin_upload_file", extra={"admin": admin["username"], "source": source, "chunks": chunk_count})
+    return {"source": source, "count": chunk_count}
 
 
 @router.put("/admin/knowledge/{source}")
