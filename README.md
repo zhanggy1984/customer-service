@@ -6,7 +6,7 @@
 
 - **做什么**：把电商售后搬进对话。用户在聊天里直接办理退货、仅退款、投诉，也能查订单、问政策——每一步真实落库，退单号/退款/工单号可查，不再是"只能聊不能办"的问答机器人。
 - **怎么做**：LangGraph 状态机驱动三个可完成的业务流（退货/退款/投诉），DeepSeek 多 Key 网关 + RAG 检索生成答复，LLM 自主决策调只读工具（P3）+ 实时护栏（P4）+ 判定落库（P5）；SSE 契约化流式全链路可观测，LLM/存储故障一律熔断降级到规则引擎，**系统永不因 AI 故障崩溃**。
-- **好在哪**：政策有依据不编造、业务动作对话内闭环、故障不崩；对外是契约对齐的 SSE 事件流，有 297 项后端测试 + 41 项前端测试 + E2E 脚本，开箱即验。
+- **好在哪**：政策有依据不编造、业务动作对话内闭环、故障不崩；对外是契约对齐的 SSE 事件流，有 300 项后端测试 + 41 项前端测试 + E2E 脚本，开箱即验。
 
 ## 目录
 
@@ -93,7 +93,7 @@ graph TB
   → 上下文装配（Redis 加载会话 + 恢复快照）
   → 状态推进（LangGraph：collect_order_id → verify_order → check_eligibility）
   → 动作执行（对接层查订单 / reasoner 资格判定 / RAG 检索）
-  → SSE 响应（tool_call → reasoning → answer 逐段流式 → usage → done）
+  → SSE 响应（tool_call → reasoning → token 逐段流式 → usage → done）
   → 确认后 EXECUTE 创建退货单落库
   → 回复：「退货单 RC-xxx 已创建，退款 ¥69.70 将在 1-3 个工作日内原路返回」
 ```
@@ -182,7 +182,7 @@ npm run build             # 生产：构建产物挂载到 nginx
 **对开发 / 架构**
 - **可演进**：对接层 ABC 接口（`IOrderService` 等），Local → Remote 微服务 **Agent 代码零改动**；
 - **可观测**：JSON 结构化日志每请求 1 进 1 出 + 6 阶段各 1 条 + LLM/DB 埋点，注入 `session_id`/`intent`/`latency_ms` 全链路追踪；
-- **可验收**：SSE 契约 §5.1 事件齐备、`usage`/`done` 必选、`answer` 拼接 == `done.content`，评测平台可自动发现（`GET /api/contracts`）。
+- **可验收**：SSE 契约 §5.1 事件齐备、`usage`/`done` 必选、`token` 拼接 == `done.content`（平台 field_map 映射 answer），评测平台可自动发现（`GET /api/contracts`）。
 
 ### 4.2 演示场景
 
@@ -192,7 +192,7 @@ npm run build             # 生产：构建产物挂载到 nginx
 ```
 「我要退货 ORD-20240801-001」→ 回答原因 → 点确认 → 收到退货单号 RC-xxx
 ```
-**观看点**：SSE 依次透出 `tool_call(query_order)` → `reasoning` → `answer` 流式 → `usage` → `done`；admin 订单管理里商品状态已流转。
+**观看点**：SSE 依次透出 `tool_call(query_order)` → `reasoning` → `token` 流式 → `usage` → `done`；admin 订单管理里商品状态已流转。
 
 **场景 2 · 多轮部分退货（任意轮次指定商品）**
 ```
@@ -228,7 +228,7 @@ npm run build             # 生产：构建产物挂载到 nginx
 **验收示例**（对运行中的服务）：
 
 ```bash
-docker compose exec -T backend python verify_cs_e2e.py   # E2E：4 场景契约断言（answer 拼接 == done.content）
+docker compose exec -T backend python verify_cs_e2e.py   # E2E：4 场景契约断言（token 拼接 == done.content）
 ```
 
 ---
@@ -241,7 +241,7 @@ docker compose exec -T backend python verify_cs_e2e.py   # E2E：4 场景契约�
 - **排队背压**：无 healthy Key 时排队 2s，超时返回容量告警，不无限堆积；
 - **熔断状态机**：连续 2 次"逻辑调用彻底失败"（重试耗尽/超时）→ 熔断 30s，期间入口直接快速拒绝、**零网络尝试**；冷却到期半开放行探测，成功即重置。超时类慢挂的代价是等满 timeout 才失败，阈值取 2 让慢挂 2×timeout 即进入冷却，用户快速转入规则引擎兜底；
 - **故障分级**：429 全冷（AllKeysDown）与本地排队超时（CapacityExceeded）**不累计熔断**（前者已被 KeyPool 冷却覆盖，后者是本进程负载非上游故障）；已流出首个 delta 的流式中断（`StreamInterruptedError`）是连接级抖动，同样不累计——5 个并发长流自然中断不会误熔断全网关；
-- **空返回兜底**：LLM 200 但 content 全空 → 固定话术兜底，且已流式/未流式两种情况都保证前端 `answer` 拼接 == `done.content`；
+- **空返回兜底**：LLM 200 但 content 全空 → 固定话术兜底，且已流式/未流式两种情况都保证前端 `token` 拼接 == `done.content`；
 - **usage 全计**：一轮内多次 LLM 调用（意图分类 + 生成 + 资格判定）token 用量经 contextvar 聚合，`done` 前补发单条 `usage` 事件透传评测平台。
 
 ### 2. StorageRouter：Redis 主存 + MySQL 双写自动切换（存储高可用）
@@ -270,15 +270,16 @@ SSE 帧按 `event: <type>\n\ndata: {json}` 格式推送，前端 `useSSE.ts` 逐
 |------|------|------|
 | `meta` | 首帧 | 接口身份声明（`agent`/`interface`/`contract_version`） |
 | `status` | 可选 | 阶段进度文案（前端进度条） |
-| `reasoning` | 可选 | 状态机推理依据（如投诉严重性评估依据） |
+| `reasoning` | 可选 | 状态机推理依据（如投诉严重性评估依据，content+delta 双字段） |
 | `tool_call` | 可选 | 工具动作透出（`query_order`/`create_return`/`create_complaint`…） |
-| `answer` | 流式 | `answer.delta` 逐段文本（TTFT 起点） |
+| `token` | 流式 | `token.content`/`token.delta` 双字段逐段文本（TTFT 起点，对齐 good-question 契约，平台 field_map 映射 answer） |
 | `usage` | **必选** | token 用量聚合（prompt/completion/total + cache 命中/未命中） |
 | `done` | **必选** | 收尾，携带最终 `content` 与 `session_id` |
 | `error` | 失败 | 错误文案 |
 
-- **answer 拼接 == done.content**：流式中途熔断/异常/空返回时 reply 拼接「已流部分 + 兜底」，`answer` 只补发新增段，前端拼接结果与 `done.content` 严格一致；
-- **greeting 路径也补发**：新会话问候无 LLM 调用，同样补发 `answer` + `usage` + `done`，契约不因降级而缺帧；
+- **token 拼接 == done.content**：流式中途熔断/异常/空返回时 reply 拼接「已流部分 + 兜底」，`token` 只补发新增段，前端拼接结果与 `done.content` 严格一致；
+- **content == delta 恒等**：两字段均为本帧增量（对齐 good-question 平台口径，已核实其 `chat_service.py` 每帧 `{"content": inc, "delta": inc}`），非累积全文——勿改为累积值，否则偏离评测契约；
+- **greeting 路径也补发**：新会话问候无 LLM 调用，同样补发 `token` + `usage` + `done`，契约不因降级而缺帧；
 - **标准契约端点**：`GET /api/contracts` 声明 agent 的评测接口与场景清单（chat/login + greeting/order_query/after_sales/human_handoff），供平台自动发现。
 
 ### 6. 并发与资源治理
@@ -297,7 +298,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 - **会话消息体截断**：`SESSION_MAX_MESSAGES`（默认 40 条）超限截断为「首条 user 消息 + 最近 N-1 条」，防止会话无限增长（LLM/状态机不读消息全文，截断仅影响前端历史展示）。
 
 ### 9. 工程化质量
-- **后端 297 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/answer-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、会话历史/消息截断、contracts 端点；
+- **后端 300 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/token-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、会话历史/消息截断、contracts 端点；
 - **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
 - **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
 
@@ -320,7 +321,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | 向量库 | Milvus + LlamaIndex + bge-small-zh | 知识库派生向量索引，Top-10 → Re-rank Top-3 |
 | LLM | DeepSeek（openai 兼容） | chat 意图/响应/闲聊 + reasoner 资格/严重性，超时降级 |
 | 网关 | 自研 KeyPool + 熔断 | 多 Key 滑动窗口 RPM + 排队背压 + 指数退避 + 规则引擎兜底 |
-| 测试 | pytest + pytest-asyncio + vitest | 后端 297 / 前端 41，集成测试真实链路可重跑 |
+| 测试 | pytest + pytest-asyncio + vitest | 后端 300 / 前端 41，集成测试真实链路可重跑 |
 
 ---
 
@@ -373,7 +374,7 @@ customer-service/
 │   │   ├── session/              # 会话管理（Redis 主存 + MySQL 兜底 + 消息截断）
 │   │   └── utils/
 │   ├── sql/init.sql              # 建表 + 种子数据
-│   └── tests/                    # 297 项单元/契约/集成测试
+│   └── tests/                    # 300 项单元/契约/集成测试
 ├── frontend/                     # 前端（Vue3 + Vite + Element Plus）
 │   ├── src/
 │   │   ├── api/                  # axios 接口模块
@@ -398,10 +399,10 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图 / 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 | **297 passed** |
+| 后端单元/契约 | 意图 / 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 | **300 passed** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 可重复运行 |
-| E2E | `backend/verify_cs_e2e.py`：4 场景契约断言（闲聊/订单/政策/投诉，answer 拼接 == done.content） | 已验证通过 |
+| E2E | `backend/verify_cs_e2e.py`：4 场景契约断言（闲聊/订单/政策/投诉，token 拼接 == done.content） | 已验证通过 |
 
 运行全部测试：
 
@@ -434,7 +435,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 - 改 `.env` 配置后 `docker compose up -d` 重启容器即可。
 
 ### 跑测试 / 验收
-- 提交前先跑后端 `pytest tests/ -q` 与前端 `vitest run`，确保不破坏既有 297 + 41 项；
+- 提交前先跑后端 `pytest tests/ -q` 与前端 `vitest run`，确保不破坏既有 300 + 41 项；
 - 集成测试需服务在跑（`docker compose up -d`），未启动自动跳过不误报。
 
 ### 新增 API

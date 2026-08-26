@@ -1,18 +1,18 @@
 """SSE 帧格式与事件契约单测（评测契约 §5.1）。
 
-覆盖 sse_format 新帧格式（event: 行 + data 内嵌 ts）与 usage/done/answer 等
+覆盖 sse_format 新帧格式（event: 行 + data 内嵌 ts）与 usage/done/token 等
 事件构造函数的字段契约，防止帧格式变更再次破坏前端 useSSE.ts。
 """
 import json
 
 from app.agent.response import (
-    answer_event,
     done_event,
     error_event,
     meta_event,
     reasoning_event,
     sse_format,
     status_event,
+    token_event,
     tool_call_event,
     usage_event,
 )
@@ -20,9 +20,9 @@ from app.agent.response import (
 
 def test_sse_format_frame_lines():
     """新帧格式：首行 event: <type>，次行 data: <json>，帧尾空行。"""
-    frame = sse_format({"type": "answer", "delta": "你好"})
+    frame = sse_format({"type": "token", "delta": "你好"})
     lines = frame.split("\n")
-    assert lines[0] == "event: answer"
+    assert lines[0] == "event: token"
     assert lines[1].startswith("data: ")
     assert frame.endswith("\n\n")
     payload = json.loads(lines[1][6:])  # 去掉 "data: "
@@ -32,14 +32,14 @@ def test_sse_format_frame_lines():
 
 def test_sse_format_ensure_ascii_false():
     """中文不转义为 \\uXXXX，前端可读。"""
-    frame = sse_format(answer_event("中文回复"))
+    frame = sse_format(token_event("中文回复"))
     assert "中文回复" in frame
     assert "\\u" not in frame
 
 
-def test_answer_event_delta_field():
-    """answer 事件 delta 增量字段（评测端首个 answer.delta 即 TTFT 起点）。"""
-    assert answer_event("增量") == {"type": "answer", "delta": "增量"}
+def test_token_event_content_delta_fields():
+    """token 事件 content+delta 双字段（对齐 good-question 契约，平台 field_map 映射 answer）。"""
+    assert token_event("增量") == {"type": "token", "content": "增量", "delta": "增量"}
 
 
 def test_usage_event_fields_complete():
@@ -62,6 +62,6 @@ def test_aux_event_types():
     assert tool_call_event({"name": "query_order", "args": {}}) == {
         "type": "tool_call", "name": "query_order", "args": {}}
     assert status_event("verify", "校验中") == {"type": "status", "stage": "verify", "message": "校验中"}
-    assert reasoning_event("思考中") == {"type": "reasoning", "delta": "思考中"}
+    assert reasoning_event("思考中") == {"type": "reasoning", "content": "思考中", "delta": "思考中"}
     assert meta_event({"contract_version": "1.0"}) == {"type": "meta", "contract_version": "1.0"}
     assert error_event("系统异常") == {"type": "error", "message": "系统异常"}

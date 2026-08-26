@@ -4,7 +4,7 @@
   CapacityExceeded/AllKeysDown 不累计（非上游故障）。
 - 退避：_call 换 Key 重试按 (0.1, 0.2) 指数退避（参照 DB retry.py 的 BACKOFF_DELAYS 语义）。
 - 空返回：chat_stream 只出 usage 无 content → 生成节点回退 _EMPTY_ANSWER_FALLBACK 且未流式
-  （finalize 全量补发，保证 answer 拼接 == done.content 契约一致）。
+  （finalize 全量补发，保证 token 拼接 == done.content 契约一致）。
 """
 import asyncio
 import time
@@ -351,9 +351,9 @@ async def test_compose_policy_fallback_answer_empty_body_fallback(monkeypatch):
 async def test_compose_policy_answer_whitespace_only_content_contract(monkeypatch):
     """LLM 只 emit 空白 delta（"  " 对 `if delta:` 为 True 会 emit）→ 补发兜底且已流式。
 
-    挑战3：若走"未流式"路径（(fallback, False)），前端已收空白 answer.delta + finalize 全量补发
+    挑战3：若走"未流式"路径（(fallback, False)），前端已收空白 token.delta + finalize 全量补发
     会拼出"空白+fallback"，与 done.content=fallback 不一致；正确做法是补发兜底进 reply，
-    使 answer 拼接 == done.content。
+    使 token 拼接 == done.content。
     """
     emitted = []
 
@@ -371,7 +371,7 @@ async def test_compose_policy_answer_whitespace_only_content_contract(monkeypatc
         "退货政策是什么", emit)
     assert streamed is True
     assert reply == "  " + orch._EMPTY_ANSWER_FALLBACK
-    # 前端 answer.delta 序列拼接 == reply == done.content（契约一致）
+    # 前端 token.delta 序列拼接 == reply == done.content（契约一致）
     assert "".join(ev["delta"] for ev in emitted) == reply
 
 

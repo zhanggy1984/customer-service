@@ -65,11 +65,11 @@ def test_greeting_path_emits_meta_then_usage_then_done(monkeypatch):
     assert meta["contract_version"] == "1.0"
     assert "ts" in meta and isinstance(meta["ts"], int)
 
-    # greeting 路径（created_new 无 LLM）：answer 全量补发（TTFT 起点）+ usage 字段齐全
+    # greeting 路径（created_new 无 LLM）：token 全量补发（TTFT 起点）+ usage 字段齐全
     types = [e["data"]["type"] for e in events]
-    assert "answer" in types
-    answer_evt = next(e["data"] for e in events if e["data"]["type"] == "answer")
-    assert "您好" in answer_evt["delta"]
+    assert "token" in types
+    token_evt = next(e["data"] for e in events if e["data"]["type"] == "token")
+    assert "您好" in token_evt["delta"]
     assert "usage" in types
     usage_evt = next(e["data"] for e in events if e["data"]["type"] == "usage")
     for field in ("prompt_tokens", "completion_tokens", "total_tokens"):

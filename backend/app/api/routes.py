@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from app.agent import usage
 from app.agent.orchestrator import run_agent
-from app.agent.response import answer_event, sse_format, usage_event
+from app.agent.response import sse_format, token_event, usage_event
 from app.api.deps import get_current_user, require_admin
 from app.config import settings
 from app.infrastructure.mysql import mysql_pool
@@ -84,9 +84,9 @@ async def send_message(
                 try:
                     if created_new:
                         reply = "您好！请问有什么可以帮您？可以查询订单、退货、退款等。"
-                        # 契约 §5.1：greeting 无 LLM 调用，answer 全量补发（评测端首个 answer.delta 即 TTFT
-                        # 起点，且按 answer.delta 拼接最终回复）+ usage 补发（字段齐全）。
-                        await emit(answer_event(reply))
+                        # 契约 §5.1：greeting 无 LLM 调用，token 全量补发（评测端首个 token.delta 即 TTFT
+                        # 起点，且按 token.delta 拼接最终回复）+ usage 补发（字段齐全）。
+                        await emit(token_event(reply))
                         await emit(usage_event(usage.current()))
                     else:
                         reply = await run_agent(session, req.content, int(user["sub"]), emit)

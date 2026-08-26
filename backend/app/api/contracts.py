@@ -14,7 +14,7 @@ MANIFEST = {
     "interfaces": [
         {"name": "chat", "path": "/api/v1/sessions/{sid}/messages", "method": "POST",
          "contract_type": "sse", "llm": True,
-         "description": "客服会话对话（SSE 流式，透出 answer/usage/done）"},
+         "description": "客服会话对话（SSE 流式，透出 token/usage/done；token 事件含 content+delta 双字段，平台 field_map 可映射 answer）"},
         {"name": "login", "path": "/api/v1/auth/login", "method": "POST",
          "llm": False, "description": "会话鉴权（辅助接口）"},
     ],

@@ -1,8 +1,9 @@
 """SSE 响应协议（评测契约 §5.1）。
 
 帧格式: event: <type>\ndata: <json>\n\n，data 内置 ts（unix ms，agent 侧生成）。
-事件 type: meta/stage/reasoning/tool_call/answer/usage/done/error，另保留旧 status/action 兼容前端。
-answer/reasoning 为 delta 增量，评测端拼接；usage/done 必选。
+事件 type: meta/stage/reasoning/tool_call/token/usage/done/error，另保留旧 status/action 兼容前端。
+token/reasoning 为 delta 增量（对齐 good-question 契约：content+delta 双字段，平台 field_map
+把 token 映射为 answer），评测端拼接；usage/done 必选。
 
 向后兼容：旧前端 useSSE.ts 只读 data 行并按 json.type 分发，新增 event: 帧与
 新增事件类型对其透明（未知 type 静默忽略，done 仍携带 content）。
@@ -21,8 +22,14 @@ def status_event(stage: str, message: str) -> dict:
     return {"type": "status", "stage": stage, "message": message}
 
 
-def token_event(content: str) -> dict:
-    return {"type": "token", "content": content}
+def token_event(delta: str) -> dict:
+    """终答增量（对齐 good-question 契约：content+delta 双字段，平台 field_map 映射为 answer）。
+
+    评测端首个 token.delta 即 TTFT 起点（§5.3）；content 字段兼容按全文读取的平台侧。
+    content == delta 恒等是 good-question 平台口径（均为本帧增量，非累积全文）——已核实其
+    chat_service.py 每帧 yield {"content": inc, "delta": inc, "ts": _ts()}。勿改为累积值，否则偏离契约。
+    """
+    return {"type": "token", "content": delta, "delta": delta}
 
 
 def meta_event(meta: dict) -> dict:
@@ -30,14 +37,9 @@ def meta_event(meta: dict) -> dict:
     return {"type": "meta", **meta}
 
 
-def answer_event(delta: str) -> dict:
-    """终答增量。评测端首个 answer.delta 即 TTFT 起点（§5.3）。"""
-    return {"type": "answer", "delta": delta}
-
-
 def reasoning_event(delta: str) -> dict:
-    """思考链增量（可选）。"""
-    return {"type": "reasoning", "delta": delta}
+    """思考链增量（可选）。content+delta 双字段（对齐 good-question 契约，均为本帧增量）。"""
+    return {"type": "reasoning", "content": delta, "delta": delta}
 
 
 def tool_call_event(call: dict) -> dict:
