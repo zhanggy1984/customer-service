@@ -142,6 +142,69 @@ async def test_breaker_stream_interrupt_not_counted(monkeypatch):
     assert gw._breaker["failures"] == 1  # 尝试阶段失败（重试耗尽）才累计
 
 
+@pytest.mark.asyncio
+async def test_breaker_rejects_chat_stream_when_open(monkeypatch):
+    """熔断 open 后 chat_stream 同样入口快速拒绝（零 _stream 调用），流式生成不放大慢挂延迟。"""
+    gw = _mk_gateway()
+    calls = {"n": 0}
+    gw._breaker["failures"] = 2
+    gw._breaker["open_until"] = time.time() + 60  # 冷却期内
+
+    async def fake_stream(*a, **kw):
+        calls["n"] += 1
+        yield "x", None
+
+    monkeypatch.setattr(gw, "_stream", fake_stream)
+    with pytest.raises(LLMUnavailableError):
+        async for _ in gw.chat_stream([{"role": "user", "content": "hi"}]):
+            pass
+    assert calls["n"] == 0  # 零网络尝试（chat 与 chat_stream 双入口一致拦截）
+
+
+@pytest.mark.asyncio
+async def test_breaker_reset_on_stream_success(monkeypatch):
+    """流式调用先失败（未达阈值）再正常流结束 → 计数清零。"""
+    gw = _mk_gateway()
+
+    async def fake_fail(*a, **kw):
+        if True:
+            raise LLMUnavailableError("boom")
+        yield
+
+    async def fake_ok(*a, **kw):
+        yield "你好", None
+
+    monkeypatch.setattr(gw, "_stream", fake_fail)
+    with pytest.raises(LLMUnavailableError):
+        async for _ in gw.chat_stream([{"role": "user", "content": "hi"}]):
+            pass
+    assert gw._breaker["failures"] == 1
+
+    monkeypatch.setattr(gw, "_stream", fake_ok)
+    collected = []
+    async for item in gw.chat_stream([{"role": "user", "content": "hi"}]):
+        collected.append(item)
+    assert collected == [("你好", None)]
+    assert gw._breaker["failures"] == 0  # 正常流结束 → 成功 reset
+
+
+def test_llm_fallback_errors_centralized():
+    """LLM_FALLBACK_ERRORS 集中定义于 deepseek.py，agent 两侧复用同一元组（修改点4：去重）。
+
+    三类异常必须同时被覆盖：LLMUnavailableError（网络/超时/熔断）、CapacityExceededError
+    （本地排队）、AllKeysDownError（429 全冷）——任一遗漏都会让该故障不再走规则引擎兜底。
+    """
+    from app.agent import agent_loop
+    from app.infrastructure.deepseek import LLM_FALLBACK_ERRORS
+
+    assert set(LLM_FALLBACK_ERRORS) == {LLMUnavailableError, CapacityExceededError, AllKeysDownError}
+    assert agent_loop.LLM_FALLBACK_ERRORS is LLM_FALLBACK_ERRORS  # 不再本地重复定义
+    assert orch.LLM_FALLBACK_ERRORS is LLM_FALLBACK_ERRORS
+    # StreamInterruptedError 是 LLMUnavailableError 子类 → except LLM_FALLBACK_ERRORS 自动捕获
+    # （熔断/流中断两类都走规则引擎兜底，isinstance 语义，无需显式加入元组）
+    assert StreamInterruptedError.__mro__[1] is LLMUnavailableError
+
+
 # ---------- 退避 ----------
 
 
