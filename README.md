@@ -305,6 +305,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 
 ### 10. LLM 工具决策循环 + 实时护栏（P3-P5）
 - **决策循环**：`ORDER_STATUS` / `POLICY_INQUIRY` 意图下，LLM 自主决定调只读工具（`search_policy` / `query_order` / `list_user_orders`），工具结果回灌后由生成节点组装回复；业务副作用工具（建退货/退款/投诉单、资格判定）的决策被护栏拦截，转由 LangGraph 状态机确定性接手——决策与执行分离，LLM 不裸调业务动作；
+- **规则短路（优化③）**：`ORDER_STATUS` 且输入命中订单号时跳过 LLM 决策、确定性直查 `query_order`（未命中订单连查 `list_user_orders` 兜底），零决策轮调用、单号提取 100% 准确；`POLICY_INQUIRY` 刻意不接管（检索 query 依赖 LLM 改写）；未命中/异常回退 LLM 决策循环；落库 `verdict=rule_shortcut` 可观测；
 - **实时护栏 ToolGuardrail**：决策与执行之间的确定性规则校验，输出 `allow / reject / override` 三态 + 机器可读理由——副作用工具 reject→business、`search_policy` 过短/纯问候 reject、`query_order` 缺单号 override 为列最近订单、同轮同参数 dedupe 复用首次结果、累计工具调用 >3 截断强制出路由；
 - **观测落库**：每次护栏判定写 `tool_call_log`（session / round / tool / verdict / reason / 结果摘要 / 延迟），落库失败静默不阻断决策；为管理侧调用分析预留数据底座。
 
@@ -409,7 +410,7 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 / TTL 清理 / severity 模型档守护 | **347 passed** |
+| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环（含规则短路）+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 / TTL 清理 / severity 模型档守护 | **351 passed** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 可重复运行 |
 | E2E | `backend/verify_cs_e2e.py`：4 场景契约断言（闲聊/订单/政策/投诉，token 拼接 == done.content） | 已验证通过 |
@@ -490,6 +491,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.2.6** | 2026-08-26 | 决策循环规则短路（优化③）：`ORDER_STATUS` 命中订单号跳过 LLM 决策、确定性直查 `query_order`，未命中订单连查 `list_user_orders` 兜底——单号提取 100% 准确 + 零决策轮调用；`POLICY_INQUIRY` 刻意不接管（检索 query 依赖 LLM 改写）、未命中/异常回退 LLM 决策循环；落库 `verdict=rule_shortcut` 可观测；测试扩充至 351 项 |
 | **2.2.5** | 2026-08-26 | 投诉严重性评估 reasoner→chat（降本增效）：全项目唯一 LLM 档收敛到 chat，reasoner 配置保留作一行回退；prompt 增强校准（物流时效归 MEDIUM、安全类列举、LOW 收紧），实测 17/17=100% 与 reasoner 打平切换无损，HIGH 判据（人身安全/批量/金额>5000）零漏判；新增 verify_severity_accuracy.py 评测基线；测试扩充至 347 项 |
 | **2.2.4** | 2026-08-26 | 意图分类规则前置短路（少调 LLM）：新建 intent_rules 正则层，高置信模板化表达（问候/查单/退货/退款/投诉）跳过 LLM 分类、未命中回退；POLICY_INQUIRY 刻意不接管、业务流内与注入命中强制禁用规则；命中打 `event=intent_rule_hit` 可观测；测试扩充至 341 项 |
 | **2.2.3** | 2026-08-26 | 会话数据 TTL 清理（回收 MySQL 存储）：conversation_history/tool_call_log 保留 30 天超期回收，后台定时分批 sweep + get_session 惰性过期，delete_session 级联清 tool_call_log，补 idx_created_at 索引；SSE 内容帧对齐 good-question（answer→token，content+delta 双字段）；测试扩充至 309 项 |
