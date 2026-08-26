@@ -8,6 +8,7 @@
 import asyncio
 import json
 import time
+from collections.abc import AsyncIterator
 
 import httpx
 
@@ -117,6 +118,7 @@ class DeepSeekGateway:
         temperature: float | None = None,
         tools: list | None = None,
         tool_choice: str | dict | None = None,
+        thinking: bool | None = None,
     ) -> dict:
         """兼容旧 DeepSeekClient.chat 签名。Key 池化 + 排队 + 背压。
 
@@ -124,6 +126,8 @@ class DeepSeekGateway:
         意图分类等确定性场景传低温度（如 0.1）。
         tools/tool_choice 可选（工具决策循环用）：不传（None）则不加
         tools 字段，OpenAI 兼容格式原样透传给 DeepSeek，现有调用方无感。
+        thinking 覆盖全局思考开关：None 用 settings.deepseek_thinking_enabled，
+        False 关闭（意图分类/严重性评估等无 reasoning 消费方的调用省思考 token）。
         """
         if await self._breaker_open():
             # 熔断冷却期：入口直接快速失败，零网络尝试（防 LLM 慢挂时每请求 3 连打放大延迟）
@@ -139,7 +143,7 @@ class DeepSeekGateway:
             logger.warning("event=queue_wait_timeout")
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
         try:
-            result = await self._call(messages, model, timeout, temperature, tools, tool_choice)
+            result = await self._call(messages, model, timeout, temperature, tools, tool_choice, thinking)
             await self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
             return result
         except LLMUnavailableError:
@@ -156,12 +160,18 @@ class DeepSeekGateway:
         temperature: float | None = None,
         tools: list | None = None,
         tool_choice: str | dict | None = None,
+        thinking: bool | None = None,
     ) -> dict:
         payload = {
             "model": model or settings.deepseek_model_chat,
             "messages": messages,
             "stream": False,
         }
+        # 思考过程开关：与 _stream 一致，非流式响应在 message.reasoning_content 携带思考链
+        #（决策循环直接作答路径依赖此字段透出 reasoning 事件）。
+        # thinking 参数可覆盖全局开关：确定性分类/评估类调用传 False 省思考 token（无消费方）。
+        if (settings.deepseek_thinking_enabled if thinking is None else thinking):
+            payload["thinking"] = {"type": "enabled"}
         if temperature is not None:
             payload["temperature"] = temperature
         if tools:
@@ -219,16 +229,17 @@ class DeepSeekGateway:
         model: str | None = None,
         timeout: float | None = None,
         temperature: float | None = None,
-    ):
+    ) -> AsyncIterator[tuple[str, dict | None, str | None]]:
         """流式 chat（契约：token 级流式透出）。保留 Key 池化/排队/背压语义。
 
-        yield (delta_content, usage_or_None)：delta 非空为内容增量；
-        usage 仅在最后一个 chunk（include_usage）出现，通常为 None。
+        yield (delta_content, usage_or_None, reasoning_or_None)：delta 非空为内容增量；
+        usage 仅在最后一个 chunk（include_usage）出现，通常为 None；
+        reasoning 为思考链增量（开启 thinking 时出现，通常为 None，先于 content 流出）。
 
-        重试边界（决策：首个 content delta 前可换 Key，之后绝不重试）：
+        重试边界（决策：首个 content/reasoning delta 前可换 Key，之后绝不重试）：
         - HTTP 层 429/5xx → 换 Key 重试（未进内容流，安全）
-        - 流内首个 content delta 之前的异常 → 换 Key 重试
-        - 首个 content delta 之后的任何异常 → 直接上抛，不回滚已流出 token
+        - 流内首个 content/reasoning delta 之前的异常 → 换 Key 重试
+        - 首个 content/reasoning delta 之后的任何异常 → 直接上抛，不回滚已流出 token
         """
         if await self._breaker_open():
             logger.warning("event=llm_circuit_rejected")
@@ -261,13 +272,17 @@ class DeepSeekGateway:
         model: str | None,
         timeout: float | None,
         temperature: float | None = None,
-    ):
+    ) -> AsyncIterator[tuple[str, dict | None, str | None]]:
         payload = {
             "model": model or settings.deepseek_model_chat,
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},  # 最后一个 chunk 携带 usage
         }
+        # 思考过程开关：deepseek-chat 默认不返回 reasoning_content，开启 thinking 才输出
+        #（reasoning 事件依赖）。开启会额外计费思考 token。条件构建避免传无效参数被 API 拒绝。
+        if settings.deepseek_thinking_enabled:
+            payload["thinking"] = {"type": "enabled"}
         if temperature is not None:
             payload["temperature"] = temperature
         request_timeout = timeout or settings.deepseek_timeout_chat
@@ -279,7 +294,7 @@ class DeepSeekGateway:
                     raise AllKeysDownError("所有 DeepSeek Key 均不可用")
                 raise CapacityExceededError("系统繁忙，请稍后再试")
 
-            started = False  # 是否已流出首个 content delta
+            started = False  # 是否已流出首个 content/reasoning delta（含 thinking 的思考链）
             try:
                 await key.record_request()
                 async with self._client.stream(
@@ -327,15 +342,20 @@ class DeepSeekGateway:
                                 "total_tokens": u.get("total_tokens", 0),
                                 "prompt_cache_hit_tokens": u.get("prompt_cache_hit_tokens", 0),
                                 "prompt_cache_miss_tokens": u.get("prompt_cache_miss_tokens", 0),
-                            }
+                            }, None
                         choices = chunk.get("choices") or []
                         if not choices:
                             continue
                         delta = choices[0].get("delta") or {}
+                        reasoning = delta.get("reasoning_content") or ""
+                        if reasoning:
+                            # 思考链增量：先于 content 流出；已流出则不可换 Key 重试（会重复思考内容）
+                            started = True
+                            yield "", None, reasoning
                         content = delta.get("content") or ""
                         if content:
                             started = True
-                            yield content, None
+                            yield content, None, None
                     return  # 正常流结束
             except httpx.TimeoutException:
                 logger.error(

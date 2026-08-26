@@ -8,6 +8,10 @@ export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  /** 思考过程（reasoning 事件增量累积；过程性内容不入库，历史会话重载无此字段） */
+  reasoning?: string
+  /** 检索来源（search_policy 工具结果提取；过程性数据不入库，供回答来源标注展示） */
+  sources?: { text: string; source: string }[]
   streaming?: boolean
 }
 
@@ -64,7 +68,7 @@ export function useChat() {
     confirmVisible.value = false
     messages.value.push({ id: nextId(), role: 'user', content: text })
     const assistantId = nextId()
-    messages.value.push({ id: assistantId, role: 'assistant', content: '', streaming: true })
+    messages.value.push({ id: assistantId, role: 'assistant', content: '', reasoning: '', sources: [], streaming: true })
 
     try {
       const sid = await ensureSession()
@@ -74,6 +78,22 @@ export function useChat() {
         },
         onAction: (action) => {
           if (action === 'confirm') confirmVisible.value = true
+        },
+        onReasoning: (delta) => {
+          const m = messages.value.find((x) => x.id === assistantId)
+          if (m) m.reasoning = (m.reasoning || '') + delta
+        },
+        onToolCall: (name, result) => {
+          if (name !== 'search_policy') return
+          const results = (result as { data?: { results?: unknown[] } })?.data?.results
+          if (!Array.isArray(results)) return
+          const m = messages.value.find((x) => x.id === assistantId)
+          if (m) {
+            m.sources = results.map((r) => {
+              const item = r as { text?: string; source?: string }
+              return { text: item.text || '', source: item.source || '' }
+            })
+          }
         },
         onDone: (reply, newSid) => {
           if (newSid) setSession(newSid)

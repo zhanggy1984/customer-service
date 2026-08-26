@@ -198,7 +198,7 @@ async def test_breaker_reset_on_stream_success(monkeypatch):
         yield
 
     async def fake_ok(*a, **kw):
-        yield "你好", None
+        yield "你好", None, None
 
     monkeypatch.setattr(gw, "_stream", fake_fail)
     with pytest.raises(LLMUnavailableError):
@@ -210,7 +210,7 @@ async def test_breaker_reset_on_stream_success(monkeypatch):
     collected = []
     async for item in gw.chat_stream([{"role": "user", "content": "hi"}]):
         collected.append(item)
-    assert collected == [("你好", None)]
+    assert collected == [("你好", None, None)]
     assert gw._breaker["failures"] == 0  # 正常流结束 → 成功 reset
 
 
@@ -322,6 +322,41 @@ async def test_call_5xx_retry_backoff_escalates_then_unavailable(monkeypatch):
     assert sleeps == [0.1, 0.2]  # attempt=0→0.1, attempt=1→0.2
 
 
+# ---------- thinking 参数覆盖 ----------
+
+
+@pytest.mark.asyncio
+async def test_call_thinking_override(monkeypatch):
+    """thinking 参数覆盖全局开关：None 跟随 settings，False/True 显式覆盖。
+
+    决策循环传 None（需 reasoning 透出，跟随全局开）；意图分类/严重性评估传 False
+    （无 reasoning 消费方，省思考 token）；显式 True 可在全局关时单点开启。
+    """
+    from app.config import settings
+
+    captured = {}
+
+    async def fake_post(*a, **kw):
+        captured["json"] = kw["json"]
+        return _FakeResp(200, {"content": "ok"})
+
+    monkeypatch.setattr(settings, "deepseek_thinking_enabled", True)
+    gw = _mk_gateway()
+    gw._client.post = fake_post
+    await gw._call([{"role": "user", "content": "hi"}], "m", None)
+    assert captured["json"]["thinking"] == {"type": "enabled"}  # None 跟随全局开
+
+    await gw._call([{"role": "user", "content": "hi"}], "m", None, thinking=False)
+    assert "thinking" not in captured["json"]  # 显式关 → 不带 thinking
+
+    monkeypatch.setattr(settings, "deepseek_thinking_enabled", False)
+    await gw._call([{"role": "user", "content": "hi"}], "m", None)
+    assert "thinking" not in captured["json"]  # None 跟随全局关
+
+    await gw._call([{"role": "user", "content": "hi"}], "m", None, thinking=True)
+    assert captured["json"]["thinking"] == {"type": "enabled"}  # 显式开 → 覆盖全局关
+
+
 # ---------- 空返回兜底 ----------
 
 
@@ -336,7 +371,7 @@ async def test_compose_policy_answer_empty_content_fallback(monkeypatch):
     """chat_stream 只出 usage 无 content → 兜底话术 + 未流式（finalize 全量补发，契约一致）。"""
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
         yield "", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
-                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
     reply, streamed = await orch._compose_policy_answer(
@@ -384,9 +419,9 @@ async def test_compose_policy_answer_whitespace_only_content_contract(monkeypatc
     emitted = []
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "  ", None  # 非空字符串但全空白：生成节点会 emit
+        yield "  ", None, None  # 非空字符串但全空白：生成节点会 emit
         yield "", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
-                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
     async def emit(ev):
         emitted.append(ev)
@@ -407,7 +442,7 @@ async def test_handle_chitchat_whitespace_only_content_contract(monkeypatch):
     emitted = []
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        yield "  ", None
+        yield "  ", None, None
 
     async def emit(ev):
         emitted.append(ev)

@@ -16,7 +16,7 @@ def test_extract_json_trailing_text():
 
 @pytest.mark.asyncio
 async def test_classify_return_request(monkeypatch):
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         return {"choices": [{"message": {"content": '{"intent":"RETURN_REQUEST","confidence":0.98,"slots":{},"missing_slots":["order_id"],"summary":"退货"}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
     r = await classify_intent("我要退货")
@@ -26,7 +26,7 @@ async def test_classify_return_request(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_classify_chitchat(monkeypatch):
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         return {"choices": [{"message": {"content": '{"intent":"CHITCHAT","confidence":0.99,"slots":{},"missing_slots":[],"summary":"问候"}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
     r = await classify_intent("你好")
@@ -37,7 +37,7 @@ async def test_classify_chitchat(monkeypatch):
 async def test_classify_invalid_json_retries_then_fallback(monkeypatch):
     calls = {"n": 0}
 
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         calls["n"] += 1
         return {"choices": [{"message": {"content": "这不是JSON"}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
@@ -48,7 +48,7 @@ async def test_classify_invalid_json_retries_then_fallback(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_classify_invalid_intent_fallback(monkeypatch):
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         return {"choices": [{"message": {"content": '{"intent":"UNKNOWN_TYPE","confidence":0.9,"slots":{},"missing_slots":[],"summary":""}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
     r = await classify_intent("x")
@@ -64,7 +64,7 @@ async def test_classify_passes_low_temperature(monkeypatch):
     """#238：classify_intent 调用 chat 时透传 temperature=0.1（意图分类确定性）。"""
     captured = {}
 
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         captured["temperature"] = temperature
         return {"choices": [{"message": {"content": '{"intent":"POLICY_INQUIRY","confidence":0.95,"slots":{},"missing_slots":[],"summary":"政策咨询"}'}}]}
 
@@ -79,7 +79,7 @@ async def test_classify_messages_user_input_in_user_role(monkeypatch):
     """用户输入拆到独立 user 消息：system 不含用户输入，user 独立。"""
     captured = {}
 
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         captured["messages"] = messages
         return {"choices": [{"message": {"content": '{"intent":"CHITCHAT","confidence":0.5,"slots":{},"missing_slots":[],"summary":"x"}'}}]}
 
@@ -97,7 +97,7 @@ async def test_classify_messages_injection_guard_prefix(monkeypatch):
     """命中注入：user 消息前置防御声明且原文保留。"""
     captured = {}
 
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         captured["messages"] = messages
         return {"choices": [{"message": {"content": '{"intent":"CHITCHAT","confidence":0.5,"slots":{},"missing_slots":[],"summary":"x"}'}}]}
 
@@ -125,7 +125,7 @@ async def test_classify_use_rules_false_calls_llm(monkeypatch):
     """use_rules=False（业务流内路径）：同输入仍走 LLM。"""
     captured = {}
 
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         captured["called"] = True
         return {"choices": [{"message": {"content": '{"intent":"RETURN_REQUEST","confidence":0.98,"slots":{},"missing_slots":["order_id"],"summary":"退货"}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)
@@ -139,7 +139,7 @@ async def test_classify_injection_disables_rules(monkeypatch):
     """注入命中：禁用规则强制走 LLM（保留防御声明），即使输入含规则可匹配的动作子串。"""
     captured = {}
 
-    async def fake_chat(messages, model=None, timeout=None, temperature=None):
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         captured["called"] = True
         return {"choices": [{"message": {"content": '{"intent":"CHITCHAT","confidence":0.5,"slots":{},"missing_slots":[],"summary":"x"}'}}]}
     monkeypatch.setattr(deepseek_client, "chat", fake_chat)

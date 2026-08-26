@@ -87,6 +87,7 @@ async def classify_intent(
                 messages,
                 model=settings.deepseek_model_chat,
                 temperature=0.1,  # 意图分类需确定性，低温度抑制同 query 分类抖动
+                thinking=False,  # 分类结果不展示思考过程，关闭 thinking 省思考 token
             )
             raw = data["choices"][0]["message"]["content"]
             json_str = _extract_json(raw)

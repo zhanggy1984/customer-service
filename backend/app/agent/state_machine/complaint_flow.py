@@ -75,6 +75,7 @@ async def _assess_severity(description: str) -> str:
             ],
             model=settings.deepseek_model_chat,
             timeout=settings.deepseek_timeout_chat,
+            thinking=False,  # 严重性评估只输出 JSON，不展示思考过程，省思考 token
         )
         usage.accumulate(data.get("usage"))
         raw = data["choices"][0]["message"]["content"]

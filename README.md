@@ -55,7 +55,10 @@
 graph TB
     subgraph 前端
         WEB["Vue3 + Element Plus<br/>（frontend，npm run build）"]
-        NGINX["nginx :80<br/>静态服务 + /api/v1 反代 + SSE 关闭缓冲"]
+        NGINX["nginx :80<br/>静态服务 + /api/v1 反代 → api-gateway + SSE 关闭缓冲"]
+    end
+    subgraph 共享网关
+        GATEWAY["API 网关 api-gateway:8099（共享 infra）<br/>Host 虚拟域名路由 + X-Request-ID traceId<br/>按真实 IP 限流 + SSE 透传"]
     end
     subgraph 应用层
         API["FastAPI Agent :8000<br/>REST API + SSE 流式"]
@@ -73,8 +76,9 @@ graph TB
     end
 
     WEB --> NGINX
-    NGINX --> API
-    NGINX -- SSE 流式回复 --> WEB
+    NGINX --> GATEWAY
+    GATEWAY --> API
+    GATEWAY -- SSE 流式回复 --> WEB
     API --> PIPELINE
     PIPELINE --> GW
     GW --> DS
@@ -83,6 +87,8 @@ graph TB
     API --> REDIS
     API --> MILVUS
 ```
+
+**对外链路（统一 API 网关）**：浏览器只访问前端 nginx；nginx 将 `/api/v1` 反代到共享网关 `api-gateway:8099`（`Host: cs.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。
 
 **核心链路（以退货为例）**：
 
@@ -153,7 +159,7 @@ npm run build             # 生产：构建产物挂载到 nginx
 
 | 入口 | 地址 | 用途 |
 |------|------|------|
-| 前端（生产） | http://localhost:8081 | nginx 统一入口，含 API 反代 |
+| 前端（生产） | http://localhost:8081 | nginx 统一入口，API 反代经共享网关 api-gateway:8099 |
 | 后端 API | http://localhost:8000/api/v1 | 开发调试（含 SSE） |
 | 前端（开发热更新） | http://localhost:5173 | Vite dev server |
 | **MySQL** | `localhost:33061`（共享 infra，库 `customer_service`） | 外部工具验证数据 |
@@ -494,6 +500,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.4.0** | 2026-08-26 | 统一 API 网关接入：前端 nginx 改反代共享网关 `api-gateway:8099`（Host: cs.local），网关负责 X-Request-ID traceId 根生成（后端日志 `trace_id` 对齐）、按真实 IP 限流（cs_chat 2r/s + cs_auth 5r/m 接管登录限流）、SSE 透传；DeepSeek thinking 参数化（意图分类/投诉评估关闭省思考 token）+ reasoning 事件全链路展示（决策非流式全文 / 生成流式增量）+ 前端思考/来源折叠；检索来源 `[来源N]` 上下文序号化 + 前端来源内容展示；测试扩充至 369 项 |
 | **2.3.0** | 2026-08-26 | 多节点状态外置（自由扩缩容）：per-session Redis 分布式锁（SET NX PX + token Lua 释放 + 看门狗续期 + Redis 抖动容忍，替代进程内 asyncio.Lock）；DB/LLM/KB 熔断计数留本地、冷却信号 Redis 广播共享（close 仅本地广播方生效防撤销他人广播）；Milvus 同步检索走 to_thread 不阻塞事件循环/锁看门狗；StorageRouter Redis key 失效回退 MySQL；Redis 不可用 fail-fast 503、锁等待超时 429；测试扩充至 361 项 |
 | **2.2.6** | 2026-08-26 | 决策循环规则短路（优化③）：`ORDER_STATUS` 命中订单号跳过 LLM 决策、确定性直查 `query_order`，未命中订单连查 `list_user_orders` 兜底——单号提取 100% 准确 + 零决策轮调用；`POLICY_INQUIRY` 刻意不接管（检索 query 依赖 LLM 改写）、未命中/异常回退 LLM 决策循环；落库 `verdict=rule_shortcut` 可观测；测试扩充至 351 项 |
 | **2.2.5** | 2026-08-26 | 投诉严重性评估 reasoner→chat（降本增效）：全项目唯一 LLM 档收敛到 chat，reasoner 配置保留作一行回退；prompt 增强校准（物流时效归 MEDIUM、安全类列举、LOW 收紧），实测 17/17=100% 与 reasoner 打平切换无损，HIGH 判据（人身安全/批量/金额>5000）零漏判；新增 verify_severity_accuracy.py 评测基线；测试扩充至 347 项 |

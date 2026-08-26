@@ -3,11 +3,12 @@
 覆盖 _stream 的核心决策：
 - 首个 content delta 前 HTTP 429/5xx/超时 → 换 Key 重试
 - 首个 content delta 后任何异常 → 直接上抛，不回滚已流出 token
-- usage chunk（include_usage）→ yield ("", usage)，cache 字段透传
+- usage chunk（include_usage）→ yield ("", usage, None)，cache 字段透传
 """
 import pytest
 import httpx
 
+from app.config import settings
 from app.infrastructure.deepseek_gateway import (
     DeepSeekGateway,
     LLMUnavailableError,
@@ -79,8 +80,10 @@ class FakeStreamCtx:
 class FakeClient:
     def __init__(self, responses: list[dict]) -> None:
         self._ctx = FakeStreamCtx(responses)
+        self.stream_kwargs: list[dict] = []  # 捕获每次 stream 调用参数（断言 thinking payload）
 
     def stream(self, *args, **kwargs):
+        self.stream_kwargs.append(kwargs)
         return self._ctx
 
 
@@ -107,7 +110,7 @@ async def test_stream_http_429_before_content_retries():
         {"status": 200, "lines": [_d('{"choices":[{"delta":{"content":"回复"}}]}'), "data: [DONE]"]},
     ], [FakeKey(0), FakeKey(1)])
     items = await _collect(gw)
-    assert items == [("回复", None)]
+    assert items == [("回复", None, None)]
     assert gw._pool._keys[0].rate_limited is True
     assert gw._pool._keys[1].rate_limited is False
     assert gw._pool.select_calls == 2
@@ -121,7 +124,7 @@ async def test_stream_http_5xx_before_content_retries():
         {"status": 200, "lines": [_d('{"choices":[{"delta":{"content":"ok"}}]}'), "data: [DONE]"]},
     ], [FakeKey(0), FakeKey(1)])
     items = await _collect(gw)
-    assert items == [("ok", None)]
+    assert items == [("ok", None, None)]
     assert gw._pool.select_calls == 2
 
 
@@ -133,7 +136,7 @@ async def test_stream_timeout_before_content_retries():
         {"status": 200, "lines": [_d('{"choices":[{"delta":{"content":"ok"}}]}'), "data: [DONE]"]},
     ], [FakeKey(0), FakeKey(1)])
     items = await _collect(gw)
-    assert items == [("ok", None)]
+    assert items == [("ok", None, None)]
     assert gw._pool.select_calls == 2
 
 
@@ -149,7 +152,7 @@ async def test_stream_no_retry_after_first_delta():
     with pytest.raises(LLMUnavailableError):
         async for item in gw._stream([{"role": "user", "content": "hi"}], "m", None, None):
             got.append(item)
-    assert got == [("部分", None)]  # 已流出内容保留
+    assert got == [("部分", None, None)]  # 已流出内容保留
     assert gw._pool.select_calls == 1  # 未换 Key 重试
 
 
@@ -166,9 +169,9 @@ async def test_stream_usage_chunk_cache_passthrough():
         ]},
     ], [FakeKey(0)])
     items = await _collect(gw)
-    assert items[0] == ("完整", None)
+    assert items[0] == ("完整", None, None)
     assert items[1] == ("", {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
-                             "prompt_cache_hit_tokens": 70, "prompt_cache_miss_tokens": 30})
+                             "prompt_cache_hit_tokens": 70, "prompt_cache_miss_tokens": 30}, None)
 
 
 @pytest.mark.asyncio
@@ -182,3 +185,55 @@ async def test_stream_retries_exhausted_raises():
     with pytest.raises(LLMUnavailableError):
         await _collect(gw)
     assert gw._pool.select_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_stream_reasoning_before_content():
+    """开启 thinking 时 reasoning_content 增量先于 content 流出（契约第三元素）。"""
+    gw = _mk_gateway([
+        {"status": 200, "lines": [
+            _d('{"choices":[{"delta":{"reasoning_content":"先思考"}}]}'),
+            _d('{"choices":[{"delta":{"content":"再回答"}}]}'),
+            "data: [DONE]",
+        ]},
+    ], [FakeKey(0)])
+    items = await _collect(gw)
+    assert items == [("", None, "先思考"), ("再回答", None, None)]
+
+
+@pytest.mark.asyncio
+async def test_stream_payload_thinking_enabled(monkeypatch):
+    """思考开关开启时 payload 携带 thinking.enabled（deepseek-chat 依赖此参数输出 reasoning）。"""
+    monkeypatch.setattr(settings, "deepseek_thinking_enabled", True)
+    gw = _mk_gateway([
+        {"status": 200, "lines": [_d('{"choices":[{"delta":{"content":"ok"}}]}'), "data: [DONE]"]},
+    ], [FakeKey(0)])
+    await _collect(gw)
+    assert gw._client.stream_kwargs[0]["json"]["thinking"] == {"type": "enabled"}
+
+
+@pytest.mark.asyncio
+async def test_stream_payload_thinking_disabled(monkeypatch):
+    """思考开关关闭时不带 thinking 参数（回退现状，不传无效参数）。"""
+    monkeypatch.setattr(settings, "deepseek_thinking_enabled", False)
+    gw = _mk_gateway([
+        {"status": 200, "lines": [_d('{"choices":[{"delta":{"content":"ok"}}]}'), "data: [DONE]"]},
+    ], [FakeKey(0)])
+    await _collect(gw)
+    assert "thinking" not in gw._client.stream_kwargs[0]["json"]
+
+
+@pytest.mark.asyncio
+async def test_stream_no_retry_after_reasoning_streamed():
+    """reasoning 已流出（started=True）后流中断 → 直接上抛，不重试（重试会重复思考内容）。"""
+    gw = _mk_gateway([
+        {"status": 200,
+         "lines": [_d('{"choices":[{"delta":{"reasoning_content":"思考中"}}]}')],
+         "raise_after": httpx.ConnectError("conn reset")},
+    ], [FakeKey(0), FakeKey(1)])
+    got = []
+    with pytest.raises(LLMUnavailableError):
+        async for item in gw._stream([{"role": "user", "content": "hi"}], "m", None, None):
+            got.append(item)
+    assert got == [("", None, "思考中")]  # 已流出思考保留
+    assert gw._pool.select_calls == 1  # 未换 Key 重试
