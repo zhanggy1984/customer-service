@@ -63,7 +63,7 @@ graph TB
     end
     subgraph AI 服务
         GW["DeepSeek Gateway<br/>多 Key 池化 + RPM + 排队背压 + 熔断"]
-        DS["DeepSeek LLM<br/>chat（意图/响应/闲聊）· reasoner（资格/严重性）"]
+        DS["DeepSeek LLM<br/>chat（意图/响应/闲聊/严重性）· 资格判定规则化"]
         BGE["bge-small-zh Embedding"]
     end
     subgraph 数据层
@@ -92,7 +92,7 @@ graph TB
   → 意图识别 → RETURN_REQUEST（deepseek-chat，~200ms，JSON 容错 + 2 次重试）
   → 上下文装配（Redis 加载会话 + 恢复快照）
   → 状态推进（LangGraph：collect_order_id → verify_order → check_eligibility）
-  → 动作执行（对接层查订单 / reasoner 资格判定 / RAG 检索）
+  → 动作执行（对接层查订单 / 确定性资格判定 / chat 严重性评估 / RAG 检索）
   → SSE 响应（tool_call → reasoning → token 逐段流式 → usage → done）
   → 确认后 EXECUTE 创建退货单落库
   → 回复：「退货单 RC-xxx 已创建，退款 ¥69.70 将在 1-3 个工作日内原路返回」
@@ -262,7 +262,7 @@ docker compose exec -T backend python verify_cs_e2e.py   # E2E：4 场景契约�
 - **全局打断**：任一节点可 `取消 / 返回 / 更换 / 转人工`；说「转人工」优先触发渠道模板话术（关键词已收窄，不误触发「人工智能」）；
 - **部分退货多轮指定**：任意轮可补「只退某商品」，items 槽合并进 `return_items`，资格重算后确认页展示子集及其金额；LLM 漏提取时以「只退/就退/只要退/仅退/单退 + 商品名」句式规则兜底（含量词/语气词/多商品/否定句式处理），规避退错全量风险；
 - **意图切换 + 快照**：业务流中切到别的意图自动保存当前进度（按意图各存一份），回来输入「继续退货」即可恢复；
-- **模型路由**：意图分类/响应/闲聊走 `deepseek-chat`（200ms-1s）；退货/退款资格判定、投诉严重性评估走 `deepseek-reasoner`（1-3s），超时降级 chat。
+- **模型路由**：全链路统一 `deepseek-chat`（意图分类/响应/闲聊/投诉严重性评估，200ms-1s）；退货/退款资格判定走**确定性规则**（不走 LLM）；severity 评估异常/超时降级 MEDIUM（配置字段 `deepseek_model_reasoner` 已弃用，保留作一行回退）。
 
 ### 5. SSE 契约化：事件齐备 + usage 必选 + 流式一致性（契约 §5.1）
 SSE 帧按 `event: <type>\n\ndata: {json}` 格式推送，前端 `useSSE.ts` 逐帧解析：
@@ -326,7 +326,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | 关系数据库 | MySQL 8 | 业务权威数据 + 知识库原文源（source of truth） |
 | 缓存/会话 | Redis 7 | 会话主存 / 快照 / RAG 精确缓存 |
 | 向量库 | Milvus + LlamaIndex + bge-small-zh | 知识库派生向量索引，Top-10 → Re-rank Top-3 |
-| LLM | DeepSeek（openai 兼容） | chat 意图/响应/闲聊 + reasoner 资格/严重性，超时降级 |
+| LLM | DeepSeek（openai 兼容） | 统一 chat（意图/响应/闲聊/严重性）；资格判定规则化，超时降级 |
 | 网关 | 自研 KeyPool + 熔断 | 多 Key 滑动窗口 RPM + 排队背压 + 指数退避 + 规则引擎兜底 |
 | 测试 | pytest + pytest-asyncio + vitest | 后端 300 / 前端 41，集成测试真实链路可重跑 |
 
@@ -340,11 +340,11 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 |------|------|--------|
 | `DEEPSEEK_API_KEYS` | DeepSeek API Key 列表，逗号分隔（**必填**，Key 越多并发越高） | - |
 | `DEEPSEEK_BASE_URL` | API 地址 | `https://api.deepseek.com` |
-| `DEEPSEEK_MODEL_CHAT` | chat 模型（意图/响应/闲聊） | `deepseek-chat` |
-| `DEEPSEEK_MODEL_REASONER` | reasoner 模型（资格/严重性判定） | `deepseek-reasoner` |
+| `DEEPSEEK_MODEL_CHAT` | chat 模型（意图/响应/闲聊/严重性） | `deepseek-chat` |
+| `DEEPSEEK_MODEL_REASONER` | ~~reasoner 模型~~ 已弃用（投诉严重性改走 chat，字段保留作一行回退） | `deepseek-reasoner` |
 | `DEEPSEEK_PER_KEY_RPM` | 单 Key 每分钟请求上限（滑动窗口追踪） | `200` |
 | `DEEPSEEK_QUEUE_MAX_SIZE` / `DEEPSEEK_QUEUE_TIMEOUT` | 排队容量 / 排队超时（秒，超时返回容量告警） | `500` / `2.0` |
-| `DEEPSEEK_TIMEOUT_CHAT` / `DEEPSEEK_TIMEOUT_REASONER` | chat / reasoner 调用超时（秒） | `8.0` / `15.0` |
+| `DEEPSEEK_TIMEOUT_CHAT` / `DEEPSEEK_TIMEOUT_REASONER` | chat 调用超时（秒）/ ~~reasoner 超时~~ 已弃用（随 reasoner 字段一并保留作回退） | `8.0` / `15.0` |
 | `SERVICE_MODE` / `VECTOR_STORE` | 运行模式 / 向量库实现 | `local` / `milvus` |
 | `REDIS_URL` | 共享 Redis 连接（db index 1） | `redis://redis:6379/1` |
 | `MYSQL_URL` | MySQL 连接（asyncmy 异步驱动，密码仅 env 注入） | `mysql+asyncmy://csuser:CHANGE_ME@mysql:3306/customer_service` |
@@ -409,7 +409,7 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 / TTL 清理 | **341 passed** |
+| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 / TTL 清理 / severity 模型档守护 | **347 passed** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 可重复运行 |
 | E2E | `backend/verify_cs_e2e.py`：4 场景契约断言（闲聊/订单/政策/投诉，token 拼接 == done.content） | 已验证通过 |
@@ -477,7 +477,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 **如实说明当前已知的性能与边界问题：**
 
-1. **模型全 CPU 推理**：bge-small-zh embedding、DeepSeek reasoner 判定在 CPU/远程 API 上运行，首次加载 embedding 模型较慢（启动已预热，重启后首次提问前加载）。重负载场景可考虑 GPU 容器。
+1. **模型全 CPU 推理**：bge-small-zh embedding、DeepSeek chat 判定在 CPU/远程 API 上运行，首次加载 embedding 模型较慢（启动已预热，重启后首次提问前加载）。重负载场景可考虑 GPU 容器。
 2. **RAG 缓存仅精确命中**：Redis 缓存 key 为精确问题文本（TTL 600s），语义相近的问法走完整检索 + LLM 调用（DeepSeek 计费）。高频率场景可评估语义级缓存。
 3. **单实例内存态熔断/冷却**：LLM 熔断（`_breaker`）与检索冷却（3 次/60s）为进程内存态，进程重启即重置；当前单实例部署可接受，多实例扩展需外置共享状态（如 Redis）。
 4. **规则引擎兜底覆盖面有限**：10 条正则仅覆盖高频售后场景（退货/退款/订单/政策/投诉），LLM 故障时的自由问答只能返回固定话术，无法真正理解。
@@ -490,6 +490,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.2.5** | 2026-08-26 | 投诉严重性评估 reasoner→chat（降本增效）：全项目唯一 LLM 档收敛到 chat，reasoner 配置保留作一行回退；prompt 增强校准（物流时效归 MEDIUM、安全类列举、LOW 收紧），实测 17/17=100% 与 reasoner 打平切换无损，HIGH 判据（人身安全/批量/金额>5000）零漏判；新增 verify_severity_accuracy.py 评测基线；测试扩充至 347 项 |
 | **2.2.4** | 2026-08-26 | 意图分类规则前置短路（少调 LLM）：新建 intent_rules 正则层，高置信模板化表达（问候/查单/退货/退款/投诉）跳过 LLM 分类、未命中回退；POLICY_INQUIRY 刻意不接管、业务流内与注入命中强制禁用规则；命中打 `event=intent_rule_hit` 可观测；测试扩充至 341 项 |
 | **2.2.3** | 2026-08-26 | 会话数据 TTL 清理（回收 MySQL 存储）：conversation_history/tool_call_log 保留 30 天超期回收，后台定时分批 sweep + get_session 惰性过期，delete_session 级联清 tool_call_log，补 idx_created_at 索引；SSE 内容帧对齐 good-question（answer→token，content+delta 双字段）；测试扩充至 309 项 |
 | **2.2.2** | 2026-08-26 | LLM 网关熔断 + 换 Key 重试退避 + 流中断隔离 + 空返回兜底 + 兜底异常元组去重；管理端文件上传（覆盖更新复用 upsert）；异常治理收尾（写路径幂等、检索冷却、DB 熔断）；RAG 增量跳检（content_hash）+ 章节级检索扩充；测试扩充至 297 项 |
