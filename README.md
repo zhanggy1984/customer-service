@@ -6,7 +6,7 @@
 
 - **做什么**：把电商售后搬进对话。用户在聊天里直接办理退货、仅退款、投诉，也能查订单、问政策——每一步真实落库，退单号/退款/工单号可查，不再是"只能聊不能办"的问答机器人。
 - **怎么做**：LangGraph 状态机驱动三个可完成的业务流（退货/退款/投诉），DeepSeek 多 Key 网关 + RAG 检索生成答复，LLM 自主决策调只读工具（P3）+ 实时护栏（P4）+ 判定落库（P5）；SSE 契约化流式全链路可观测，LLM/存储故障一律熔断降级到规则引擎，**系统永不因 AI 故障崩溃**。
-- **好在哪**：政策有依据不编造、业务动作对话内闭环、故障不崩；对外是契约对齐的 SSE 事件流，有 300 项后端测试 + 41 项前端测试 + E2E 脚本，开箱即验。
+- **好在哪**：政策有依据不编造、业务动作对话内闭环、故障不崩；对外是契约对齐的 SSE 事件流，有 361 项后端测试 + 41 项前端测试 + E2E 脚本，开箱即验。
 
 ## 目录
 
@@ -43,7 +43,7 @@
 | **对话式业务办理** | LangGraph 状态机驱动退货/仅退款/投诉，每步落库真实可查，支持部分退货多轮指定 | 人力成本 |
 | **政策问答** | MySQL 原文源 + Milvus 向量 + RAG 检索，命中/未命中都有兜底，绝不编造 | 口径不一 |
 | **订单/进度查询** | 对接层抽象 + 意图切换快照，对话内随时查单、中途切流、断点恢复 | 业务断层 |
-| **高可用工程** | DeepSeek 多 Key 网关 + StorageRouter 双写 + 熔断降级，LLM/存储故障系统不崩 | 峰值崩溃 |
+| **高可用工程** | DeepSeek 多 Key 网关 + StorageRouter 双写 + 分布式锁/熔断信号 Redis 外置（多节点自由扩缩容），LLM/存储故障系统不崩 | 峰值崩溃 |
 
 > **一句话理解 Agent 编排**：系统把"看懂用户要什么"（意图识别）、"要不要查/调工具"（LLM 工具决策循环 + 护栏）、"怎么一步步办成业务"（LangGraph 状态机）、"回答不上来怎么办"（规则引擎兜底）四件事分层交给不同组件——LLM 负责理解与生成，规则负责确定性与兜底，状态机负责业务闭环。
 
@@ -240,6 +240,7 @@ docker compose exec -T backend python verify_cs_e2e.py   # E2E：4 场景契约�
 - **KeyPool**：多 Key 滑动窗口 RPM 追踪，选负载最低的 healthy Key；429 → 自动冷却，5xx → 换 Key 重试（最多 2 次，指数退避 0.1s/0.2s）；
 - **排队背压**：无 healthy Key 时排队 2s，超时返回容量告警，不无限堆积；
 - **熔断状态机**：连续 2 次"逻辑调用彻底失败"（重试耗尽/超时）→ 熔断 30s，期间入口直接快速拒绝、**零网络尝试**；冷却到期半开放行探测，成功即重置。超时类慢挂的代价是等满 timeout 才失败，阈值取 2 让慢挂 2×timeout 即进入冷却，用户快速转入规则引擎兜底；
+- **多节点共享熔断**：熔断连续计数留本地（进程私有），冷却期信号经 Redis 广播共享——任一节点熔断，其他节点免去各自重复探测即同步降级；半开放探测成功仅广播方清除共享信号，他节点成功不 DEL（防撤销他人广播），靠 TTL 自然过期兜底；
 - **故障分级**：429 全冷（AllKeysDown）与本地排队超时（CapacityExceeded）**不累计熔断**（前者已被 KeyPool 冷却覆盖，后者是本进程负载非上游故障）；已流出首个 delta 的流式中断（`StreamInterruptedError`）是连接级抖动，同样不累计——5 个并发长流自然中断不会误熔断全网关；
 - **空返回兜底**：LLM 200 但 content 全空 → 固定话术兜底，且已流式/未流式两种情况都保证前端 `token` 拼接 == `done.content`；
 - **usage 全计**：一轮内多次 LLM 调用（意图分类 + 生成 + 资格判定）token 用量经 contextvar 聚合，`done` 前补发单条 `usage` 事件透传评测平台。
@@ -284,7 +285,7 @@ SSE 帧按 `event: <type>\n\ndata: {json}` 格式推送，前端 `useSSE.ts` 逐
 - **标准契约端点**：`GET /api/contracts` 声明 agent 的评测接口与场景清单（chat/login + greeting/order_query/after_sales/human_handoff），供平台自动发现。
 
 ### 6. 并发与资源治理
-- **同一会话串行锁**：`asyncio.Lock(session_id)` 防止双击发送导致状态覆盖；
+- **同一会话串行锁（分布式）**：Redis 锁（SET NX PX + token Lua 释放 + 看门狗每 ttl/3 续期）串行化同会话并发请求，**多节点共享**——双击发送、多实例负载均衡下状态不覆盖；Redis 不可用 fail-fast 503、等待超时映射 429；看门狗 Redis 抖动不退出（TTL 兜底）；
 - **SSE 断连自取消**：检测 `request.is_disconnected()`，自动保存进度并取消生成，防资源泄露；
 - **优雅关闭**：停止接新请求 → 30s 宽限 → 保存活跃会话 checkpoint → 关闭连接池；
 - **MySQL 写入重试**：连接错误/死锁指数退避（0.1/0.2/0.4s）3 次，失败统一兜底话术。
@@ -299,7 +300,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 - **会话消息体截断**：`SESSION_MAX_MESSAGES`（默认 40 条）超限截断为「首条 user 消息 + 最近 N-1 条」，防止会话无限增长（LLM/状态机不读消息全文，截断仅影响前端历史展示）。
 
 ### 9. 工程化质量
-- **后端 300 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/token-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、会话历史/消息截断、contracts 端点；
+- **后端 361 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/token-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、共享熔断 close 仅本地广播方、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、分布式锁（获取/等待/超时/看门狗续期）、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、会话历史/消息截断、contracts 端点；
 - **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
 - **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
 
@@ -325,7 +326,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | 状态编排 | LangGraph | 三业务流状态机，每轮输入推进一节点 |
 | 前端 | Vue3 + Vite + Element Plus + Pinia | 客服聊天 + Admin 管理后台，SSE 逐帧消费 |
 | 关系数据库 | MySQL 8 | 业务权威数据 + 知识库原文源（source of truth） |
-| 缓存/会话 | Redis 7 | 会话主存 / 快照 / RAG 精确缓存 |
+| 缓存/会话 | Redis 7 | 会话主存 / 快照 / RAG 精确缓存 / 分布式锁 / 熔断冷却共享信号 |
 | 向量库 | Milvus + LlamaIndex + bge-small-zh | 知识库派生向量索引，Top-10 → Re-rank Top-3 |
 | LLM | DeepSeek（openai 兼容） | 统一 chat（意图/响应/闲聊/严重性）；资格判定规则化，超时降级 |
 | 网关 | 自研 KeyPool + 熔断 | 多 Key 滑动窗口 RPM + 排队背压 + 指数退避 + 规则引擎兜底 |
@@ -353,6 +354,9 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | `JWT_SECRET_KEY` | JWT 签名密钥（生产必须替换为随机长字符串） | `change-me...` |
 | `JWT_EXPIRE_HOURS` | token 有效期（小时） | `2` |
 | `SESSION_TTL` | 会话 TTL（秒） | `3600` |
+| `SESSION_LOCK_TTL` | 会话分布式锁 TTL（秒，看门狗每 ttl/3 续期防长处理击穿） | `60` |
+| `SESSION_LOCK_WAIT_TIMEOUT` | 获取锁最大等待（秒），超时映射 429 | `30` |
+| `SESSION_LOCK_POLL_INTERVAL` | 抢锁失败轮询间隔（秒） | `0.1` |
 | `CONVERSATION_MAX_ROUNDS` | 对话最大轮次 | `10` |
 | `SESSION_RETENTION_DAYS` | 会话/工具判定日志保留天数，超期定时+惰性回收（回收 MySQL 存储） | `30` |
 | `SESSION_CLEANUP_INTERVAL_SECONDS` | 定时清理周期（秒） | `3600` |
@@ -382,7 +386,7 @@ customer-service/
 │   │   ├── infrastructure/       # DeepSeek Gateway（keypool/熔断/网关）+ MySQL + schema（应用自建表+种子）
 │   │   ├── rag/                  # RAG（embedder/retriever/milvus_impl/kb_store/knowledge）
 │   │   ├── services/             # 业务服务（interfaces 抽象 + local_impl + 重试）
-│   │   ├── session/              # 会话管理（Redis 主存 + MySQL 兜底 + 消息截断）
+│   │   ├── session/              # 会话管理（Redis 主存 + MySQL 兜底 + 消息截断 + 分布式锁）
 │   │   └── utils/
 │   ├── sql/init.sql              # 建表 + 种子数据
 │   └── tests/                    # 300 项单元/契约/集成测试
@@ -410,7 +414,7 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环（含规则短路）+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / tool_call_log / contracts / 建表种子 / TTL 清理 / severity 模型档守护 | **351 passed** |
+| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环（含规则短路）+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / 分布式锁 / tool_call_log / contracts / 建表种子 / TTL 清理 / severity 模型档守护 | **361 passed** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 可重复运行 |
 | E2E | `backend/verify_cs_e2e.py`：4 场景契约断言（闲聊/订单/政策/投诉，token 拼接 == done.content） | 已验证通过 |
@@ -480,10 +484,9 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 1. **模型全 CPU 推理**：bge-small-zh embedding、DeepSeek chat 判定在 CPU/远程 API 上运行，首次加载 embedding 模型较慢（启动已预热，重启后首次提问前加载）。重负载场景可考虑 GPU 容器。
 2. **RAG 缓存仅精确命中**：Redis 缓存 key 为精确问题文本（TTL 600s），语义相近的问法走完整检索 + LLM 调用（DeepSeek 计费）。高频率场景可评估语义级缓存。
-3. **单实例内存态熔断/冷却**：LLM 熔断（`_breaker`）与检索冷却（3 次/60s）为进程内存态，进程重启即重置；当前单实例部署可接受，多实例扩展需外置共享状态（如 Redis）。
-4. **规则引擎兜底覆盖面有限**：10 条正则仅覆盖高频售后场景（退货/退款/订单/政策/投诉），LLM 故障时的自由问答只能返回固定话术，无法真正理解。
-5. **回合缓存仅限无状态政策轮次**：订单/业务流等依赖实时数据的轮次不缓存（正确性优先），缓存命中率受限于政策问答占比。
-6. **SSE 断连不重放已流内容**：流式中途断线会保存进度并取消生成，但已流出的内容不会自动补发，用户需重新进入会话查看历史。
+3. **规则引擎兜底覆盖面有限**：10 条正则仅覆盖高频售后场景（退货/退款/订单/政策/投诉），LLM 故障时的自由问答只能返回固定话术，无法真正理解。
+4. **回合缓存仅限无状态政策轮次**：订单/业务流等依赖实时数据的轮次不缓存（正确性优先），缓存命中率受限于政策问答占比。
+5. **SSE 断连不重放已流内容**：流式中途断线会保存进度并取消生成，但已流出的内容不会自动补发，用户需重新进入会话查看历史。
 
 ---
 
@@ -491,6 +494,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.3.0** | 2026-08-26 | 多节点状态外置（自由扩缩容）：per-session Redis 分布式锁（SET NX PX + token Lua 释放 + 看门狗续期 + Redis 抖动容忍，替代进程内 asyncio.Lock）；DB/LLM/KB 熔断计数留本地、冷却信号 Redis 广播共享（close 仅本地广播方生效防撤销他人广播）；Milvus 同步检索走 to_thread 不阻塞事件循环/锁看门狗；StorageRouter Redis key 失效回退 MySQL；Redis 不可用 fail-fast 503、锁等待超时 429；测试扩充至 361 项 |
 | **2.2.6** | 2026-08-26 | 决策循环规则短路（优化③）：`ORDER_STATUS` 命中订单号跳过 LLM 决策、确定性直查 `query_order`，未命中订单连查 `list_user_orders` 兜底——单号提取 100% 准确 + 零决策轮调用；`POLICY_INQUIRY` 刻意不接管（检索 query 依赖 LLM 改写）、未命中/异常回退 LLM 决策循环；落库 `verdict=rule_shortcut` 可观测；测试扩充至 351 项 |
 | **2.2.5** | 2026-08-26 | 投诉严重性评估 reasoner→chat（降本增效）：全项目唯一 LLM 档收敛到 chat，reasoner 配置保留作一行回退；prompt 增强校准（物流时效归 MEDIUM、安全类列举、LOW 收紧），实测 17/17=100% 与 reasoner 打平切换无损，HIGH 判据（人身安全/批量/金额>5000）零漏判；新增 verify_severity_accuracy.py 评测基线；测试扩充至 347 项 |
 | **2.2.4** | 2026-08-26 | 意图分类规则前置短路（少调 LLM）：新建 intent_rules 正则层，高置信模板化表达（问候/查单/退货/退款/投诉）跳过 LLM 分类、未命中回退；POLICY_INQUIRY 刻意不接管、业务流内与注入命中强制禁用规则；命中打 `event=intent_rule_hit` 可观测；测试扩充至 341 项 |
