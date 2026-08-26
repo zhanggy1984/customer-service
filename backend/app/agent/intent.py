@@ -7,7 +7,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from app.agent.prompts.intent import build_intent_prompt
+from app.agent.prompts.guard import guard_user_content
+from app.agent.prompts.intent import build_intent_system
 from app.config import settings
 from app.infrastructure.deepseek import deepseek_client
 from app.utils.logger import logger
@@ -49,13 +50,18 @@ async def classify_intent(
     user_input: str,
     current_state_context: str | None = None,
     max_retries: int = 2,
+    injection_detected: bool = False,
 ) -> IntentResult:
-    prompt = build_intent_prompt(user_input, current_state_context)
+    # 用户输入放独立 user 消息（不拼进 system，消除注入面）；命中注入时前置防御声明
+    messages = [
+        {"role": "system", "content": build_intent_system(current_state_context)},
+        {"role": "user", "content": guard_user_content(user_input, injection_detected)},
+    ]
 
     for attempt in range(max_retries):
         try:
             data = await deepseek_client.chat(
-                [{"role": "system", "content": prompt}],
+                messages,
                 model=settings.deepseek_model_chat,
                 temperature=0.1,  # 意图分类需确定性，低温度抑制同 query 分类抖动
             )
@@ -91,7 +97,7 @@ async def classify_intent(
                     extra={"input_len": len(user_input), "attempt": attempt},
                 )
                 return _chitchat_fallback()
-            # 追加严格 JSON 提示重试
-            prompt += "\n[注意] 必须输出严格的 JSON，不要用 ```json 包裹。"
+            # 追加严格 JSON 提示重试（改 system 消息本体，user 消息不动）
+            messages[0]["content"] += "\n[注意] 必须输出严格的 JSON，不要用 ```json 包裹。"
 
     return _chitchat_fallback()

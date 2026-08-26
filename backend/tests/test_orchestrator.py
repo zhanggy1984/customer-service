@@ -48,7 +48,7 @@ class _FakeClassify:
         self._results = list(results)
         self.calls = []
 
-    async def __call__(self, user_input, current_state_context=None, max_retries=2):
+    async def __call__(self, user_input, current_state_context=None, max_retries=2, injection_detected=False):
         self.calls.append(user_input)
         idx = min(len(self.calls) - 1, len(self._results) - 1)
         return self._results[idx]
