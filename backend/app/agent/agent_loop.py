@@ -20,6 +20,7 @@ from app.agent.function_calling.executor import execute
 from app.agent.function_calling.guardrail import ToolGuardrail
 from app.agent.function_calling.registry import TOOL_SCHEMAS
 from app.agent.function_calling.tool_call_log import write_tool_call
+from app.agent.intent_rules import ORDER_ID_RE
 from app.agent.prompts.guard import guard_user_content
 from app.config import settings
 from app.infrastructure.deepseek import (
@@ -79,6 +80,60 @@ def _decide_route(intent: str, tool_results: dict) -> str:
     return "policy" if intent == "POLICY_INQUIRY" else "order"
 
 
+async def _rule_shortcut(user_message: str, intent: str, session_id: str, user_id: int) -> dict | None:
+    """规则短路（优化③）：ORDER_STATUS + 输入命中订单号 → 确定性直查，未命中/异常回退 LLM。
+
+    只做 ORDER_STATUS 半边——POLICY_INQUIRY 的检索 query 依赖 LLM 改写，规则短路会伤检索质量；
+    纯数字单号刻意不接（误匹配手机号/金额风险 > 收益，种子单号均 ORD 前缀）。
+    query_order 未命中订单 → 顺序连查 list_user_orders（确定性兜底，等价 LLM 决策循环典型路径，
+    生成节点 _compose_order_answer 已支持两者并存组装）。两个调用均落 tool_call_log（verdict=rule_shortcut）。
+    返回结构与 run_decision_loop 契约同构（route/tool_results/tool_events/usage/direct_reply），
+    生成节点无感知；短路路径不经 ToolGuardrail（护栏防 LLM 循环，规则自身确定性无需自防）。
+    """
+    if intent != "ORDER_STATUS":
+        return None
+    m = ORDER_ID_RE.search(user_message)
+    if not m:
+        return None
+    order_id = m.group(0)
+    tool_results: dict = {}
+    tool_events: list = []
+    try:
+        start = time.time_ns()
+        result = await execute("query_order", {"order_id": order_id}, user_id, session_id)
+        latency_ms = (time.time_ns() - start) // 1_000_000
+        tool_results["query_order"] = result
+        tool_events.append({"id": str(time.time_ns()), "name": "query_order",
+                            "args": {"order_id": order_id}, "result": result,
+                            "status": "error" if not result.get("ok") else "success"})
+        await write_tool_call(session_id=session_id, user_id=user_id, round_no=1,
+                              tool_name="query_order", args={"order_id": order_id},
+                              result=result, latency_ms=latency_ms,
+                              verdict="rule_shortcut", reason="rule_shortcut_order_id",
+                              query_text=user_message)
+        if (result.get("error") or {}).get("code") == "order_not_found":
+            list_start = time.time_ns()
+            list_result = await execute("list_user_orders", {"limit": 5}, user_id, session_id)
+            list_latency_ms = (time.time_ns() - list_start) // 1_000_000  # 独立计时，不复用 query_order 延迟
+            tool_results["list_user_orders"] = list_result
+            tool_events.append({"id": str(time.time_ns()), "name": "list_user_orders",
+                                "args": {"limit": 5}, "result": list_result,
+                                "status": "error" if not list_result.get("ok") else "success"})
+            await write_tool_call(session_id=session_id, user_id=user_id, round_no=1,
+                                  tool_name="list_user_orders", args={"limit": 5},
+                                  result=list_result, latency_ms=list_latency_ms,
+                                  verdict="rule_shortcut", reason="rule_shortcut_fallback",
+                                  query_text=user_message)
+    except Exception as exc:
+        # 短路路径异常（只读查询，概率极低）：回退 LLM 决策循环，不阻断本轮
+        logger.warning("event=rule_shortcut_error", extra={"error": str(exc)})
+        return None
+    logger.info("event=rule_shortcut", extra={"intent": intent, "order_id": order_id})
+    return {"route": "order",  # 短路必产出订单工具结果，路由静态为 order
+            "tool_results": tool_results, "tool_events": tool_events,
+            "usage": dict(_EMPTY_USAGE), "direct_reply": ""}
+
+
 async def run_decision_loop(user_message: str, intent: str, session, user_id: int,
                             injection_detected: bool = False) -> dict:
     """LLM 工具决策循环（仅 ORDER_STATUS / POLICY_INQUIRY；其他意图由 orchestrator 短路）。
@@ -96,6 +151,14 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
                 "usage": dict(_EMPTY_USAGE), "direct_reply": ""}
 
     session_id = getattr(session, "session_id", "")
+
+    # 规则短路（优化③）：ORDER_STATUS + 命中订单号 → 确定性直查，未命中/异常回退 LLM 决策循环。
+    # 短路产出与循环契约同构（route/tool_results/tool_events/usage/direct_reply），orchestrator 与
+    # 生成节点完全无感知——"决策与执行分离 + 静态组装"架构下前置快路径，零上下文丢失。
+    shortcut = await _rule_shortcut(user_message, intent, session_id, user_id)
+    if shortcut is not None:
+        return shortcut
+
     tool_results: dict = {}
     tool_events: list = []
     decision_usage = dict(_EMPTY_USAGE)

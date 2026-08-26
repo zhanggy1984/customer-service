@@ -197,6 +197,14 @@ def _compose_order_answer(tool_results: dict, direct_reply: str = "") -> str:
     # 错误语义收敛（FC 契约）：order_not_found 引导核对单号；其余错误码（internal_error 等）
     # 明确为故障话术，不伪装"没有订单"——DB 查询故障 ≠ 用户没订单。
     if (order_res.get("error") or {}).get("code") == "order_not_found":
+        # 决策层已连查 list_user_orders（规则短路/LLM 多步路径）时展示最近订单辅助定位，
+        # 否则引导核对单号——修复：原提前 return 使 list 数据对用户永不可见（无效兜底）。
+        list_res = tool_results.get("list_user_orders") or {}
+        list_data = list_res.get("data") or {}  # 防御 data=None（internal_error 信封）
+        orders = list_data.get("orders") or []
+        if orders:
+            lines = "、".join(f"{o['order_id']}（{STATUS_DESC.get(o['status'], o['status'])}）" for o in orders)
+            return f"未找到该订单，请核对订单号。您最近的订单：{lines}。"
         return "未找到该订单，请核对订单号。也可以让我列出您最近的订单。"
     if order_res.get("error"):
         return "订单查询暂时不可用，请稍后重试。也可以核对订单号后再次询问。"

@@ -77,7 +77,8 @@ async def test_order_query_loop(monkeypatch):
 
     monkeypatch.setattr(al, "execute", fake_execute)
     monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
-    out = await al.run_decision_loop("查 ORD-1", "ORDER_STATUS", _Session(), 1)
+    # 输入不带订单号（避免触发优化③规则短路），保持"LLM 决策 query_order"语义
+    out = await al.run_decision_loop("查询我的订单状态", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"
     assert calls["execute"][0][0] == "query_order"
 
@@ -110,7 +111,8 @@ async def test_side_effect_guard_routes_business(monkeypatch):
 
     monkeypatch.setattr(al, "execute", fake_execute)
     monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
-    out = await al.run_decision_loop("我要退货 ORD-1", "ORDER_STATUS", _Session(), 1)
+    # 输入不带订单号（避免触发规则短路），保持"LLM 决策副作用工具 → 护栏拦截"语义
+    out = await al.run_decision_loop("我要退货", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "business"
     assert calls["execute"] == 0
     assert out["tool_events"] == []
@@ -185,7 +187,8 @@ async def test_duplicate_tool_call_deduped(monkeypatch):
     monkeypatch.setattr(al, "execute", fake_execute)
     monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
     monkeypatch.setattr(al.settings, "agent_loop_max_rounds", 3)
-    out = await al.run_decision_loop("查 ORD-1", "ORDER_STATUS", _Session(), 1)
+    # 输入不带订单号（避免触发规则短路），保持"LLM 重复决策 → dedupe"语义
+    out = await al.run_decision_loop("查询订单详情", "ORDER_STATUS", _Session(), 1)
     assert calls["execute"] == [("query_order", {"order_id": "ORD-1"})]  # 同参数只执行一次
     assert len(out["tool_events"]) == 1  # 缓存命中不透出重复事件
     assert out["tool_results"]["query_order"]["data"]["order"]["order_id"] == "ORD-1"
@@ -297,7 +300,8 @@ async def test_decision_loop_writes_tool_call_log(monkeypatch):
     monkeypatch.setattr(al, "write_tool_call", fake_log)  # 覆盖 conftest 的 no-op，改为收集
     monkeypatch.setattr(al, "execute", fake_execute)
     monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
-    out = await al.run_decision_loop("查 ORD-1", "ORDER_STATUS", _Session(), 1)
+    # 输入不带订单号（避免触发规则短路），保持"LLM 循环真执行 → 落库"语义
+    out = await al.run_decision_loop("查询订单详情", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"
     assert len(calls) == 1  # query_order 真执行 → 恰好落 1 条
     entry = calls[0]
@@ -305,7 +309,7 @@ async def test_decision_loop_writes_tool_call_log(monkeypatch):
     assert entry["verdict"] == "allow"
     assert entry["round_no"] == 1
     assert entry["session_id"] == "sess-1"
-    assert entry["query_text"] == "查 ORD-1"
+    assert entry["query_text"] == "查询订单详情"
 
 
 @pytest.mark.asyncio
@@ -336,3 +340,130 @@ async def test_call_limit_truncates_before_final_round(monkeypatch):
     assert calls["execute"] == ["ORD-1", "ORD-2", "ORD-3"]  # 第 4 个被截断
     assert calls["chat"] == 1  # 截断后不再发下一轮 LLM 请求（外层循环被终止）
     assert out["route"] == "order"
+
+
+# ==================== 优化③：决策循环规则短路（ORDER_STATUS 半短路） ====================
+
+@pytest.mark.asyncio
+async def test_rule_shortcut_order_status_hit(monkeypatch):
+    """规则短路命中：ORDER_STATUS + 订单号 → 确定性直查 query_order，零 LLM 调用。
+
+    产出与 LLM 决策循环契约同构（route=order + tool_results + tool_events），
+    落库 verdict=rule_shortcut（非 allow），观测可区分短路与 LLM 决策路径。
+    """
+    calls = {"execute": [], "chat": 0, "log": []}
+
+    async def fake_execute(name, params, user_id, session_id):
+        calls["execute"].append((name, params))
+        return {"ok": True, "data": {"order": {"order_id": "ORD-20240801-001", "status": "PAID"}}, "error": None}
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
+        calls["chat"] += 1
+        raise AssertionError("短路命中不应调用 LLM 决策")
+
+    async def fake_log(**kwargs):
+        calls["log"].append(kwargs)
+
+    monkeypatch.setattr(al, "execute", fake_execute)
+    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al, "write_tool_call", fake_log)
+    out = await al.run_decision_loop("查 ORD-20240801-001", "ORDER_STATUS", _Session(), 1)
+    assert calls["chat"] == 0  # 决策轮 LLM 零调用
+    assert calls["execute"] == [("query_order", {"order_id": "ORD-20240801-001"})]
+    assert out["route"] == "order"
+    assert out["tool_results"]["query_order"]["data"]["order"]["order_id"] == "ORD-20240801-001"
+    assert out["tool_events"][0]["name"] == "query_order"
+    assert out["direct_reply"] == ""
+    assert len(calls["log"]) == 1
+    assert calls["log"][0]["verdict"] == "rule_shortcut"
+    assert calls["log"][0]["tool_name"] == "query_order"
+    assert calls["log"][0]["query_text"] == "查 ORD-20240801-001"
+
+
+@pytest.mark.asyncio
+async def test_rule_shortcut_not_found_chains_list(monkeypatch):
+    """短路连查：query_order 未命中订单 → 顺序连查 list_user_orders 兜底。
+
+    等价 LLM 决策循环典型多步路径，但确定性一步完成；生成节点 _compose_order_answer
+    已支持"query_order 未命中 + list_user_orders 命中 → 列最近订单"组装。
+    """
+    calls = {"execute": [], "log": []}
+
+    async def fake_execute(name, params, user_id, session_id):
+        calls["execute"].append((name, params))
+        if name == "query_order":
+            return {"ok": False, "data": None,
+                    "error": {"code": "order_not_found", "message": "订单不存在"}}
+        return {"ok": True, "data": {"orders": [{"order_id": "ORD-20240801-001", "status": "PAID"}]}, "error": None}
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
+        raise AssertionError("短路命中不应调用 LLM 决策")
+
+    async def fake_log(**kwargs):
+        calls["log"].append(kwargs)
+
+    monkeypatch.setattr(al, "execute", fake_execute)
+    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al, "write_tool_call", fake_log)
+    out = await al.run_decision_loop("查 ORD-999999999", "ORDER_STATUS", _Session(), 1)
+    assert calls["execute"] == [("query_order", {"order_id": "ORD-999999999"}),
+                                ("list_user_orders", {"limit": 5})]  # 连查
+    assert "query_order" in out["tool_results"] and "list_user_orders" in out["tool_results"]
+    assert len(out["tool_events"]) == 2
+    assert len(calls["log"]) == 2  # 两次调用各落一条，均为 rule_shortcut
+    assert {e["reason"] for e in calls["log"]} == {"rule_shortcut_order_id", "rule_shortcut_fallback"}
+    # 连查数据必须对用户可见：生成节点组装出"最近订单"（修复 _compose_order_answer 提前 return）
+    from app.agent.orchestrator import _compose_order_answer
+    reply = _compose_order_answer(out["tool_results"])
+    assert "您最近的订单" in reply
+    assert "ORD-20240801-001" in reply
+
+
+@pytest.mark.asyncio
+async def test_rule_shortcut_miss_falls_back_llm(monkeypatch):
+    """短路未命中回退 LLM：POLICY_INQUIRY（即使带单号）、ORDER_STATUS 无单号均走决策循环。"""
+    calls = {"execute": [], "chat": 0}
+
+    async def fake_execute(name, params, user_id, session_id):
+        calls["execute"].append((name, params))
+        return {"ok": True, "data": {"results": [{"text": "政策文档", "score": 0.9, "source": "x.md"}]}, "error": None}
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
+        calls["chat"] += 1
+        if any(m.get("role") == "tool" for m in messages):
+            return _resp(content="基于政策文档回答")
+        return _resp(tool_calls=[_tool("search_policy", {"query": "退货政策"})])
+
+    monkeypatch.setattr(al, "execute", fake_execute)
+    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    # POLICY_INQUIRY 带单号 → 不短路（政策侧不接管，防检索 query 改写丢失）
+    out = await al.run_decision_loop("ORD-20240801-001 能退吗", "POLICY_INQUIRY", _Session(), 1)
+    assert calls["chat"] >= 1  # 走 LLM 决策循环（非短路）
+    assert calls["execute"][0][0] == "search_policy"
+    # ORDER_STATUS 无单号 → 不短路，走 LLM 决策循环
+    calls["chat"] = 0
+    calls["execute"] = []
+    out = await al.run_decision_loop("我的订单到哪了", "ORDER_STATUS", _Session(), 1)
+    assert calls["chat"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_rule_shortcut_exception_falls_back_llm(monkeypatch):
+    """短路执行异常（只读查询故障）→ 回退 LLM 决策循环，不阻断本轮。"""
+    calls = {"execute": [], "chat": 0}
+
+    async def fake_execute(name, params, user_id, session_id):
+        calls["execute"].append((name, params))
+        raise RuntimeError("db down")
+
+    async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
+        calls["chat"] += 1
+        return _resp(content="订单查询暂时不可用")
+
+    monkeypatch.setattr(al, "execute", fake_execute)
+    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    out = await al.run_decision_loop("查 ORD-20240801-001", "ORDER_STATUS", _Session(), 1)
+    assert calls["execute"][0] == ("query_order", {"order_id": "ORD-20240801-001"})  # 短路先执行
+    assert calls["chat"] == 1  # 短路异常 → 回退 LLM 决策循环
+    assert out["route"] == "order"
+    assert out["direct_reply"] == "订单查询暂时不可用"  # LLM 直接作答透出
