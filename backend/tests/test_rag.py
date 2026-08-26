@@ -99,6 +99,50 @@ async def test_clear_cache_flushes_turn_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_search_query_normalized(monkeypatch):
+    """检索 query 归一化：剥客套/全角/尾部标点后再 embed 与建缓存 key（与文档侧清洗同口径）。"""
+    r = Retriever()
+    r._redis = FakeRedis()
+    received = {}
+
+    async def fake_embed(text):
+        received["query"] = text
+        return [0.1] * 10
+
+    async def fake_search(vec, top_k):
+        return [SearchResult(id="1", text="退货时限 7 天", score=0.9, metadata={"source": "return_policy"})]
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
+
+    await r.search("请问退货时限？")
+    assert received["query"] == "退货时限"  # 剥客套前缀 + 尾部标点
+
+
+@pytest.mark.asyncio
+async def test_search_query_empty_fallback_to_original(monkeypatch):
+    """纯客套 query 归一化后为空 → 回退原文，防空 query 拖垮召回。"""
+    r = Retriever()
+    r._redis = FakeRedis()
+    received = {}
+
+    async def fake_embed(text):
+        received["query"] = text
+        return [0.1] * 10
+
+    async def fake_search(vec, top_k):
+        return []
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+    monkeypatch.setattr(reranker_mod, "rerank", fake_rerank)
+
+    await r.search("谢谢")
+    assert received["query"] == "谢谢"  # normalize 后为空，回退原文
+
+
+@pytest.mark.asyncio
 async def test_search_expands_section_siblings(monkeypatch):
     """章节扩充：命中 chunk 的同 section 兄弟 chunk 合并进 context。"""
     from app.rag.interfaces import Document

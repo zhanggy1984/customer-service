@@ -14,6 +14,7 @@ import re
 from functools import lru_cache
 
 from app.config import settings
+from app.rag import text_cleaner
 from app.utils.logger import logger
 
 # 448 = bge-small-zh-v1.5 max_seq_length(512) 留 12.5% 余量，见模块 docstring
@@ -124,6 +125,10 @@ def chunk_document(content: str, source: str) -> list[dict]:
     "{source}:{sha8}:{occurrence}"（heading_path hash），无标题为 "{source}:plain:{occurrence}"，
     文档增删不漂移；供检索层按 (source, section_id) 回查同章节兄弟 chunk 扩充上下文。
     """
+    # 预清洗（全角→半角/去零宽/统一换行等，见 text_cleaner）：脏文本（复制粘贴的
+    # BOM/全角/零宽字符）会打断 BGE 中文切分、污染向量。清洗只作用于派生向量侧，
+    # MySQL knowledge_docs 保留原始 markdown。splitter 依赖的标题/表格/代码块结构不受影响。
+    content = text_cleaner.clean_text(content)
     content = content.strip()
     if not content:
         return []

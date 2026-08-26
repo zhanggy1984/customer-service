@@ -50,6 +50,8 @@ class Retriever:
         await turn_cache.flush_all()
 
     async def search(self, query: str) -> list[SearchResult]:
+        # 检索 query 归一化：与回合缓存同口径（剥客套/全角/尾部标点），空回退原文
+        query = turn_cache.normalize_query(query) or query
         cache_key = f"rag_cache:{hashlib.md5(query.encode()).hexdigest()}"
 
         # L1 精确缓存（Redis 不可用时跳过缓存直接检索）

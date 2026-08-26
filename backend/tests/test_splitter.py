@@ -116,3 +116,14 @@ def test_section_id_stable_across_edits():
 
     assert sid_of(chunk_document(md1, "doc"), ["退换货政策", "退货时限"]) == \
         sid_of(chunk_document(md2, "doc"), ["退换货政策", "退货时限"])
+
+
+def test_chunk_content_cleaned_fullwidth_and_zero_width():
+    """复制粘贴脏文本：分块前清洗全角数字（７→7）并删除零宽字符（会打断 BGE 中文切分）。"""
+    dirty = "## 退货时限\n\n自签收之日起 ７ 天内可退。工资​发放规则见政策。"
+    chunks = chunk_document(dirty, "doc")
+    texts = [c["content"] for c in chunks]
+    assert any("7 天" in t for t in texts)
+    assert not any("７" in t or "​" in t for t in texts)
+    # 标题结构不受清洗影响
+    assert ("退货时限",) in {tuple(c["metadata"]["heading_path"]) for c in chunks}
