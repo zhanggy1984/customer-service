@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     session_cleanup_interval_seconds: int = 3600   # 定时清理周期
     session_cleanup_batch_size: int = 500          # 单批删除行数，控制事务大小
 
+    # ---------- 分布式锁（per-session 并发串行化，多节点共享） ----------
+    session_lock_ttl: int = 60            # 锁 TTL 秒（看门狗持续续期，防长处理击穿）
+    session_lock_wait_timeout: int = 30   # 获取锁最大等待秒，超时映射 429
+    session_lock_poll_interval: float = 0.1  # 抢锁失败轮询间隔（秒）
+
     # ---------- Agent 工具决策循环（P3） ----------
     # LLM 工具决策循环最大轮数（每轮一次 LLM 调用 + 若干工具执行）
     agent_loop_max_rounds: int = 3

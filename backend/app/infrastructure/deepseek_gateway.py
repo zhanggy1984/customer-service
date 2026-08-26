@@ -12,6 +12,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.infrastructure.cooldown import RedisCooldown
 from app.infrastructure.deepseek_keypool import KeyPool
 from app.utils.logger import logger
 
@@ -61,30 +62,40 @@ class DeepSeekGateway:
         )
         # 背压信号量：限制同时进行的 LLM 请求数（排队容量）
         self._semaphore = asyncio.Semaphore(settings.deepseek_queue_max_size)
-        # LLM 熔断状态（实例属性：测试可注入/天然隔离，生产单例等效全局）
+        # LLM 熔断状态（实例属性：测试可注入/天然隔离，生产单例等效全局）。
+        # 计数留本地，冷却期经 RedisCooldown 广播全局（多节点共享熔断信号）
         self._breaker = {"failures": 0, "open_until": 0.0}
+        self._cooldown = RedisCooldown("llm", _LLM_BREAKER_COOLDOWN)
 
-    def _breaker_open(self) -> bool:
-        """熔断是否 open：冷却期内直接拒绝；冷却到期后重置计数放行（半开放行）。"""
+    async def _breaker_open(self) -> bool:
+        """熔断是否 open：本地冷却期内，或任一节点已广播熔断 → 直接拒绝。"""
         if time.time() < self._breaker["open_until"]:
+            return True
+        if await self._cooldown.is_open():  # 共享信号：他节点已熔断 → 本节点提前降级
             return True
         if self._breaker["failures"] >= _LLM_BREAKER_FAIL_THRESHOLD:
             self._breaker["failures"] = 0  # 冷却到期：重置计数放行，靠下一次调用探测恢复
         return False
 
-    def _breaker_fail(self) -> None:
-        """记录一次熔断失败；达阈值进入冷却。"""
+    async def _breaker_fail(self) -> None:
+        """记录一次熔断失败；达阈值进入冷却并广播全局。"""
         self._breaker["failures"] += 1
         if self._breaker["failures"] >= _LLM_BREAKER_FAIL_THRESHOLD:
             self._breaker["open_until"] = time.time() + _LLM_BREAKER_COOLDOWN
+            await self._cooldown.open()  # 广播：让其他节点不必再打失败的 LLM
             logger.error(
                 "event=llm_circuit_open",
                 extra={"cooldown": _LLM_BREAKER_COOLDOWN},
             )
 
-    def _breaker_reset(self) -> None:
-        """调用成功：重置连续失败计数。"""
+    async def _breaker_reset(self) -> None:
+        """调用成功：重置连续失败计数；仅本地广播方成功时清除共享熔断信号。
+
+        他节点成功不 DEL（防撤销他人广播的共享降级信号，多节点语义）。
+        """
         self._breaker["failures"] = 0
+        if self._breaker["open_until"] > time.time():
+            await self._cooldown.close()
 
     async def _backoff_sleep(self, attempt: int) -> None:
         """换 Key 重试前的指数退避；最后一次尝试失败不再等（循环将退出，白睡无意义）。"""
@@ -114,7 +125,7 @@ class DeepSeekGateway:
         tools/tool_choice 可选（工具决策循环用）：不传（None）则不加
         tools 字段，OpenAI 兼容格式原样透传给 DeepSeek，现有调用方无感。
         """
-        if self._breaker_open():
+        if await self._breaker_open():
             # 熔断冷却期：入口直接快速失败，零网络尝试（防 LLM 慢挂时每请求 3 连打放大延迟）
             logger.warning("event=llm_circuit_rejected")
             raise LLMUnavailableError("LLM 服务暂时不可用，请稍后重试")
@@ -129,10 +140,10 @@ class DeepSeekGateway:
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
         try:
             result = await self._call(messages, model, timeout, temperature, tools, tool_choice)
-            self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
+            await self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
             return result
         except LLMUnavailableError:
-            self._breaker_fail()  # 网络/超时/重试耗尽 → 累计；AllKeysDown/Capacity 不累计
+            await self._breaker_fail()  # 网络/超时/重试耗尽 → 累计；AllKeysDown/Capacity 不累计
             raise
         finally:
             self._semaphore.release()
@@ -219,7 +230,7 @@ class DeepSeekGateway:
         - 流内首个 content delta 之前的异常 → 换 Key 重试
         - 首个 content delta 之后的任何异常 → 直接上抛，不回滚已流出 token
         """
-        if self._breaker_open():
+        if await self._breaker_open():
             logger.warning("event=llm_circuit_rejected")
             raise LLMUnavailableError("LLM 服务暂时不可用，请稍后重试")
         try:
@@ -233,13 +244,13 @@ class DeepSeekGateway:
         try:
             async for item in self._stream(messages, model, timeout, temperature):
                 yield item
-            self._breaker_reset()  # 正常流结束 → 成功
+            await self._breaker_reset()  # 正常流结束 → 成功
         except StreamInterruptedError:
             # 已产出首个 delta 后的流中断：连接级抖动/用户断连，非网关整体故障，不累计熔断
             # （挑战1：单次长流中途断不应误熔断全网关）。仍冒泡给上层规则引擎兜底。
             raise
         except LLMUnavailableError:
-            self._breaker_fail()
+            await self._breaker_fail()
             raise
         finally:
             self._semaphore.release()

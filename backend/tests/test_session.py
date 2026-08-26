@@ -51,6 +51,30 @@ async def test_router_fallback_to_mysql(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fallback_drops_redis_key(monkeypatch):
+    """Redis set 失败进入 fallback 时，失效 Redis key（防他节点读到本节点写 MySQL 的旧值）。
+
+    多节点下：A 节点 Redis 写失败走 MySQL，B 节点 Redis 正常会读到旧值；DEL 让 B 读 miss 走 MySQL。
+    """
+    deletes: list[str] = []
+
+    class FakeRedisDown:
+        async def set(self, *a, **kw):
+            raise ConnectionError("redis down")
+
+        async def delete(self, *a, **kw):
+            deletes.extend(a)
+            return 1
+
+    monkeypatch.setattr(sr_mod, "mysql_pool", FakeMySQL())
+    router = StorageRouter(FakeRedisDown(), ttl=3600)
+    session = Session(session_id="s9", user_id=1)
+    await router.save(session)
+    assert router._mode == "mysql_fallback"
+    assert "session:s9" in deletes  # fallback 后 Redis key 被失效
+
+
+@pytest.mark.asyncio
 async def test_router_normal_mode_redis(monkeypatch):
     class FakeRedisOK:
         async def get(self, key):

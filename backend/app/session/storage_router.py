@@ -61,8 +61,20 @@ class StorageRouter:
             await self._redis.set(self._key(session.session_id), payload, ex=self._ttl)
         except Exception as exc:
             self._fallback(exc)
+            # 失效 Redis key：防多节点下其他节点（Redis 仍正常）读到本节点已写入
+            # MySQL 的旧值。仅对"set 失败但连接可用"场景有效（如 OOM/写入错误）；
+            # 连接彻底断开时 DEL 同样失败，但此时他节点读 Redis 也失败会走 MySQL，
+            # 双路径最终都收敛到 MySQL。
+            await self._drop_redis_key(session.session_id)
         # MySQL 异步双写（不阻塞主流程）
         await self._save_mysql(session)
+
+    async def _drop_redis_key(self, sid: str) -> None:
+        """best-effort 删除 Redis 会话 key（失败静默，MySQL 兜底已在写）。"""
+        try:
+            await self._redis.delete(self._key(sid))
+        except Exception:
+            pass
 
     async def load(self, sid: str) -> Session | None:
         if self._mode == "redis":
