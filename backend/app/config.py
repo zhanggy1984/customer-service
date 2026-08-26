@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     rerank_model: str = "BAAI/bge-reranker-base"
     rag_cache_ttl: int = 600
     intent_cache_ttl: int = 60
+    # 回合级 LLM 答案缓存（P6）：无状态政策轮次整轮缓存，命中零 LLM 调用。
+    # KB 变更时即时清（retriever.clear_cache 同源失效），TTL 仅兜底防陈旧。
+    turn_cache_enabled: bool = True
+    turn_cache_ttl: int = 7200
 
     # ---------- Milvus（VECTOR_STORE=milvus 时生效） ----------
     milvus_uri: str = "http://milvus:19530"          # compose 内服务名；本地开发改 http://localhost:19533

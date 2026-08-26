@@ -24,7 +24,9 @@ class FakeRedis:
         return None
 
     async def scan_iter(self, match=None):
-        return iter(())
+        if False:
+            yield  # async generator：供 clear_cache 的 async for 消费（空迭代）
+        return
 
 
 @pytest.mark.asyncio
@@ -77,6 +79,23 @@ async def test_search_cache_hit(monkeypatch):
     results = await r.search("退款多久到账")
     assert len(results) == 1
     assert results[0].text == "缓存内容"
+
+
+@pytest.mark.asyncio
+async def test_clear_cache_flushes_turn_cache(monkeypatch):
+    """clear_cache 联动清回合缓存：回合答案派生自检索文档，与 RAG 精确缓存同源失效。"""
+    from app.infrastructure import turn_cache as tc
+
+    flushed = {"n": 0}
+
+    async def fake_flush():
+        flushed["n"] += 1
+
+    monkeypatch.setattr(tc, "flush_all", fake_flush)
+    r = Retriever()
+    r._redis = FakeRedis()
+    await r.clear_cache()
+    assert flushed["n"] == 1  # 清 RAG 缓存后必须一并 flush 回合缓存
 
 
 @pytest.mark.asyncio

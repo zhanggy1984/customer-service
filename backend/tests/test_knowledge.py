@@ -7,6 +7,8 @@
 - sync_full: 全量重建 + 孤儿清理
 - delete_source: MySQL 删除 + ChromaDB 尽力清理（失败不阻塞）
 """
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.rag import kb_store
@@ -74,7 +76,9 @@ def deps(monkeypatch):
     monkeypatch.setattr(kb_store.vector_store, "count_by_source", vs.count_by_source)
     monkeypatch.setattr(kb_store.vector_store, "get_all", vs.get_all)
     monkeypatch.setattr(kb_store.embedder, "embed_documents", fake_embed)
-    # retriever 缓存清理由 _clear_rag_cache 容错，不 mock 也能跑
+    # delete_source/sync_full 都会 _clear_rag_cache → retriever.clear_cache → turn_cache.flush_all，
+    # 后者会连真实 Redis（1s 超时）：mock 掉避免单测依赖外部缓存（清缓存逻辑由 test_rag 专测）。
+    monkeypatch.setattr(kb_store.retriever, "clear_cache", AsyncMock())
     return pool, vs
 
 

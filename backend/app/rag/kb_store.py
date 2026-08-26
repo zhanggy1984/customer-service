@@ -116,6 +116,9 @@ async def delete_source(source: str, updated_by: str) -> None:
         await vector_store.delete_by_source(source)
     except Exception as exc:
         logger.error("event=kb_delete_chroma_fail source=%s error=%s", source, str(exc))
+    # 删文档后清缓存：既有缺口——delete_source 原先不调 _clear_rag_cache，
+    # 删掉的文档内容最长 600s（rag_cache_ttl）仍会被精确缓存命中。回合缓存同理。
+    await _clear_rag_cache()
     logger.info("event=kb_delete source=%s by=%s", source, updated_by)
 
 

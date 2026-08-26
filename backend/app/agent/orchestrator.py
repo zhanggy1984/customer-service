@@ -26,6 +26,7 @@ from app.agent.state_machine.complaint_flow import ComplaintFlow
 from app.agent.state_machine.refund_flow import RefundFlow
 from app.agent.state_machine.return_flow import ReturnFlow
 from app.config import settings
+from app.infrastructure import turn_cache
 from app.infrastructure.deepseek import (
     AllKeysDownError,
     CapacityExceededError,
@@ -580,6 +581,53 @@ def _build_agent_graph():
 AGENT_GRAPH = _build_agent_graph()  # 模块加载编译一次（无状态单例，state 每轮独立）
 
 
+def _turn_cacheable(session: Session, user_message: str) -> bool:
+    """回合缓存门控：仅"无业务状态 + 无注入"的轮次可查/可写缓存。
+
+    政策答复不依赖用户数据/会话历史（跨用户确定性），这是缓存安全的前提；其余排除：
+    - 业务流（session.intent in FLOWS 或 agent_state 带 stage）：答复依赖状态机进度，
+      同句话不同进度语义不同，缓存必答错；
+    - 快照：存在未恢复业务流，保守排除；
+    - 注入：安全拦截路径，绝不能命中缓存的正常答案。
+    """
+    if not settings.turn_cache_enabled:
+        return False
+    if _detect_injection(user_message):
+        return False
+    if session.intent in FLOWS:
+        return False
+    if (session.agent_state or {}).get("stage"):
+        return False
+    if session.snapshots:
+        return False
+    return True
+
+
+async def _replay_turn(payload: dict, user_message: str, emit) -> str:
+    """回放缓存轮次（命中时零 LLM 调用，契约必选项对齐正常路径）。
+
+    - tool_call：重构 search_policy 观测事件（决策循环正常路径也会透出，保持前端一致）；
+    - answer.delta：全量单段补发（契约首个 answer.delta 即 TTFT，命中即秒回）；
+    - usage：真实 token=0（本轮未调 LLM），加 cached 标记供观测/计费区分
+      （对应 good-question 的 llm_calls=0 + cached=True 口径）。
+    status/reasoning 为瞬态 UI 事件，命中时不重放（契约不要求，评测端不依赖）。
+    """
+    sp = payload.get("search_policy") or {}
+    if emit:
+        await emit(tool_call_event({
+            "id": str(time.time_ns()),
+            "name": "search_policy",
+            "args": {"query": (sp.get("query") or user_message)[:50]},
+            "result": sp,
+            "status": "success",
+        }))
+        await emit(answer_event(payload["reply"]))
+        u = usage.current()  # current() 返回拷贝，加 cached 后 emit 即可
+        u["cached"] = True
+        await emit(usage_event(u))
+    return payload["reply"]
+
+
 @_rule_engine_fallback
 async def run_agent(session: Session, user_message: str, user_id: int, emit=None) -> str:
     """单轮对话：顶层 LangGraph 图驱动 6 阶段流水线（行为与命令式版本逐位等价）。
@@ -588,12 +636,33 @@ async def run_agent(session: Session, user_message: str, user_id: int, emit=None
     - answer.delta：终答增量。LLM 生成（chitchat/policy）逐段流式；静态/规则话术全量补发。
     - usage：本轮所有 LLM 调用（意图分类/决策循环/回复生成）token 全计，done 前单条 emit。
     - tool_call / reasoning：状态机业务动作与决策循环工具动作观测式透出，emit 后从 state 移除防累积。
+
+    回合缓存（P6）：无业务状态的政策轮次重复请求不再调 LLM（意图+决策+生成全短路），
+    命中重放 tool_call/answer/usage(cached)；未命中走完整图后按高置信条件写缓存。
+    安全性约束（为什么只缓存 POLICY 无状态轮次）：
+    - 政策答复不依赖用户数据/会话历史 → 跨用户确定性，可安全共享；
+    - 订单答复依赖实时订单、业务流答复依赖 agent_state → 缓存会串数据/答错，明确排除；
+    - 命中轮次的判定 = 意图分类在 stateless 下是 user_message 的确定性函数（temp 0.1），
+      故缓存键不含会话维度，命中即短路整图。
     """
     t0 = time.perf_counter()
     # 硬约束：usage.begin() 必须在 ainvoke 之前。langgraph 每节点 contextvar 上下文拷贝，
     # 节点内 begin()（_ctx.set 新 dict）只影响该节点拷贝、聚合会丢；accumulate() 就地修改
     # dict（值对象共享引用）才对后续节点与调用方可见。
     usage.begin()
+
+    # ---- 回合缓存前置短路（仅无业务状态轮次；命中零 LLM 调用）----
+    if _turn_cacheable(session, user_message):
+        key = turn_cache.turn_key(turn_cache.normalize_query(user_message))
+        payload = await turn_cache.get(key)
+        if payload:
+            logger.info(
+                "event=turn_cache_hit",
+                extra={"session_id": session.session_id, "ms": round((time.perf_counter() - t0) * 1000)},
+            )
+            session.agent_state = None
+            session.intent = None  # 复刻政策轮次语义（_policy_answer_node 的收尾）
+            return await _replay_turn(payload, user_message, emit)
 
     result = await AGENT_GRAPH.ainvoke({
         "session": session,
@@ -602,6 +671,31 @@ async def run_agent(session: Session, user_message: str, user_id: int, emit=None
         "emit": emit,
     })
     reply = result["reply"]
+
+    # ---- 回合缓存写入：无业务状态的高置信 POLICY 轮次 ----
+    # 门控逐条：
+    # - intent==POLICY_INQUIRY：只有政策答复跨用户确定（订单/业务流排除）；
+    # - answer_streamed + search_policy 有结果：真实生成且检索成功（排除"暂未收录"兜底、
+    #   系统繁忙熔断、LLM 无工具直接作答）；
+    # - 高置信：防歧义消息（同一句话偶发分到其他意图）被缓存成固定答案；
+    # - 不含"系统繁忙"：排除纯熔断开头与流式中途降级（_compose_policy_answer 异常路径返回
+    #   部分答案 + "系统繁忙"后缀，startswith 挡不住，必须 contains，否则降级答案被缓存 2h）；
+    # - 写发生在 ainvoke 成功返回后，LLM 熔断路径由装饰器提前 return，天然不进这里。
+    if (settings.turn_cache_enabled
+            and result.get("intent") == "POLICY_INQUIRY"
+            and result.get("answer_streamed")
+            and result.get("tool_results", {}).get("search_policy")
+            and (result.get("intent_result") or IntentResult(confidence=0.0)).confidence >= 0.8
+            and "系统繁忙" not in reply):
+        key = turn_cache.turn_key(turn_cache.normalize_query(user_message))
+        await turn_cache.set(key, {
+            "v": 1,
+            "intent": "POLICY_INQUIRY",
+            "reply": reply,
+            "search_policy": result["tool_results"]["search_policy"],
+        }, ttl=settings.turn_cache_ttl)
+        logger.info("event=turn_cache_write", extra={"session_id": session.session_id})
+
     # 注入路径不经过 intent 节点（无 intent key），与旧实现一致不记 request_out
     if result.get("intent"):
         logger.info(

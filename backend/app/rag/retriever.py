@@ -11,6 +11,7 @@ import json
 import redis.asyncio as aioredis
 
 from app.config import settings
+from app.infrastructure import turn_cache
 from app.rag import vector_store
 from app.rag.embedder import embedder
 from app.rag.interfaces import SearchResult
@@ -38,9 +39,15 @@ class Retriever:
             self._redis = None
 
     async def clear_cache(self) -> None:
-        """清除全部 RAG 精确缓存（Admin 增删知识库后调用，防止旧缓存污染新检索）。"""
-        async for key in self._redis.scan_iter(match="rag_cache:*"):
-            await self._redis.delete(key)
+        """清除全部 RAG 精确缓存（Admin 增删知识库后调用，防止旧缓存污染新检索）。
+
+        回合缓存（turn_cache）的答案派生自检索文档，与 RAG 精确缓存同源失效，一并清，
+        否则删改文档后旧答案会继续命中（TTL 兜底不够及时）。
+        """
+        if self._redis is not None:
+            async for key in self._redis.scan_iter(match="rag_cache:*"):
+                await self._redis.delete(key)
+        await turn_cache.flush_all()
 
     async def search(self, query: str) -> list[SearchResult]:
         cache_key = f"rag_cache:{hashlib.md5(query.encode()).hexdigest()}"
