@@ -7,11 +7,15 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from app.agent.intent_rules import match_intent_rules
 from app.agent.prompts.guard import guard_user_content
 from app.agent.prompts.intent import build_intent_system
 from app.config import settings
 from app.infrastructure.deepseek import deepseek_client
 from app.utils.logger import logger
+
+# 规则命中视为确定性分类（> SWITCH_THRESHOLD=0.8），业务流内规则已禁用，不会触发意外切换
+RULE_HIT_CONFIDENCE = 0.97
 
 VALID_INTENTS = {
     "POLICY_INQUIRY",
@@ -51,7 +55,26 @@ async def classify_intent(
     current_state_context: str | None = None,
     max_retries: int = 2,
     injection_detected: bool = False,
+    use_rules: bool = True,
 ) -> IntentResult:
+    # 规则前置短路：高置信模板化表达不调 LLM。
+    # 禁用场景：injection_detected（规则会跳过注入防御声明）、业务流内（orchestrator 传 False，
+    # 流内短词"确认/好的/补充"本身模糊，规则必误判，须保留 LLM + state_hint）。
+    if use_rules and not injection_detected:
+        hit = match_intent_rules(user_input)
+        if hit:
+            logger.info(
+                "event=intent_rule_hit",
+                extra={"intent": hit.intent, "input_len": len(user_input)},
+            )
+            return IntentResult(
+                intent=hit.intent,
+                confidence=RULE_HIT_CONFIDENCE,
+                slots=hit.slots,
+                missing_slots=hit.missing_slots,
+                summary=hit.summary,
+                usage=None,  # 未调 LLM，无 token 消耗
+            )
     # 用户输入放独立 user 消息（不拼进 system，消除注入面）；命中注入时前置防御声明
     messages = [
         {"role": "system", "content": build_intent_system(current_state_context)},

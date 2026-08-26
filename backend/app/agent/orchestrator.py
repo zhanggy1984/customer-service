@@ -490,8 +490,11 @@ async def _intent_node(state: AgentState) -> dict:
     in_business_flow = session.intent in FLOWS and bool(session.agent_state)
     if in_business_flow:
         # 进行中的业务状态机：分类结果判断推进还是切换
+        # use_rules=False：流内输入是"确认/好的/补充/取消"等短词，本身模糊，规则必误判，
+        # 须保留 LLM + state_hint（规则短路只用于非业务流路径）
         intent_result = await classify_intent(
-            user_message, _state_context(session), injection_detected=state.get("injection_detected"))
+            user_message, _state_context(session), injection_detected=state.get("injection_detected"),
+            use_rules=False)
         if intent_result.intent == session.intent or intent_result.confidence < SWITCH_THRESHOLD:
             intent = session.intent  # 推进当前状态机
         else:
