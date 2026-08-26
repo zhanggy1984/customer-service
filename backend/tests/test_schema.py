@@ -72,3 +72,63 @@ def test_ensure_hash_column_skips_when_present(monkeypatch):
     monkeypatch.setattr(schema, "mysql_pool", fake)
     asyncio.run(schema._ensure_knowledge_hash_column())
     assert not any("ALTER TABLE knowledge_docs" in s for s in fake.executed)
+
+
+def test_ensure_refund_order_unique_migrates_when_missing(monkeypatch):
+    """存量库缺 uk_refund_order_user 且无重复数据 → ALTER ADD UNIQUE（写路径幂等）"""
+    fake = _FakePool()
+
+    async def fake_fetchone(sql: str) -> dict | None:
+        # 第一次查 STATISTICS 索引=0（缺失），第二次查重复行=0（无重复）
+        return {"c": 0}
+
+    fake.fetchone = fake_fetchone
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_refund_order_unique())
+    assert any(
+        "ALTER TABLE refund_orders ADD UNIQUE KEY uk_refund_order_user" in s
+        for s in fake.executed
+    )
+
+
+def test_ensure_refund_order_unique_skips_when_present(monkeypatch):
+    """uk_refund_order_user 已存在 → 不执行 ALTER"""
+    fake = _FakePool()
+    fake.one = {"c": 1}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_refund_order_unique())
+    assert not any("ALTER TABLE refund_orders" in s for s in fake.executed)
+
+
+def test_ensure_refund_order_unique_skips_on_duplicates(monkeypatch):
+    """存量有重复 (order_id,user_id) → 告警跳过不 ALTER（避免 ADD UNIQUE 失败阻断启动）"""
+    fake = _FakePool()
+
+    async def fake_fetchone(sql: str) -> dict | None:
+        return {"c": 1} if "STATISTICS" in sql else {"c": 2}  # 索引缺失 + 重复 2 组
+
+    fake.fetchone = fake_fetchone
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_refund_order_unique())
+    assert not any("ALTER TABLE refund_orders" in s for s in fake.executed)
+
+
+def test_ensure_ticket_idempotency_key_migrates_when_missing(monkeypatch):
+    """存量库缺 idempotency_key 列 → ALTER 补列 + 唯一约束（complaint 写路径幂等）"""
+    fake = _FakePool()
+    fake.one = {"c": 0}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_ticket_idempotency_key())
+    assert any(
+        "ALTER TABLE complaint_tickets ADD COLUMN idempotency_key" in s
+        for s in fake.executed
+    )
+
+
+def test_ensure_ticket_idempotency_key_skips_when_present(monkeypatch):
+    """idempotency_key 列已存在 → 不执行 ALTER"""
+    fake = _FakePool()
+    fake.one = {"c": 1}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_ticket_idempotency_key())
+    assert not any("ALTER TABLE complaint_tickets" in s for s in fake.executed)

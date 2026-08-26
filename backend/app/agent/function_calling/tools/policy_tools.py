@@ -5,7 +5,7 @@
 """
 from app.infrastructure.turn_cache import normalize_query
 from app.rag.interfaces import source_label
-from app.rag.retriever import retriever
+from app.rag.retriever import RetrievalUnavailableError, retriever
 
 _QUERY_MAX_LEN = 100  # LLM 可能传整段对话，超长前缀截断（简单截断，不引入切句逻辑）
 
@@ -19,7 +19,13 @@ async def search_policy(params: dict, user_id: int, session_id: str) -> dict:
     q = normalize_query(raw) or raw
     if len(q) > _QUERY_MAX_LEN:
         q = q[:_QUERY_MAX_LEN]
-    results = await retriever.search(q)
+    try:
+        results = await retriever.search(q)
+    except RetrievalUnavailableError:
+        # 检索故障（Milvus/embedding 不可用）≠ 检索空：映射专用错误码，
+        # 消费端据此走 LLM 兜底，不误报"未收录知识库"。
+        return {"ok": False, "data": None,
+                "error": {"code": "retrieval_unavailable", "message": "知识库检索暂不可用"}}
     scores = [r.score for r in results]
     return {
         "ok": True,

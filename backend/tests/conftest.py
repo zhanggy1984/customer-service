@@ -16,6 +16,24 @@ def _noop_tool_call_log(monkeypatch):
     monkeypatch.setattr("app.agent.agent_loop.write_tool_call", _noop)
 
 
+@pytest.fixture(autouse=True)
+def _reset_module_fault_state():
+    """reset 模块级熔断/冷却状态（挑战 2/3）：防跨测试污染。
+
+    retry._breaker（DB 熔断）与 orchestrator._kb_fault_*（检索故障冷却）均为
+    进程内存态，测试内触发后会残留下一次调用（如熔断 open 使后续测试的
+    query_order 快速失败），必须每个测试前复位。
+    """
+    import app.agent.orchestrator as orch
+    import app.services.retry as retry_mod
+
+    retry_mod._breaker["failures"] = 0
+    retry_mod._breaker["open_until"] = 0.0
+    orch._kb_fault_streak = 0
+    orch._kb_fault_cooldown_until = 0.0
+    yield
+
+
 def _service_ready() -> bool:
     try:
         resp = httpx.get("http://localhost:8000/healthz", timeout=2)

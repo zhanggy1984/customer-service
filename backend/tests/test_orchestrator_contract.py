@@ -480,12 +480,36 @@ async def test_order_status_not_found_emits_error_tool_call(monkeypatch):
 
 
 def test_compose_order_answer_internal_error_not_faked_as_not_found():
-    """query_order internal_error 不伪装 order_not_found（错误语义收敛的契约守卫）。"""
+    """query_order internal_error 不伪装"没有订单"（DB 故障 ≠ 用户没订单，错误语义收敛）。"""
     reply = orch._compose_order_answer(
         {"query_order": {"ok": False, "data": None,
                          "error": {"code": "internal_error", "message": "系统出问题了"}}},
         direct_reply="")
     assert "未找到" not in reply  # 只有 order_not_found 才引导核对单号
+    assert "没有订单" not in reply  # 故障不伪装成"您最近没有订单"
+    assert "暂时不可用" in reply  # 明确故障话术
+
+
+def test_compose_order_answer_list_orders_error_not_faked_as_no_orders():
+    """list_user_orders internal_error：明确故障话术，不落"没有订单"。"""
+    reply = orch._compose_order_answer(
+        {"query_order": {"ok": True, "data": {"order": None}, "error": None},
+         "list_user_orders": {"ok": False, "data": None,
+                              "error": {"code": "internal_error", "message": "系统出问题了"}}},
+        direct_reply="")
+    assert "没有订单" not in reply
+    assert "暂时不可用" in reply
+
+
+def test_compose_order_answer_double_internal_error_no_attribute_error():
+    """query_order + list_user_orders 双 internal_error（data=None）：防御式取值不抛 AttributeError。"""
+    reply = orch._compose_order_answer(
+        {"query_order": {"ok": False, "data": None,
+                         "error": {"code": "internal_error", "message": "x"}},
+         "list_user_orders": {"ok": False, "data": None,
+                              "error": {"code": "internal_error", "message": "x"}}},
+        direct_reply="")
+    assert "暂时不可用" in reply
 
 
 @pytest.mark.asyncio
@@ -559,6 +583,47 @@ async def test_policy_search_tool_call_and_no_result(monkeypatch):
         {"search_policy": {"ok": True, "data": {"results": []}, "error": None}}, "不存在的政策", emit2)
     assert "400-XXX" not in reply2
     assert streamed2 is False
+
+
+@pytest.mark.asyncio
+async def test_compose_policy_answer_retrieval_failure_llm_fallback(monkeypatch):
+    """检索故障（retrieval_unavailable）→ LLM 兜底：前置声明 + 尾部转人工，无文档注入。"""
+    _reset_usage()
+    captured = {}
+
+    async def fake_stream(messages, model=None, timeout=None, temperature=None):
+        captured["sys"] = messages[0]["content"]
+        yield "退货一般需满足签收后7天内", None
+
+    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    emit = EmitCollector()
+    reply, streamed = await _compose_policy_answer(
+        {"search_policy": {"ok": False, "data": None,
+                           "error": {"code": "retrieval_unavailable", "message": "知识库检索暂不可用"}}},
+        "退货政策是什么", emit)
+    assert streamed is True
+    assert "知识库检索暂不可用" in reply  # 前置低可信度声明
+    assert "转人工" in reply  # 尾部转人工建议
+    assert "未收录" not in reply  # 故障 ≠ 空，不误报"未收录知识库"
+    assert "<document>" not in captured["sys"]  # 走了兜底分支，无文档注入
+    # 声明与转人工建议由代码层 emit：answer.delta 拼接与 done.content 一致（契约口径）
+    deltas = "".join(e["delta"] for e in emit.events if e["type"] == "answer" and e.get("delta"))
+    assert deltas == reply
+
+
+@pytest.mark.asyncio
+async def test_compose_policy_answer_internal_error_no_attribute_error(monkeypatch):
+    """search_policy data=None（internal_error 信封）：防御式取值不抛 AttributeError，走 LLM 兜底。"""
+    async def fake_stream(messages, model=None, timeout=None, temperature=None):
+        yield "基于常识回答", None
+
+    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    reply, streamed = await _compose_policy_answer(
+        {"search_policy": {"ok": False, "data": None,
+                           "error": {"code": "internal_error", "message": "系统出问题了"}}},
+        "退货政策")
+    assert streamed is True
+    assert "转人工" in reply
 
 
 @pytest.mark.asyncio
@@ -811,8 +876,8 @@ async def test_turn_cache_not_written_low_confidence(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_turn_cache_not_written_no_search_result(monkeypatch):
-    """检索无结果（"暂未收录"兜底，answer_streamed=False）不写缓存。"""
+async def test_turn_cache_write_empty_result(monkeypatch):
+    """检索空（"暂未收录"兜底）也写缓存：对齐 good-question 防重复检索（KB 变更经 clear_cache 清缓存）。"""
     from app.agent.intent import IntentResult
 
     async def fake_classify(msg, ctx=None, **kw):
@@ -820,14 +885,15 @@ async def test_turn_cache_not_written_no_search_result(monkeypatch):
                             missing_slots=[], summary="问政策")
 
     async def fake_stream(messages, model=None, timeout=None, temperature=None):
-        raise AssertionError("无检索结果不应触发生成")
+        raise AssertionError("空结果固定话术不调 LLM")
 
     written = _install_write_capture(monkeypatch, _policy_decision(with_result=False),
                                      fake_classify, fake_stream)
     emit = EmitCollector()
-    reply = await run_agent(_mk_session(), "退货政策是什么？", 1, emit)
+    reply = await run_agent(_mk_session(), "不存在的政策", 1, emit)
     assert "暂未收录" in reply  # 兜底话术
-    assert not written.get("called")
+    assert written.get("called")  # 空结果也写缓存
+    assert written["payload"]["search_policy"]["data"]["results"] == []
 
 
 @pytest.mark.asyncio
@@ -849,3 +915,92 @@ async def test_turn_cache_not_written_stream_midway_degraded(monkeypatch):
     assert "系统繁忙" in reply  # 降级兜底追加在部分答案后
     assert not reply.startswith("系统繁忙")  # 关键：不以"系统繁忙"开头
     assert not written.get("called")  # contains 门控拦下，坏答案不入缓存
+
+
+@pytest.mark.asyncio
+async def test_turn_cache_not_written_retrieval_failure(monkeypatch):
+    """检索故障（ok:False，LLM 兜底轮）不写缓存：故障答案绝不缓存（sp.ok 语义门控）。"""
+    from app.agent.intent import IntentResult
+
+    async def fake_classify(msg, ctx=None, **kw):
+        return IntentResult(intent="POLICY_INQUIRY", confidence=0.99, slots={},
+                            missing_slots=[], summary="问政策")
+
+    decision = {
+        "route": "policy",
+        "tool_results": {"search_policy": {"ok": False, "data": None,
+                                           "error": {"code": "retrieval_unavailable", "message": "知识库检索暂不可用"}}},
+        "tool_events": [{"id": "t1", "name": "search_policy",
+                         "args": {"query": "x"}, "result": {"ok": False, "data": None,
+                                                            "error": {"code": "retrieval_unavailable", "message": "x"}},
+                         "status": "error"}],
+        "usage": None, "direct_reply": "",
+    }
+
+    async def fake_stream(messages, model=None, timeout=None, temperature=None):
+        yield "基于常识回答", None
+
+    written = _install_write_capture(monkeypatch, decision, fake_classify, fake_stream)
+    emit = EmitCollector()
+    reply = await run_agent(_mk_session(), "退货政策是什么？", 1, emit)
+    assert "转人工" in reply  # LLM 兜底 + 转人工建议
+    assert not written.get("called")  # 故障轮绝不缓存
+
+
+@pytest.mark.asyncio
+async def test_compose_policy_cooldown_reply_no_llm(monkeypatch):
+    """检索故障冷却期：返回固定话术，不调 LLM 兜底（防正文流式烧 token）。"""
+    import time as _time
+
+    orch._kb_fault_cooldown_until = _time.time() + 999  # 置冷却中
+    called = {"n": 0}
+
+    async def fake_stream(*a, **kw):
+        called["n"] += 1
+        yield "", None
+
+    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+
+    reply, streamed = await _compose_policy_answer(
+        {"search_policy": {"ok": False, "data": None,
+                           "error": {"code": "retrieval_unavailable", "message": "知识库检索暂不可用"}}},
+        "退货政策是什么",
+    )
+    assert reply == orch._KB_COOLDOWN_REPLY
+    assert streamed is False
+    assert called["n"] == 0  # 零 LLM 调用
+
+
+@pytest.mark.asyncio
+async def test_compose_policy_fault_streak_triggers_cooldown(monkeypatch):
+    """连续检索故障达阈值 → 触发冷却；检索成功重置连续计数。"""
+    import time as _time
+
+    async def fake_stream(*a, **kw):
+        yield "", None
+
+    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+
+    err_sp = {"search_policy": {"ok": False, "data": None,
+                                "error": {"code": "retrieval_unavailable", "message": "x"}}}
+    ok_sp = {"search_policy": {"ok": True, "data": {"results": []}, "error": None}}
+
+    # 前 2 次故障：未达阈值，走 LLM 兜底
+    for _ in range(2):
+        await _compose_policy_answer(err_sp, "退货政策")
+    assert orch._kb_fault_streak == 2
+    assert orch._kb_fault_cooldown_until == 0.0
+
+    # 第 3 次故障：达阈值触发冷却（计数已重置、冷却被置位）
+    await _compose_policy_answer(err_sp, "退货政策")
+    assert orch._kb_fault_streak == 0
+    assert orch._kb_fault_cooldown_until > _time.time()
+
+    # 冷却期再故障 → 固定话术
+    reply, _ = await _compose_policy_answer(err_sp, "退货政策")
+    assert reply == orch._KB_COOLDOWN_REPLY
+
+    # 检索成功（空结果也算成功）→ 重置连续计数
+    orch._kb_fault_cooldown_until = 0.0
+    await _compose_policy_answer(ok_sp, "退货政策")
+    assert orch._kb_fault_streak == 0

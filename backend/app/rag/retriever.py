@@ -25,6 +25,15 @@ SCORE_THRESHOLD = 0.3
 _SECTION_EXPAND_TOTAL = 6
 
 
+class RetrievalUnavailableError(Exception):
+    """embedding / 向量库检索失败（Milvus 挂、模型不可用等）。
+
+    语义 = "不知道有没有文档"，区别于"检索正常但为空"（search 返回空列表）。
+    由 search_policy 工具捕获后映射为 retrieval_unavailable 错误码，消费端
+    （_compose_policy_answer）据此走 LLM 兜底，而非"未收录知识库"话术。
+    """
+
+
 class Retriever:
     def __init__(self) -> None:
         self._redis: aioredis.Redis | None = None
@@ -65,8 +74,14 @@ class Retriever:
             return [SearchResult(**item) for item in data]
 
         # 检索 + 交叉编码重排（bge-reranker 真重排；失败降级按相似度排序，不阻断检索）
-        query_vec = await embedder.embed_query(query)
-        results = await vector_store.search(query_vec, top_k=TOP_K)
+        # embedding/Milvus 失败 ≠ 检索空：显式抛专用异常，由 search_policy 映射
+        # retrieval_unavailable，消费端走 LLM 兜底（防把故障误报成"未收录知识库"）。
+        try:
+            query_vec = await embedder.embed_query(query)
+            results = await vector_store.search(query_vec, top_k=TOP_K)
+        except Exception as exc:
+            logger.error("event=rag_retrieval_unavailable error=%s", str(exc))
+            raise RetrievalUnavailableError("知识库检索暂不可用") from exc
         try:
             results = await reranker.rerank(query, results)
         except Exception:

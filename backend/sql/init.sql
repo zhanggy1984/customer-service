@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS refund_orders (
     status     VARCHAR(16)  NOT NULL DEFAULT 'APPROVED',
     session_id VARCHAR(64)  NULL,
     created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_refund_order_user (order_id, user_id),  -- 防同一订单重复退款（INSERT IGNORE 幂等）
     KEY idx_user (user_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
@@ -88,7 +89,9 @@ CREATE TABLE IF NOT EXISTS complaint_tickets (
     severity       VARCHAR(16)  NULL,                     -- HIGH/MEDIUM/LOW
     status         VARCHAR(16)  NOT NULL DEFAULT 'OPEN',
     session_id     VARCHAR(64)  NULL,
+    idempotency_key VARCHAR(64) NULL,                     -- 防重复提交（同用户同内容派生的确定性键，INSERT IGNORE 幂等）
     created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_ticket_idempotency (idempotency_key),
     KEY idx_user (user_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 

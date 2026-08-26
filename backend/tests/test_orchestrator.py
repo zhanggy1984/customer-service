@@ -191,3 +191,30 @@ async def test_multi_round_items_fallback_when_llm_misses(monkeypatch):
     assert session.agent_state["return_items"] == ["手机壳"]
     assert [i["item_id"] for i in session.agent_state["eligibility"]["items"]] == ["SKU-1"]
     assert session.agent_state["eligibility"]["refund_amount"] == 29.9
+
+
+@pytest.mark.asyncio
+async def test_business_flow_db_unavailable_keeps_progress(monkeypatch):
+    """业务流确认提交时 DB 写失败（ServiceUnavailableException）：保留流程进度，提示重试。"""
+    from app.services.exceptions import ServiceUnavailableException
+
+    async def _fake_create_return(*args, **kwargs):
+        raise ServiceUnavailableException("数据库暂时不可用")
+
+    classify = _FakeClassify([
+        IntentResult(intent="RETURN_REQUEST", confidence=0.95, slots={"order_id": "ORD-T"}),
+        IntentResult(intent="RETURN_REQUEST", confidence=0.95, slots={}),
+        IntentResult(intent="RETURN_REQUEST", confidence=0.95, slots={}),
+    ])
+    monkeypatch.setattr("app.agent.orchestrator.classify_intent", classify)
+    _patch_services(monkeypatch)
+    monkeypatch.setattr(return_service, "create_return", _fake_create_return)
+
+    emit = _Emit()
+    session = _session()
+    await run_agent(session, "我要退货 ORD-T", 1, emit)  # 停在 collect_reason
+    await run_agent(session, "质量问题", 1, emit)          # 停在 confirm（等待确认）
+    reply3 = await run_agent(session, "确认", 1, emit)     # confirm→execute，create_return 抛异常
+    assert "进度已保留" in reply3  # 明确提示，非通用 error 事件
+    assert session.agent_state is not None  # 流程保留（未清空）
+    assert session.agent_state.get("stage") == "confirm"  # 停在确认节点，重试继续

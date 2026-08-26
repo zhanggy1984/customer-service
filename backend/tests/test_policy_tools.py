@@ -80,3 +80,18 @@ async def test_search_policy_missing_query_error(monkeypatch):
     assert out["ok"] is False
     assert out["data"] is None
     assert out["error"]["code"] == "missing_query"
+
+
+@pytest.mark.asyncio
+async def test_search_policy_retrieval_unavailable(monkeypatch):
+    """检索故障（Milvus/embedding 挂）→ retrieval_unavailable 错误码，不伪装"空"（未收录）。"""
+    from app.rag.retriever import RetrievalUnavailableError
+
+    monkeypatch.setattr(
+        policy_tools.retriever, "search",
+        AsyncMock(side_effect=RetrievalUnavailableError("知识库检索暂不可用")),
+    )
+    out = await policy_tools.search_policy({"query": "退货政策"}, 1, "s")
+    assert out["ok"] is False
+    assert out["data"] is None
+    assert out["error"]["code"] == "retrieval_unavailable"

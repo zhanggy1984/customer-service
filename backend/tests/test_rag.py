@@ -2,7 +2,7 @@
 import pytest
 
 from app.rag.interfaces import SearchResult
-from app.rag.retriever import Retriever
+from app.rag.retriever import RetrievalUnavailableError, Retriever
 from app.rag.retriever import embedder as embedder_mod
 from app.rag.retriever import reranker as reranker_mod
 from app.rag.retriever import vector_store as vs_mod
@@ -66,6 +66,44 @@ async def test_search_empty_below_threshold(monkeypatch):
 
     results = await r.search("量子物理")
     assert results == []  # score < 0.3 过滤
+
+
+@pytest.mark.asyncio
+async def test_search_embedding_error_raises_retrieval_unavailable(monkeypatch):
+    """embedding 失败 ≠ 检索空：抛 RetrievalUnavailableError（供 search_policy 映射故障码）。"""
+    r = Retriever()
+    r._redis = FakeRedis()
+
+    async def fake_embed(text):
+        raise RuntimeError("embedding 模型不可用")
+
+    async def fake_search(vec, top_k):
+        raise AssertionError("embedding 失败时不应走到向量检索")
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+
+    with pytest.raises(RetrievalUnavailableError):
+        await r.search("退货时限")
+
+
+@pytest.mark.asyncio
+async def test_search_vector_store_error_raises_retrieval_unavailable(monkeypatch):
+    """Milvus 查询失败 ≠ 检索空：抛 RetrievalUnavailableError（不伪装成空列表）。"""
+    r = Retriever()
+    r._redis = FakeRedis()
+
+    async def fake_embed(text):
+        return [0.1] * 10
+
+    async def fake_search(vec, top_k):
+        raise RuntimeError("Milvus connection refused")
+
+    monkeypatch.setattr(embedder_mod, "embed_query", fake_embed)
+    monkeypatch.setattr(vs_mod, "search", fake_search)
+
+    with pytest.raises(RetrievalUnavailableError):
+        await r.search("退货时限")
 
 
 @pytest.mark.asyncio

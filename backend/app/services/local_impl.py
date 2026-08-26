@@ -3,9 +3,12 @@
 升级路径: Agent → IOrderService → LocalOrderService → MySQL
 未来:     Agent → IOrderService → RemoteOrderService → HTTP/gRPC → 订单微服务
 """
+import hashlib
 import json
 import time
 from datetime import datetime
+
+from asyncmy.errors import IntegrityError
 
 from app.infrastructure.mysql import mysql_pool
 from app.services.interfaces import (
@@ -15,6 +18,7 @@ from app.services.interfaces import (
     IReturnService,
     ITicketService,
 )
+from app.services.exceptions import ServiceUnavailableException
 from app.services.retry import _retry_on_db_error
 from app.services.models import (
     ComplaintResult,
@@ -70,7 +74,26 @@ def _refundable_amount(order: OrderInfo) -> tuple[float, list[OrderItem]]:
     return round(sum(it.price * it.quantity for it in eligible), 2), eligible
 
 
+def _ticket_idempotency_key(user_id: int, order_id: str | None, complaint_type: str, description: str) -> str:
+    """投诉幂等键：用户+订单+类型+描述整体哈希派生的定长键（CT:+32 位 hex=36 ≤ VARCHAR(64)）。
+
+    order_id/complaint_type 最长 32 字符，明文拼接可超 64 触发截断（严格模式报错/非严格截断
+    导致幂等语义错乱），故对拼接串整体 sha256 定长化；确定性保留（同参数同键）。
+    重试（DB 已提交但响应前断开）与重复提交同一内容时键相同，uk_ticket_idempotency 冲突 →
+    不重复建单。同一内容重复投诉被幂等合并（防误操作）；新内容摘要不同正常新建。
+    """
+    material = f"{user_id}:{order_id or '-'}:{complaint_type or '-'}:{description or ''}"
+    return f"CT:{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]}"
+
+
+def _manual_idempotency_key(user_id: int, message: str) -> str:
+    """转人工幂等键：用户+消息整体哈希定长（复用 complaint_tickets 的 uk_ticket_idempotency）。"""
+    material = f"{user_id}:{message or ''}"
+    return f"MT:{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]}"
+
+
 class LocalOrderService(IOrderService):
+    @_retry_on_db_error
     async def query_order(self, order_id: str, user_id: int) -> OrderInfo | None:
         row = await mysql_pool.fetchone("SELECT * FROM orders WHERE order_id=%s", (order_id,))
         # 订单不存在或不属于当前用户 → 返回 None（用户隔离由这里保证）
@@ -78,6 +101,7 @@ class LocalOrderService(IOrderService):
             return None
         return _row_to_order(row, await _load_items(row["id"]))
 
+    @_retry_on_db_error
     async def list_user_orders(self, user_id: int, limit: int = 5) -> list[OrderInfo]:
         rows = await mysql_pool.fetchall(
             "SELECT * FROM orders WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
@@ -125,28 +149,44 @@ class LocalReturnService(IReturnService):
             }
             for it in eligible
         ]
-        async with mysql_pool.transaction() as run:
-            cur = await run(
-                "INSERT IGNORE INTO return_orders "
-                "(return_id, order_id, user_id, items, reason, refund_amount, status, session_id) "
-                "VALUES (%s,%s,%s,%s,%s,%s,'APPROVED',%s)",
-                (return_id, order.db_id, user_id, json.dumps(items_payload, ensure_ascii=False),
-                 reason, refund_amount, session_id),
-            )
-            inserted = cur.rowcount > 0
-            if inserted:
+        try:
+            async with mysql_pool.transaction() as run:
+                await run(
+                    "INSERT INTO return_orders "
+                    "(return_id, order_id, user_id, items, reason, refund_amount, status, session_id) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,'APPROVED',%s)",
+                    (return_id, order.db_id, user_id, json.dumps(items_payload, ensure_ascii=False),
+                     reason, refund_amount, session_id),
+                )
                 for it in eligible:
                     # 只更新仍为 NORMAL 的商品，防重复退
                     await run(
                         "UPDATE order_items SET status='RETURNED' WHERE order_id=%s AND item_id=%s AND status='NORMAL'",
                         (order.db_id, it.item_id),
                     )
+        except IntegrityError:
+            # transaction 已 ROLLBACK；唯一键冲突（uk_return_order_user）：重试/重复退货 → 幂等返回已有单号。
+            # 不用 INSERT IGNORE：它把外键/类型错误也吞成 rowcount=0，误判为幂等冲突造成假拒绝。
+            row = await mysql_pool.fetchone(
+                "SELECT return_id FROM return_orders WHERE order_id=%s AND user_id=%s",
+                (order.db_id, user_id),
+            )
+            if not row:
+                # 非唯一键冲突（return_id 时间戳碰撞/外键归入 IntegrityError）→ 不回落假成功
+                raise ServiceUnavailableException("退货提交失败，请稍后重试") from None
+            existing = row["return_id"]
+            logger.info("event=return_idempotent", extra={"order_id": order.order_id, "return_id": existing})
+            return ReturnResult(
+                success=True,
+                return_id=existing,
+                status="APPROVED",
+                refund_amount=refund_amount,
+                message="您已提交过退货申请，单号 " + existing,
+            )
         logger.info(
             "event=return_created",
-            extra={"order_id": order.order_id, "return_id": return_id, "amount": refund_amount, "inserted": inserted},
+            extra={"order_id": order.order_id, "return_id": return_id, "amount": refund_amount},
         )
-        if not inserted:
-            return ReturnResult(success=False, status="REJECTED", message="该订单已提交过退货申请")
         return ReturnResult(
             success=True,
             return_id=return_id,
@@ -176,11 +216,32 @@ class LocalRefundService(IRefundService):
         refund_id = f"RF-{int(time.time() * 1000)}"
         # 金额与 check_refund_eligibility 同口径（过滤定制类商品），避免判定与落库不一致
         amount, _ = _refundable_amount(order)
-        await mysql_pool.execute(
-            "INSERT INTO refund_orders (refund_id, order_id, user_id, reason, amount, status, session_id) "
-            "VALUES (%s,%s,%s,%s,%s,'APPROVED',%s)",
-            (refund_id, order.db_id, user_id, reason, amount, session_id),
-        )
+        try:
+            await mysql_pool.execute(
+                "INSERT INTO refund_orders (refund_id, order_id, user_id, reason, amount, status, session_id) "
+                "VALUES (%s,%s,%s,%s,%s,'APPROVED',%s)",
+                (refund_id, order.db_id, user_id, reason, amount, session_id),
+            )
+        except IntegrityError:
+            # 唯一键冲突（uk_refund_order_user）：DB 已提交但响应前断开的重试/重复提交
+            # → 返回已存在的退款单号，不重复创建。不用 INSERT IGNORE：它把外键/类型错误也
+            # 吞成 rowcount=0，误判为幂等冲突造成假成功。
+            row = await mysql_pool.fetchone(
+                "SELECT refund_id FROM refund_orders WHERE order_id=%s AND user_id=%s",
+                (order.db_id, user_id),
+            )
+            if not row:
+                # 非唯一键冲突（refund_id 时间戳碰撞/外键归入 IntegrityError）→ 不回落假成功
+                raise ServiceUnavailableException("退款提交失败，请稍后重试") from None
+            existing = row["refund_id"]
+            logger.info("event=refund_idempotent", extra={"order_id": order.order_id, "refund_id": existing})
+            return RefundResult(
+                success=True,
+                refund_id=existing,
+                status="APPROVED",
+                amount=amount,
+                message="您已提交过退款申请，单号 " + existing,
+            )
         logger.info("event=refund_created", extra={"order_id": order.order_id, "refund_id": refund_id})
         return RefundResult(
             success=True,
@@ -203,12 +264,28 @@ class LocalComplaintService(IComplaintService):
         session_id: str,
     ) -> ComplaintResult:
         ticket_id = f"CT-{int(time.time() * 1000)}"  # 3+13=16 字符，VARCHAR(32) 内
-        await mysql_pool.execute(
-            "INSERT INTO complaint_tickets "
-            "(ticket_id, user_id, order_id, complaint_type, description, severity, status, session_id) "
-            "VALUES (%s,%s,%s,%s,%s,%s,'OPEN',%s)",
-            (ticket_id, user_id, order_id, complaint_type, description, severity, session_id),
-        )
+        key = _ticket_idempotency_key(user_id, order_id, complaint_type, description)
+        try:
+            await mysql_pool.execute(
+                "INSERT INTO complaint_tickets "
+                "(ticket_id, user_id, order_id, complaint_type, description, severity, status, session_id, idempotency_key) "
+                "VALUES (%s,%s,%s,%s,%s,%s,'OPEN',%s,%s)",
+                (ticket_id, user_id, order_id, complaint_type, description, severity, session_id, key),
+            )
+        except IntegrityError:
+            # 唯一键冲突（uk_ticket_idempotency）：重试/重复提交同一投诉 → 返回已存在的工单号
+            row = await mysql_pool.fetchone(
+                "SELECT ticket_id FROM complaint_tickets WHERE idempotency_key=%s", (key,)
+            )
+            if not row:
+                # 非唯一键冲突（ticket_id 时间戳碰撞）→ 不回落假成功
+                raise ServiceUnavailableException("投诉提交失败，请稍后重试") from None
+            existing = row["ticket_id"]
+            logger.info("event=complaint_idempotent", extra={"ticket_id": existing, "severity": severity})
+            return ComplaintResult(
+                success=True, ticket_id=existing, severity=severity,
+                message="您已提交过该投诉，工单号 " + existing,
+            )
         logger.info("event=complaint_created", extra={"ticket_id": ticket_id, "severity": severity})
         return ComplaintResult(success=True, ticket_id=ticket_id, severity=severity, message="投诉工单已创建")
 
@@ -223,11 +300,23 @@ class LocalTicketService(ITicketService):
         message: str,
     ) -> ManualTicket:
         ticket_id = f"MT-{int(time.time() * 1000)}"
-        await mysql_pool.execute(
-            "INSERT INTO complaint_tickets "
-            "(ticket_id, user_id, order_id, complaint_type, description, severity, status, session_id) "
-            "VALUES (%s,%s,%s,'MANUAL',%s,'MEDIUM','OPEN',%s)",
-            (ticket_id, user_id, order_id, message, session_id),
-        )
+        key = _manual_idempotency_key(user_id, message)
+        try:
+            await mysql_pool.execute(
+                "INSERT INTO complaint_tickets "
+                "(ticket_id, user_id, order_id, complaint_type, description, severity, status, session_id, idempotency_key) "
+                "VALUES (%s,%s,%s,'MANUAL',%s,'MEDIUM','OPEN',%s,%s)",
+                (ticket_id, user_id, order_id, message, session_id, key),
+            )
+        except IntegrityError:
+            # 唯一键冲突（uk_ticket_idempotency）：同一转人工消息重复提交（重试/重复触发）→ 返回已存在工单号
+            row = await mysql_pool.fetchone(
+                "SELECT ticket_id FROM complaint_tickets WHERE idempotency_key=%s", (key,)
+            )
+            if not row:
+                raise ServiceUnavailableException("转人工提交失败，请稍后重试") from None
+            existing = row["ticket_id"]
+            logger.info("event=manual_ticket_idempotent", extra={"ticket_id": existing})
+            return ManualTicket(ticket_id=existing, message="已转人工客服，工单号 " + existing)
         logger.info("event=manual_ticket_created", extra={"ticket_id": ticket_id})
         return ManualTicket(ticket_id=ticket_id, message="已转人工客服，工单号 " + ticket_id)
