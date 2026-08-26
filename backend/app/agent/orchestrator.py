@@ -28,17 +28,10 @@ from app.agent.state_machine.refund_flow import RefundFlow
 from app.agent.state_machine.return_flow import ReturnFlow
 from app.config import settings
 from app.infrastructure import turn_cache
-from app.infrastructure.deepseek import (
-    AllKeysDownError,
-    CapacityExceededError,
-    LLMUnavailableError,
-    deepseek_client,
-)
+from app.infrastructure.deepseek import LLM_FALLBACK_ERRORS, deepseek_client
 from app.services.exceptions import ServiceUnavailableException
 from app.session.models import Session
 from app.utils.logger import logger
-
-LLM_FALLBACK_ERRORS = (LLMUnavailableError, CapacityExceededError, AllKeysDownError)
 
 FLOWS = {
     "RETURN_REQUEST": ReturnFlow(),
@@ -220,6 +213,10 @@ def _compose_order_answer(tool_results: dict, direct_reply: str = "") -> str:
     return f"请提供订单号。您最近的订单：{lines}。"
 
 
+# LLM 空返回兜底：DeepSeek 200 但 content 全空（只吐 reasoning/静默失败）→ 固定话术不编造。
+# 对齐 good-question _EMPTY_ANSWER_FALLBACK 口径。空内容走"未流式"路径由 finalize 全量补发，
+# 保证 answer 拼接 == done.content 契约一致。
+_EMPTY_ANSWER_FALLBACK = "抱歉，模型没有生成有效回答，请稍后重试或换个问法。"
 _KB_UNAVAILABLE_PREFIX = "⚠️ 知识库检索暂不可用，以下回答基于模型常识，未经平台文档验证，仅供参考。\n\n"
 _KB_UNAVAILABLE_SUFFIX = "\n\n如需准确的退货/退款/投诉政策，请通过在线客服或留言转人工确认。"
 
@@ -283,6 +280,13 @@ async def _compose_policy_fallback_answer(user_message: str, emit=None,
         # 非 LLM 异常（流式中途）：前缀已流、正文中断，仅补发转人工后缀，不报"系统繁忙"
         # （故障语义已由前缀声明，避免与正常检索轮的"系统繁忙"话术混淆）。
         logger.warning("event=policy_fallback_stream_error")
+    body = "".join(buf[1:])  # buf[0] 是前缀，其余为 LLM 正文
+    if not body.strip():
+        # LLM 正文空（静默失败）：前缀声明 + 兜底话术 + 转人工后缀，避免只有声明没有正文。
+        # 兜底话术需同步 emit，保证前端 answer 拼接 == done.content。
+        buf.append(_EMPTY_ANSWER_FALLBACK)
+        if emit:
+            await emit(answer_event(_EMPTY_ANSWER_FALLBACK))
     if emit:
         await emit(answer_event(_KB_UNAVAILABLE_SUFFIX))
     buf.append(_KB_UNAVAILABLE_SUFFIX)
@@ -370,7 +374,18 @@ async def _compose_policy_answer(tool_results: dict, user_message: str, emit=Non
         if emit:
             await emit(answer_event("系统繁忙，请稍后再试。"))
         return "".join(buf) + "系统繁忙，请稍后再试。", True
-    return "".join(buf), True
+    reply = "".join(buf)
+    if not reply.strip():
+        # LLM 200 但 content 全空（静默失败）：区分是否 emit 过（仅空白）delta——
+        # 完全没 emit 过 → 未流式，finalize 全量补发（answer 拼接 == done.content 自动一致）；
+        # 仅 emit 过空白 delta → 补发兜底并拼进 reply，保证前端已收空白与 done.content 严格一致
+        # （挑战3：`if delta:` 对 "  " 为 True 已 emit，若走未流式会破坏契约）。
+        if not buf:
+            return _EMPTY_ANSWER_FALLBACK, False
+        if emit:
+            await emit(answer_event(_EMPTY_ANSWER_FALLBACK))
+        return reply + _EMPTY_ANSWER_FALLBACK, True
+    return reply, True
 
 
 async def _handle_chitchat(
@@ -412,7 +427,18 @@ async def _handle_chitchat(
                 await emit(answer_event(delta))
         if u:
             usage.accumulate(u)
-    return "".join(buf), True
+    reply = "".join(buf)
+    if not reply.strip():
+        # LLM 200 但 content 全空（静默失败）：区分是否 emit 过（仅空白）delta——
+        # 完全没 emit 过 → 未流式，finalize 全量补发（answer 拼接 == done.content 自动一致）；
+        # 仅 emit 过空白 delta → 补发兜底并拼进 reply，保证前端已收空白与 done.content 严格一致
+        # （挑战3：`if delta:` 对 "  " 为 True 已 emit，若走未流式会破坏契约）。
+        if not buf:
+            return _EMPTY_ANSWER_FALLBACK, False
+        if emit:
+            await emit(answer_event(_EMPTY_ANSWER_FALLBACK))
+        return reply + _EMPTY_ANSWER_FALLBACK, True
+    return reply, True
 
 
 # ==================== 顶层 LangGraph 图（P2）====================

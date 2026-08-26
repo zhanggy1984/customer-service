@@ -23,14 +23,10 @@ from app.agent.function_calling.tool_call_log import write_tool_call
 from app.agent.prompts.guard import guard_user_content
 from app.config import settings
 from app.infrastructure.deepseek import (
-    AllKeysDownError,
-    CapacityExceededError,
-    LLMUnavailableError,
+    LLM_FALLBACK_ERRORS,
     deepseek_client,
 )
 from app.utils.logger import logger
-
-LLM_FALLBACK_ERRORS = (LLMUnavailableError, CapacityExceededError, AllKeysDownError)
 
 DECISION_PROMPT = (
     "<role>\n"

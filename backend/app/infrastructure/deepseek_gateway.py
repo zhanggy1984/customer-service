@@ -7,6 +7,7 @@
 """
 import asyncio
 import json
+import time
 
 import httpx
 
@@ -19,12 +20,33 @@ class LLMUnavailableError(Exception):
     """LLM 调用失败（网络/超时/重试耗尽）。"""
 
 
+class StreamInterruptedError(LLMUnavailableError):
+    """流式生成中途（已流出首个 content delta）后的连接中断。
+
+    区别于 LLMUnavailableError：这是单次请求的连接级抖动/用户断连，不代表网关整体
+    故障，不参与熔断累计（挑战1：5 个长流中途断一下不应误熔断全网关）。
+    仍被上层 LLM_FALLBACK_ERRORS 捕获（子类），走规则引擎兜底，行为不变。
+    """
+
+
 class CapacityExceededError(Exception):
     """排队超时，容量不足。"""
 
 
 class AllKeysDownError(Exception):
     """全部 Key 冷却，触发熔断降级。"""
+
+
+# LLM 网关熔断（仿 services/retry.py 的 DB _breaker 模式）：累计"一次逻辑调用彻底失败"
+# （换 Key 重试耗尽 / 超时 break），连续达阈值进入冷却，冷却期内入口直接拒绝零网络尝试。
+# 429 全冷（AllKeysDown）与本地排队超时（CapacityExceeded）不走此熔断——前者已由 KeyPool
+# 冷却机制覆盖，后者是本进程负载非上游持续故障。进程内存态，单实例可接受，进程重启即重置。
+# 阈值取 2 而非更高（挑战2）：计入熔断的都是强故障信号——超时类失败是等满 timeout 才失败
+# （慢挂确定性信号，每失败代价 ≈1×timeout），若阈值 5，慢挂需 5×timeout 才熔断，期间每请求
+# 都白挂满超时；取 2 则 2×timeout 即进入冷却，用户快速转入规则引擎兜底。
+_LLM_BREAKER_FAIL_THRESHOLD = 2  # 连续失败次数触发熔断
+_LLM_BREAKER_COOLDOWN = 30.0  # 熔断冷却时长（秒），到期后半开放行一次尝试
+_LLM_RETRY_BACKOFF = (0.1, 0.2)  # 换 Key 重试退避（指数，两档对应 ≤2 次重试）
 
 
 class DeepSeekGateway:
@@ -39,6 +61,35 @@ class DeepSeekGateway:
         )
         # 背压信号量：限制同时进行的 LLM 请求数（排队容量）
         self._semaphore = asyncio.Semaphore(settings.deepseek_queue_max_size)
+        # LLM 熔断状态（实例属性：测试可注入/天然隔离，生产单例等效全局）
+        self._breaker = {"failures": 0, "open_until": 0.0}
+
+    def _breaker_open(self) -> bool:
+        """熔断是否 open：冷却期内直接拒绝；冷却到期后重置计数放行（半开放行）。"""
+        if time.time() < self._breaker["open_until"]:
+            return True
+        if self._breaker["failures"] >= _LLM_BREAKER_FAIL_THRESHOLD:
+            self._breaker["failures"] = 0  # 冷却到期：重置计数放行，靠下一次调用探测恢复
+        return False
+
+    def _breaker_fail(self) -> None:
+        """记录一次熔断失败；达阈值进入冷却。"""
+        self._breaker["failures"] += 1
+        if self._breaker["failures"] >= _LLM_BREAKER_FAIL_THRESHOLD:
+            self._breaker["open_until"] = time.time() + _LLM_BREAKER_COOLDOWN
+            logger.error(
+                "event=llm_circuit_open",
+                extra={"cooldown": _LLM_BREAKER_COOLDOWN},
+            )
+
+    def _breaker_reset(self) -> None:
+        """调用成功：重置连续失败计数。"""
+        self._breaker["failures"] = 0
+
+    async def _backoff_sleep(self, attempt: int) -> None:
+        """换 Key 重试前的指数退避；最后一次尝试失败不再等（循环将退出，白睡无意义）。"""
+        if attempt < len(_LLM_RETRY_BACKOFF):
+            await asyncio.sleep(_LLM_RETRY_BACKOFF[attempt])
 
     async def init(self) -> None:
         self._pool.start_cleanup()
@@ -63,6 +114,10 @@ class DeepSeekGateway:
         tools/tool_choice 可选（工具决策循环用）：不传（None）则不加
         tools 字段，OpenAI 兼容格式原样透传给 DeepSeek，现有调用方无感。
         """
+        if self._breaker_open():
+            # 熔断冷却期：入口直接快速失败，零网络尝试（防 LLM 慢挂时每请求 3 连打放大延迟）
+            logger.warning("event=llm_circuit_rejected")
+            raise LLMUnavailableError("LLM 服务暂时不可用，请稍后重试")
         try:
             # 排队（背压）：并发超过容量时等待，超时抛容量不足
             await asyncio.wait_for(
@@ -73,7 +128,12 @@ class DeepSeekGateway:
             logger.warning("event=queue_wait_timeout")
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
         try:
-            return await self._call(messages, model, timeout, temperature, tools, tool_choice)
+            result = await self._call(messages, model, timeout, temperature, tools, tool_choice)
+            self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
+            return result
+        except LLMUnavailableError:
+            self._breaker_fail()  # 网络/超时/重试耗尽 → 累计；AllKeysDown/Capacity 不累计
+            raise
         finally:
             self._semaphore.release()
 
@@ -125,9 +185,11 @@ class DeepSeekGateway:
                     retry_after = int(resp.headers.get("retry-after", "30") or 30)
                     logger.warning("event=llm_429", extra={"key_index": key.index, "retry_after": retry_after})
                     await key.mark_rate_limited(retry_after)
+                    await self._backoff_sleep(attempt)
                     continue  # 冷却后换 Key
                 if resp.status_code >= 500:
                     logger.warning("event=llm_5xx", extra={"key_index": key.index, "status": resp.status_code})
+                    await self._backoff_sleep(attempt)
                     continue  # 服务端错误换 Key
                 resp.raise_for_status()  # 其他 4xx（参数错误等）不重试
             except httpx.TimeoutException:
@@ -135,6 +197,7 @@ class DeepSeekGateway:
                 break  # 超时不重试
             except httpx.HTTPError as exc:
                 logger.error("event=llm_http_error", extra={"attempt": attempt, "error": str(exc)})
+                await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
                 continue
 
         raise LLMUnavailableError("LLM 调用失败，请稍后重试")
@@ -156,6 +219,9 @@ class DeepSeekGateway:
         - 流内首个 content delta 之前的异常 → 换 Key 重试
         - 首个 content delta 之后的任何异常 → 直接上抛，不回滚已流出 token
         """
+        if self._breaker_open():
+            logger.warning("event=llm_circuit_rejected")
+            raise LLMUnavailableError("LLM 服务暂时不可用，请稍后重试")
         try:
             await asyncio.wait_for(
                 self._semaphore.acquire(),
@@ -167,6 +233,14 @@ class DeepSeekGateway:
         try:
             async for item in self._stream(messages, model, timeout, temperature):
                 yield item
+            self._breaker_reset()  # 正常流结束 → 成功
+        except StreamInterruptedError:
+            # 已产出首个 delta 后的流中断：连接级抖动/用户断连，非网关整体故障，不累计熔断
+            # （挑战1：单次长流中途断不应误熔断全网关）。仍冒泡给上层规则引擎兜底。
+            raise
+        except LLMUnavailableError:
+            self._breaker_fail()
+            raise
         finally:
             self._semaphore.release()
 
@@ -212,11 +286,13 @@ class DeepSeekGateway:
                                 "event=llm_429", extra={"key_index": key.index, "retry_after": retry_after}
                             )
                             await key.mark_rate_limited(retry_after)
+                            await self._backoff_sleep(attempt)
                             continue
                         if resp.status_code >= 500:
                             logger.warning(
                                 "event=llm_5xx", extra={"key_index": key.index, "status": resp.status_code}
                             )
+                            await self._backoff_sleep(attempt)
                             continue
                         resp.raise_for_status()
 
@@ -255,7 +331,7 @@ class DeepSeekGateway:
                     "event=llm_stream_timeout", extra={"attempt": attempt, "started": started}
                 )
                 if started:
-                    raise LLMUnavailableError("LLM 流式中断") from None
+                    raise StreamInterruptedError("LLM 流式中断") from None
                 continue  # 未流出内容，可换 Key 重试
             except httpx.HTTPError as exc:
                 logger.error(
@@ -263,7 +339,8 @@ class DeepSeekGateway:
                     extra={"attempt": attempt, "started": started, "error": str(exc)},
                 )
                 if started:
-                    raise LLMUnavailableError("LLM 流式中断") from None
+                    raise StreamInterruptedError("LLM 流式中断") from None
+                await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
                 continue
 
         raise LLMUnavailableError("LLM 调用失败，请稍后重试")
