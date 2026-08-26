@@ -40,4 +40,22 @@ async def init_schema() -> None:
     ]
     for stmt in statements:
         await mysql_pool.execute(stmt)
+    await _ensure_knowledge_hash_column()
     logger.info("schema init done（%s 条语句）", len(statements))
+
+
+async def _ensure_knowledge_hash_column() -> None:
+    """存量库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在表加列，
+    knowledge_docs.content_hash 缺失时补列（增量跳检的判据，见 kb_store）。
+
+    用 information_schema 检查而非 try/except 吞 ALTER 异常，避免掩盖真实 SQL 错误。
+    init_schema 先执行建表语句，此函数运行时表必然存在。
+    """
+    row = await mysql_pool.fetchone(
+        "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'knowledge_docs' "
+        "AND COLUMN_NAME = 'content_hash'"
+    )
+    if (row or {}).get("c", 0) == 0:
+        await mysql_pool.execute("ALTER TABLE knowledge_docs ADD COLUMN content_hash CHAR(64) NULL")
+        logger.info("schema: knowledge_docs 补 content_hash 列（存量库迁移）")

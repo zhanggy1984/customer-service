@@ -13,9 +13,13 @@ class _FakePool:
 
     def __init__(self) -> None:
         self.executed: list[str] = []
+        self.one: dict | None = {"c": 1}  # 默认 content_hash 列已存在 → 不触发 ALTER 迁移
 
     async def execute(self, sql: str) -> None:
         self.executed.append(sql)
+
+    async def fetchone(self, sql: str) -> dict | None:
+        return self.one
 
 
 def test_init_schema_executes_all_statements(monkeypatch):
@@ -47,3 +51,24 @@ def test_init_schema_skips_missing_file(monkeypatch):
     )
     asyncio.run(schema.init_schema())
     assert fake.executed == []
+
+
+def test_ensure_hash_column_migrates_when_missing(monkeypatch):
+    """存量库缺 content_hash 列 → ALTER 补列（增量跳检判据）"""
+    fake = _FakePool()
+    fake.one = {"c": 0}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_knowledge_hash_column())
+    assert any(
+        "ALTER TABLE knowledge_docs ADD COLUMN content_hash" in s
+        for s in fake.executed
+    )
+
+
+def test_ensure_hash_column_skips_when_present(monkeypatch):
+    """content_hash 列已存在 → 不执行 ALTER（幂等，避免重复迁移报错）"""
+    fake = _FakePool()
+    fake.one = {"c": 1}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_knowledge_hash_column())
+    assert not any("ALTER TABLE knowledge_docs" in s for s in fake.executed)

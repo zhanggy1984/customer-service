@@ -159,3 +159,144 @@ async def test_delete_source_chroma_fail_does_not_block(deps, monkeypatch):
     await kb_store.delete_source("faq", "admin")
     deletes = [c for c in pool.calls if c[0] == "execute" and "DELETE FROM knowledge_docs" in c[1]]
     assert deletes
+
+
+# ==================== content_hash 增量跳检 ====================
+
+
+def _count_add_calls(monkeypatch, vs):
+    """包一层 add_documents 计数，返回计数器。"""
+    calls = {"n": 0}
+    orig = vs.add_documents
+
+    async def counting_add(docs, embeddings=None):
+        calls["n"] += 1
+        await orig(docs, embeddings)
+
+    monkeypatch.setattr(kb_store.vector_store, "add_documents", counting_add)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_content_skips_rebuild(deps, monkeypatch):
+    """同内容重复上传 → 幂等跳过重建（hash 一致 + 向量库在），不重写向量。"""
+    pool, vs = deps
+    pool.one = {"content_hash": kb_store._content_hash("七天无理由退货。"), "sync_status": "ok"}
+    vs.docs = [_doc("return_policy", 0), _doc("return_policy", 1)]
+    calls = _count_add_calls(monkeypatch, vs)
+    count = await kb_store.upsert("return_policy", "七天无理由退货。", "admin")
+    assert calls["n"] == 0  # 未重建
+    assert count == 2  # 返回现有 chunk 数
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_content_but_vector_missing_rebuilds(deps, monkeypatch):
+    """hash 一致但向量库缺该 source（异常恢复）→ 不得跳检，必须重建。"""
+    pool, vs = deps
+    pool.one = {"content_hash": kb_store._content_hash("七天无理由退货。"), "sync_status": "ok"}
+    # vs.docs 为空 = 向量库丢失
+    calls = _count_add_calls(monkeypatch, vs)
+    count = await kb_store.upsert("return_policy", "七天无理由退货。", "admin")
+    assert calls["n"] == 1
+    assert count > 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_changed_content_rebuilds(deps, monkeypatch):
+    """内容变更 → 重建，INSERT 带新 hash 回填。"""
+    pool, vs = deps
+    pool.one = {"content_hash": kb_store._content_hash("旧内容")}
+    calls = _count_add_calls(monkeypatch, vs)
+    await kb_store.upsert("return_policy", "七天无理由退货。", "admin")
+    assert calls["n"] == 1
+    insert = [c for c in pool.calls if c[0] == "execute" and "INSERT" in c[1]]
+    assert insert
+    # hash 走参数化传参（params 而非拼进 SQL 文本）
+    assert kb_store._content_hash("七天无理由退货。") in insert[0][2]
+
+
+@pytest.mark.asyncio
+async def test_sync_full_skips_unchanged(deps, monkeypatch):
+    """内容未变且向量库在 → 跳过重建（skipped），不重写向量。"""
+    pool, vs = deps
+    ch = kb_store._content_hash("七天无理由退货。")
+    pool.rows = [{"source": "return_policy", "content": "七天无理由退货。", "content_hash": ch, "sync_status": "ok"}]
+    vs.docs = [_doc("return_policy", 0)]
+    calls = _count_add_calls(monkeypatch, vs)
+    result = await kb_store.sync_full()
+    assert calls["n"] == 0
+    assert result["synced"] == 0 and result["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_full_force_rebuilds(deps, monkeypatch):
+    """force=True → 全量重建，即便内容未变。"""
+    pool, vs = deps
+    ch = kb_store._content_hash("七天无理由退货。")
+    pool.rows = [{"source": "return_policy", "content": "七天无理由退货。", "content_hash": ch, "sync_status": "ok"}]
+    vs.docs = [_doc("return_policy", 0)]
+    calls = _count_add_calls(monkeypatch, vs)
+    result = await kb_store.sync_full(force=True)
+    assert calls["n"] == 1
+    assert result["synced"] == 1 and result["skipped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_full_null_hash_rebuilds(deps, monkeypatch):
+    """存量行 hash 为 NULL → 升级后首次 sync 全量重建并回填。"""
+    pool, vs = deps
+    pool.rows = [{"source": "return_policy", "content": "七天无理由退货。"}]  # 无 content_hash
+    vs.docs = [_doc("return_policy", 0)]
+    calls = _count_add_calls(monkeypatch, vs)
+    result = await kb_store.sync_full()
+    assert calls["n"] == 1
+    assert result["synced"] == 1 and result["skipped"] == 0
+    # 回填 hash：UPDATE 语句带新 hash
+    updates = [c for c in pool.calls if c[0] == "execute" and "content_hash" in c[1] and "UPDATE" in c[1]]
+    assert updates
+
+
+@pytest.mark.asyncio
+async def test_seed_writes_content_hash(deps, tmp_path, monkeypatch):
+    """seed 落库带 content_hash：后续 sync 可跳检。"""
+    pool, vs = deps
+    (tmp_path / "return_policy.md").write_text("七天无理由退货。", encoding="utf-8")
+    monkeypatch.setattr(kb_store, "KNOWLEDGE_DIR", tmp_path)
+    await kb_store._seed_from_markdown()
+    insert = [c for c in pool.calls if c[0] == "execute" and "INSERT" in c[1]]
+    assert insert
+    # hash 走参数化传参（params 而非拼进 SQL 文本）
+    assert kb_store._content_hash("七天无理由退货。") in insert[0][2]
+
+
+@pytest.mark.asyncio
+async def test_upsert_pending_never_skips(deps, monkeypatch):
+    """sync_status='pending'（上次重建失败残留）→ 不得跳检，必须重建保补偿。"""
+    pool, vs = deps
+    pool.one = {"content_hash": kb_store._content_hash("七天无理由退货。"), "sync_status": "pending"}
+    vs.docs = [_doc("return_policy", 0), _doc("return_policy", 1)]  # 残留的部分向量
+    calls = _count_add_calls(monkeypatch, vs)
+    await kb_store.upsert("return_policy", "七天无理由退货。", "admin")
+    assert calls["n"] == 1  # pending 行不跳检，重建修复
+
+
+@pytest.mark.asyncio
+async def test_sync_full_pending_never_skipped(deps, monkeypatch):
+    """pending 行即使 hash 匹配也不跳检——否则把"待补偿"洗成 ok，自愈链路断。"""
+    pool, vs = deps
+    ch = kb_store._content_hash("七天无理由退货。")
+    pool.rows = [{"source": "return_policy", "content": "七天无理由退货。",
+                  "content_hash": ch, "sync_status": "pending"}]
+    vs.docs = [_doc("return_policy", 0)]  # 残留的部分向量
+    calls = _count_add_calls(monkeypatch, vs)
+    result = await kb_store.sync_full()
+    assert calls["n"] == 1  # 重建，而非跳过
+    assert result["synced"] == 1 and result["skipped"] == 0
+    # pending 行重建后回填 hash，未被跳检分支误洗
+
+
+def test_content_hash_binds_embedding_model(monkeypatch):
+    """hash 绑定 embedding 模型版本：换模型后旧 hash 全部失效 → sync 自动全量重建。"""
+    h0 = kb_store._content_hash("七天无理由退货。")
+    monkeypatch.setattr(kb_store.settings, "embedding_model", "other-embed-model")
+    assert kb_store._content_hash("七天无理由退货。") != h0

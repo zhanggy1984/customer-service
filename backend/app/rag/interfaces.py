@@ -10,10 +10,16 @@ def source_label(metadata: dict) -> str:
     """溯源标签：source 拼 heading_path（如 "return_policy > 退货时限"）。
 
     chunk 带标题路径时提示来自哪篇文档哪个章节；无标题数据退化为纯 source。
+    未来分页文档（PDF 采集端）透传 page_num 后自动追加"（第 N 页）"，
+    当前纯 markdown 知识库无该字段，不产生任何展示变化。
     """
     src = metadata.get("source", "")
     path = metadata.get("heading_path") or []
-    return " > ".join([src] + list(path)) if path else src
+    label = " > ".join([src] + list(path)) if path else src
+    page = metadata.get("page_num")
+    if page:
+        label = f"{label}（第 {page} 页）"
+    return label
 
 
 @dataclass

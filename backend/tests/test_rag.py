@@ -142,6 +142,22 @@ async def test_search_query_empty_fallback_to_original(monkeypatch):
     assert received["query"] == "谢谢"  # normalize 后为空，回退原文
 
 
+def test_source_label_with_page_num():
+    """page_num 透传时溯源标签追加页码（PDF 接入后生效，当前 markdown 无该字段）。"""
+    from app.rag.interfaces import source_label
+
+    assert (
+        source_label({"source": "policy.pdf", "heading_path": ["第三章"], "page_num": 42})
+        == "policy.pdf > 第三章（第 42 页）"
+    )
+    assert source_label({"source": "policy.pdf", "page_num": 42}) == "policy.pdf（第 42 页）"
+    # 无 page_num 不产生页码（现有 markdown 数据路径不变）
+    assert (
+        source_label({"source": "return_policy", "heading_path": ["退货时限"]})
+        == "return_policy > 退货时限"
+    )
+
+
 @pytest.mark.asyncio
 async def test_search_expands_section_siblings(monkeypatch):
     """章节扩充：命中 chunk 的同 section 兄弟 chunk 合并进 context。"""

@@ -14,6 +14,7 @@
 import hashlib
 from pathlib import Path
 
+from app.config import settings
 from app.infrastructure.mysql import mysql_pool
 from app.rag import vector_store
 from app.rag.embedder import embedder
@@ -31,6 +32,18 @@ async def _clear_rag_cache() -> None:
         await retriever.clear_cache()
     except Exception as exc:
         logger.warning("event=kb_clear_cache_fail error=%s", str(exc))
+
+
+def _content_hash(content: str) -> str:
+    """文档内容指纹（sha256 hex）：raw 原文 + embedding 模型版本。
+
+    - 原文相同则清洗后必然相同，不会漏掉真实变更；仅改全角空格等清洗等价差异
+      只多触发一次重建，幂等无害。
+    - embedding 模型版本进 hash（同 turn_cache key 的成熟模式）：换模型后旧 hash
+      全部失效，sync 自动全量重建——否则旧向量与新模型错配会静默全废且无报错。
+    """
+    raw = f"{settings.embedding_model}|{content}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _make_docs(source: str, content: str) -> list[Document]:
@@ -78,12 +91,27 @@ async def upsert(source: str, content: str, updated_by: str) -> int:
 
     MySQL 先落（权威），ChromaDB 同步失败 → sync_status='pending' 并抛异常，
     由调用方返回 502；admin 重试或全量对账自愈。
+
+    幂等跳检：同内容重复上传/更新时跳过向量重建——内容未变则向量必然未变，
+    省 embedding 与向量库写入。仅当 MySQL 哈希一致**且 sync_status='ok'（非失败待补偿）
+    且向量库确有该 source** 才跳：pending 行（上次重建失败残留的部分向量）不得跳检，
+    否则补偿机会被跳过、向量库永久不完整。
     """
+    ch = _content_hash(content)
+    row = await mysql_pool.fetchone(
+        "SELECT content_hash, sync_status FROM knowledge_docs WHERE source=%s", (source,)
+    )
+    if row and row.get("content_hash") == ch and row.get("sync_status") == "ok":
+        existing = vector_store.count_by_source(source)
+        if existing > 0:
+            logger.info("event=kb_upsert_skip source=%s by=%s（内容未变，幂等跳过重建）", source, updated_by)
+            return existing
     await mysql_pool.execute(
-        "INSERT INTO knowledge_docs (source, content, updated_by, sync_status) "
-        "VALUES (%s, %s, %s, 'ok') "
-        "ON DUPLICATE KEY UPDATE content=VALUES(content), updated_by=VALUES(updated_by), sync_status='ok'",
-        (source, content, updated_by),
+        "INSERT INTO knowledge_docs (source, content, content_hash, updated_by, sync_status) "
+        "VALUES (%s, %s, %s, %s, 'ok') "
+        "ON DUPLICATE KEY UPDATE content=VALUES(content), content_hash=VALUES(content_hash), "
+        "updated_by=VALUES(updated_by), sync_status='ok'",
+        (source, content, ch, updated_by),
     )
     try:
         chunk_count = await rebuild_source(source, content)
@@ -158,26 +186,48 @@ async def reconcile_pending() -> int:
     return done
 
 
-async def sync_full() -> dict:
+async def sync_full(force: bool = False) -> dict:
     """全量对账（admin 手动按钮 / ChromaDB 丢失恢复）。
 
     1. 每篇 MySQL 文档重建 ChromaDB chunks（同时把 pending 行拉回 ok）。
     2. 清理孤儿：ChromaDB 中存在但 MySQL 中已删除的 source。
     不进常态路径，仅异常恢复时调用，避免全量扫描压力常态化。
+
+    增量跳检：非 force 时，内容未变（content_hash 一致）**且 sync_status='ok'** 且
+    向量库已有该 source 的文档跳过重建，仅回填 sync_status。pending 行（上次重建失败
+    残留的部分向量）不得跳检——否则把"待补偿"状态洗成 ok，reconcile_pending 再也
+    找不到它，自愈链路断。存量行 hash 为 NULL → 升级后首次 sync 自然全量重建回填。
+    升级重建（换 embedding/切分逻辑）用 force=True。
     """
-    rows = await mysql_pool.fetchall("SELECT source, content FROM knowledge_docs")
+    rows = await mysql_pool.fetchall(
+        "SELECT source, content, content_hash, sync_status FROM knowledge_docs"
+    )
     synced = 0
+    skipped = 0
     for row in rows:
-        try:
-            await rebuild_source(row["source"], row["content"])
+        source, content = row["source"], row["content"]
+        ch = _content_hash(content)
+        if (
+            not force
+            and row.get("content_hash") == ch
+            and row.get("sync_status") == "ok"
+            and vector_store.count_by_source(source) > 0
+        ):
             await mysql_pool.execute(
-                "UPDATE knowledge_docs SET sync_status='ok' WHERE source=%s",
-                (row["source"],),
+                "UPDATE knowledge_docs SET sync_status='ok' WHERE source=%s", (source,)
+            )
+            skipped += 1
+            continue
+        try:
+            await rebuild_source(source, content)
+            await mysql_pool.execute(
+                "UPDATE knowledge_docs SET sync_status='ok', content_hash=%s WHERE source=%s",
+                (ch, source),
             )
             synced += 1
         except Exception as exc:
             logger.error(
-                "event=kb_sync_full_fail source=%s error=%s", row["source"], str(exc)
+                "event=kb_sync_full_fail source=%s error=%s", source, str(exc)
             )
     # 孤儿清理：ChromaDB 的 source 集合 - MySQL 的 source 集合
     mysql_sources = {r["source"] for r in rows}
@@ -194,8 +244,10 @@ async def sync_full() -> dict:
                 "event=kb_orphan_clean_fail source=%s error=%s", source, str(exc)
             )
     logger.info(
-        "event=kb_sync_full synced=%s orphan_removed=%s", synced, orphan_removed
+        "event=kb_sync_full synced=%s skipped=%s orphan_removed=%s",
+        synced, skipped, orphan_removed,
     )
+    return {"synced": synced, "skipped": skipped, "orphan_removed": orphan_removed}
     return {"synced": synced, "orphan_removed": orphan_removed}
 
 
@@ -239,9 +291,9 @@ async def _seed_from_markdown() -> None:
         if not content:
             continue
         await mysql_pool.execute(
-            "INSERT IGNORE INTO knowledge_docs (source, content, updated_by, sync_status) "
-            "VALUES (%s, %s, 'system', 'ok')",
-            (md_path.stem, content),
+            "INSERT IGNORE INTO knowledge_docs (source, content, content_hash, updated_by, sync_status) "
+            "VALUES (%s, %s, %s, 'system', 'ok')",
+            (md_path.stem, content, _content_hash(content)),
         )
         count += 1
     logger.info("event=kb_seed_from_markdown docs=%s", count)

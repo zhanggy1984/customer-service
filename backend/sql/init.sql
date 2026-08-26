@@ -96,13 +96,14 @@ CREATE TABLE IF NOT EXISTS complaint_tickets (
 -- MySQL 是知识库单一事实来源（source of truth），ChromaDB 只存分块向量快照（派生）。
 -- sync_status: ok=已同步 / pending=ChromaDB 写入失败待补偿（admin 重试或全量对账自愈）
 CREATE TABLE IF NOT EXISTS knowledge_docs (
-    id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    source      VARCHAR(100) NOT NULL UNIQUE,   -- 文档标题，也是 ChromaDB metadata.source 关联键
-    content     MEDIUMTEXT   NOT NULL,          -- 原始 Markdown 全文
-    updated_by  VARCHAR(64)  NULL,
-    sync_status VARCHAR(16)  NOT NULL DEFAULT 'ok',
-    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    source       VARCHAR(100) NOT NULL UNIQUE,   -- 文档标题，也是 ChromaDB metadata.source 关联键
+    content      MEDIUMTEXT   NOT NULL,          -- 原始 Markdown 全文
+    content_hash CHAR(64)     NULL,              -- sha256(原文) 幂等跳检：同内容上传/sync 跳过向量重建
+    updated_by   VARCHAR(64)  NULL,
+    sync_status  VARCHAR(16)  NOT NULL DEFAULT 'ok',
+    created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 -- ---------- conversation_history（会话异步快照兜底）----------

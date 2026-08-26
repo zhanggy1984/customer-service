@@ -7,7 +7,7 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -249,9 +249,13 @@ async def list_knowledge(admin: dict = Depends(require_admin)) -> dict:
 
 # 注意: sync 必须定义在 /{source} 路由之前，否则 "sync" 会被 {source} 路径参数捕获
 @router.post("/admin/knowledge/sync")
-async def sync_knowledge(admin: dict = Depends(require_admin)) -> dict:
-    """全量对账：从 MySQL 重建全部文档 chunks + 清理孤儿。异常恢复时手动触发。"""
-    result = await kb_store.sync_full()
+async def sync_knowledge(force: bool = Query(False), admin: dict = Depends(require_admin)) -> dict:
+    """全量对账：从 MySQL 重建全部文档 chunks + 清理孤儿。异常恢复时手动触发。
+
+    force=true（?force=true）强制全量重建（升级 embedding/切分逻辑、清库恢复后）；
+    默认增量跳检：内容未变且向量库在的文档跳过重建（content_hash 判据）。
+    """
+    result = await kb_store.sync_full(force=force)
     logger.info("event=admin_sync_knowledge", extra={"admin": admin["username"], **result})
     return result
 
