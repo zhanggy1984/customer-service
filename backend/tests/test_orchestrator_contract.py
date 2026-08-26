@@ -479,6 +479,53 @@ async def test_order_status_not_found_emits_error_tool_call(monkeypatch):
     assert tc[0]["status"] == "error"
 
 
+@pytest.mark.asyncio
+async def test_llm_multi_step_not_found_then_lists_recent_orders(monkeypatch):
+    """LLM 多步路径（修复回归守护）：query_order 未命中 → LLM 改查 list_user_orders，并存结果展示最近订单。
+
+    构造 decision 直接注入，等价 run_decision_loop 两轮产物（首轮 not_found 结果回灌后，
+    LLM 决策 prompt 约束"工具结果不足时再调更合适工具"→ 次轮 list_user_orders）。
+    _compose_order_answer 修复前 order_not_found 恒提前 return，list 数据对用户不可见；
+    修复后 LLM 多步路径与规则短路路径同样受益。
+    """
+    _reset_usage()
+    from app.agent.intent import IntentResult
+
+    async def fake_classify(msg, ctx=None, **kw):
+        return IntentResult(intent="ORDER_STATUS", confidence=0.99, slots={"order_id": "ORD-404"},
+                            missing_slots=[], summary="查订单")
+
+    decision = {
+        "route": "order",
+        "tool_results": {
+            "query_order": {"ok": False, "data": None,
+                            "error": {"code": "order_not_found", "message": "订单不存在"}},
+            "list_user_orders": {"ok": True, "data": {"orders": [
+                {"order_id": "ORD-20240801-001", "status": "DELIVERED", "items": [], "total_amount": "69.70"},
+            ]}, "error": None},
+        },
+        "tool_events": [
+            {"id": "t1", "name": "query_order", "args": {"order_id": "ORD-404"},
+             "result": {"ok": False, "data": None,
+                        "error": {"code": "order_not_found", "message": "订单不存在"}}, "status": "error"},
+            {"id": "t2", "name": "list_user_orders", "args": {"limit": 5},
+             "result": {"ok": True, "data": {"orders": [
+                 {"order_id": "ORD-20240801-001", "status": "DELIVERED", "items": [], "total_amount": "69.70"}]},
+              "error": None}, "status": "success"},
+        ],
+        "usage": None, "direct_reply": "",
+    }
+    monkeypatch.setattr(orch, "classify_intent", fake_classify)
+    monkeypatch.setattr(orch, "run_decision_loop", AsyncMock(return_value=decision))
+    emit = EmitCollector()
+    session = _mk_session()
+    reply = await run_agent(session, "订单 ORD-404 现在什么状态", 1, emit)
+    assert "未找到" in reply
+    assert "您最近的订单" in reply  # 修复后：list 数据对用户可见（修复前此分支不可达）
+    assert "ORD-20240801-001" in reply
+    assert "DELIVERED" in reply or "已签收" in reply  # 订单状态透出
+
+
 def test_compose_order_answer_internal_error_not_faked_as_not_found():
     """query_order internal_error 不伪装"没有订单"（DB 故障 ≠ 用户没订单，错误语义收敛）。"""
     reply = orch._compose_order_answer(
