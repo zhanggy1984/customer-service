@@ -15,17 +15,21 @@ _MAX_SUMMARY = 512  # result_summary 截断
 
 
 def _result_summary(result: dict | None) -> str:
-    """结果摘要：命中数优先（results/orders 列表），兜底 JSON 截断。"""
+    """结果摘要（FC 契约信封）：ok=False 且带错误码 → "错误 <code>"；成功按 data 判别。"""
     if not result:
         return ""
-    if "results" in result:
-        return f"命中 {len(result['results'])} 条"
-    if "orders" in result:
-        return f"{len(result['orders'])} 条订单"
-    if isinstance(result.get("order"), dict):
-        o = result["order"]
+    if not result.get("ok"):
+        err = result.get("error") or {}
+        return f"错误 {err['code']}" if err.get("code") else ""
+    data = result.get("data") or {}
+    if "results" in data:
+        return f"命中 {len(data['results'])} 条"
+    if "orders" in data:
+        return f"{len(data['orders'])} 条订单"
+    if isinstance(data.get("order"), dict):
+        o = data["order"]
         return f"订单 {o.get('order_id', '')} 状态 {o.get('status', '')}"
-    return json.dumps(result, ensure_ascii=False)[:_MAX_SUMMARY]
+    return json.dumps(data, ensure_ascii=False)[:_MAX_SUMMARY]
 
 
 async def write_tool_call(*, session_id: str, user_id: int, round_no: int, tool_name: str,

@@ -9,19 +9,32 @@ from app.agent.function_calling import tool_call_log as tcl
 from app.infrastructure.mysql import mysql_pool
 
 
+def _ok(data):
+    """构造成功信封。"""
+    return {"ok": True, "data": data, "error": None}
+
+
 def test_result_summary_results_list():
     """results 列表 → 命中数摘要。"""
-    assert tcl._result_summary({"results": [{}, {}, {}]}) == "命中 3 条"
+    assert tcl._result_summary(_ok({"results": [{}, {}, {}]})) == "命中 3 条"
 
 
 def test_result_summary_orders():
     """orders 列表 → 订单数摘要。"""
-    assert tcl._result_summary({"orders": [{}]}) == "1 条订单"
+    assert tcl._result_summary(_ok({"orders": [{}]})) == "1 条订单"
 
 
 def test_result_summary_order_dict():
     """单订单 dict → 订单号 + 状态摘要。"""
-    assert tcl._result_summary({"order": {"order_id": "ORD-1", "status": "PAID"}}) == "订单 ORD-1 状态 PAID"
+    assert tcl._result_summary(_ok({"order": {"order_id": "ORD-1", "status": "PAID"}})) == "订单 ORD-1 状态 PAID"
+
+
+def test_result_summary_error_code():
+    """失败信封带错误码 → "错误 <code>" 摘要（观测层可辨失败原因）。"""
+    assert tcl._result_summary(
+        {"ok": False, "data": None, "error": {"code": "order_not_found", "message": "订单不存在"}}
+    ) == "错误 order_not_found"
+    assert tcl._result_summary({"ok": False, "data": None, "error": {}}) == ""
 
 
 def test_result_summary_none_or_empty():
@@ -31,8 +44,8 @@ def test_result_summary_none_or_empty():
 
 
 def test_result_summary_fallback_json():
-    """其他结构 → JSON 截断兜底。"""
-    s = tcl._result_summary({"foo": "bar"})
+    """data 内其他结构 → JSON 截断兜底。"""
+    s = tcl._result_summary(_ok({"foo": "bar"}))
     assert s.startswith("{") and "bar" in s
 
 
@@ -49,7 +62,8 @@ async def test_write_tool_call_insert(monkeypatch):
     long_query = "查" * 600
     await tcl.write_tool_call(
         session_id="sess-1", user_id=1, round_no=1, tool_name="search_policy",
-        args={"query": "退货政策"}, result={"results": [{"text": "x"}]}, latency_ms=12,
+        args={"query": "退货政策"},
+        result={"ok": True, "data": {"results": [{"text": "x"}]}, "error": None}, latency_ms=12,
         verdict="allow", reason="", query_text=long_query,
     )
     assert "INSERT INTO tool_call_log" in calls["sql"]

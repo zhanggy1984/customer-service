@@ -17,7 +17,7 @@ import time
 
 from app.config import settings
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2  # v2：search_policy 结果信封化（{ok,data,error}），旧 v1 裸 dict 缓存全部失效
 _DISABLE_COOLDOWN = 60.0
 _PREFIX = "cs:turn:"
 

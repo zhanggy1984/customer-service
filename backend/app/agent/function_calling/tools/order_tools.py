@@ -28,11 +28,11 @@ def _order_to_dict(order) -> dict:
 async def query_order(params: dict, user_id: int, session_id: str) -> dict:
     order_id = params.get("order_id")
     if not order_id:
-        return {"error": "缺少 order_id 参数"}
+        return {"ok": False, "data": None, "error": {"code": "missing_order_id", "message": "缺少 order_id 参数"}}
     order = await order_service.query_order(order_id, user_id)
     if not order:
-        return {"not_found": True, "message": "订单不存在或不属于当前用户"}
-    return {"order": _order_to_dict(order)}
+        return {"ok": False, "data": None, "error": {"code": "order_not_found", "message": "订单不存在或不属于当前用户"}}
+    return {"ok": True, "data": {"order": _order_to_dict(order)}, "error": None}
 
 
 async def list_user_orders(params: dict, user_id: int, session_id: str) -> dict:
@@ -41,6 +41,4 @@ async def list_user_orders(params: dict, user_id: int, session_id: str) -> dict:
     except (TypeError, ValueError):
         limit = 5
     orders = await order_service.list_user_orders(user_id, limit=limit)
-    if not orders:
-        return {"orders": [], "message": "您最近没有订单"}
-    return {"orders": [_order_to_dict(o) for o in orders]}
+    return {"ok": True, "data": {"orders": [_order_to_dict(o) for o in orders]}, "error": None}

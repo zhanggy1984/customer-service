@@ -70,15 +70,25 @@ def test_turn_key_stable_and_model_sensitive(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_set_roundtrip(fake_redis):
     key = tc.turn_key(tc.normalize_query("退货政策"))
-    payload = {"v": 1, "intent": "POLICY_INQUIRY", "reply": "7 天内", "search_policy": {"results": []}}
+    payload = {"v": 2, "intent": "POLICY_INQUIRY", "reply": "7 天内",
+               "search_policy": {"ok": True, "data": {"results": []}, "error": None}}
     await tc.set(key, payload, ttl=600)
     assert await tc.get(key) == payload
 
 
 @pytest.mark.asyncio
 async def test_get_version_mismatch_returns_none(fake_redis):
-    await fake_redis.set("cs:turn:x", '{"v": 2, "reply": "旧格式"}')
+    await fake_redis.set("cs:turn:x", '{"v": 99, "reply": "未来格式"}')
     assert await tc.get("cs:turn:x") is None
+
+
+@pytest.mark.asyncio
+async def test_get_v1_legacy_cache_returns_none(fake_redis):
+    """v=1 旧缓存（search_policy 裸 dict）随版本 bump 全部失效，防旧结构误读新契约。"""
+    await fake_redis.set("cs:turn:legacy",
+                         '{"v": 1, "intent": "POLICY_INQUIRY", "reply": "旧答案",'
+                         ' "search_policy": {"results": []}}')
+    assert await tc.get("cs:turn:legacy") is None
 
 
 @pytest.mark.asyncio

@@ -200,17 +200,19 @@ def _compose_order_answer(tool_results: dict, direct_reply: str = "") -> str:
     无工具结果且 LLM 直接作答（direct_reply）时透出作答，否则引导提供订单号。
     工具调用事件已由 agent_loop 节点透出，此处不再 emit。
     """
-    order_result = tool_results.get("query_order") or {}
-    if order_result.get("order"):
-        order = order_result["order"]
+    order_res = tool_results.get("query_order") or {}
+    order_data = order_res.get("data") or {}
+    if order_data.get("order"):
+        order = order_data["order"]
         items = "、".join(f"{i['name']}×{i['quantity']}" for i in order.get("items", []))
         return (
             f"订单 {order['order_id']} 当前状态：{STATUS_DESC.get(order['status'], order['status'])}。"
             f"商品：{items}；金额：¥{order['total_amount']}。"
         )
-    if order_result.get("not_found"):
+    # 错误语义收敛（FC 契约）：仅 order_not_found 引导核对单号，internal_error 不伪装"未找到"
+    if (order_res.get("error") or {}).get("code") == "order_not_found":
         return "未找到该订单，请核对订单号。也可以让我列出您最近的订单。"
-    orders = (tool_results.get("list_user_orders") or {}).get("orders") or []
+    orders = (tool_results.get("list_user_orders") or {}).get("data", {}).get("orders") or []
     if not orders:
         if direct_reply:
             return direct_reply  # LLM 无工具直接作答（纯自主语义）
@@ -225,7 +227,7 @@ async def _compose_policy_answer(tool_results: dict, user_message: str, emit=Non
     返回 (reply, 是否已流式透出 answer)。工具结果由 agent_loop 决策循环产出
     （search_policy 的 results），检索动作的事件已在 agent_loop 节点透出，此处不再重复。
     """
-    results = (tool_results.get("search_policy") or {}).get("results") or []
+    results = (tool_results.get("search_policy") or {}).get("data", {}).get("results") or []
     if not results:
         # 不带占位热线（评测 judge 对 X 占位扣分）；引导转人工入口与 _handle_chitchat 模板一致
         return "您的问题暂未收录到知识库，建议通过在线客服或留言转人工确认。", False

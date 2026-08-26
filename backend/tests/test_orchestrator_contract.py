@@ -332,11 +332,12 @@ async def test_order_status_query_tool_call(monkeypatch):
 
     decision = {
         "route": "order",
-        "tool_results": {"query_order": {"order": {
-            "order_id": "ORD-1", "status": "PAID", "total_amount": 99.9,
-            "items": [{"name": "手机", "quantity": 1}]}}},
+        "tool_results": {"query_order": {"ok": True, "data": {
+            "order": {"order_id": "ORD-1", "status": "PAID", "total_amount": 99.9,
+                      "items": [{"name": "手机", "quantity": 1}]}}, "error": None}},
         "tool_events": [{"id": "t1", "name": "query_order", "args": {"order_id": "ORD-1"},
-                         "result": {"order": {"order_id": "ORD-1", "status": "PAID"}}, "status": "success"}],
+                         "result": {"ok": True, "data": {"order": {"order_id": "ORD-1", "status": "PAID"}},
+                                    "error": None}, "status": "success"}],
         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7,
                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0},
         "direct_reply": "",
@@ -349,7 +350,7 @@ async def test_order_status_query_tool_call(monkeypatch):
     assert "已付款待发货" in reply and "99.9" in reply
     tc = [e for e in emit.events if e["type"] == "tool_call"]
     assert tc and tc[0]["name"] == "query_order"
-    assert tc[0]["result"]["order"]["status"] == "PAID"
+    assert tc[0]["result"]["data"]["order"]["status"] == "PAID"
     # 决策轮 usage 计入本轮聚合，done 前收尾
     assert emit.events[-1]["type"] == "usage"
 
@@ -439,9 +440,12 @@ async def test_order_status_not_found_emits_error_tool_call(monkeypatch):
 
     decision = {
         "route": "order",
-        "tool_results": {"query_order": {"not_found": True, "message": "订单不存在"}},
+        "tool_results": {"query_order": {"ok": False, "data": None,
+                                         "error": {"code": "order_not_found", "message": "订单不存在"}}},
         "tool_events": [{"id": "t1", "name": "query_order", "args": {"order_id": "ORD-404"},
-                         "result": {"not_found": True}, "status": "error"}],
+                         "result": {"ok": False, "data": None,
+                                    "error": {"code": "order_not_found", "message": "订单不存在"}},
+                         "status": "error"}],
         "usage": None, "direct_reply": "",
     }
     monkeypatch.setattr(orch, "classify_intent", fake_classify)
@@ -453,6 +457,15 @@ async def test_order_status_not_found_emits_error_tool_call(monkeypatch):
     tc = [e for e in emit.events if e["type"] == "tool_call"]
     assert tc and tc[0]["name"] == "query_order"
     assert tc[0]["status"] == "error"
+
+
+def test_compose_order_answer_internal_error_not_faked_as_not_found():
+    """query_order internal_error 不伪装 order_not_found（错误语义收敛的契约守卫）。"""
+    reply = orch._compose_order_answer(
+        {"query_order": {"ok": False, "data": None,
+                         "error": {"code": "internal_error", "message": "系统出问题了"}}},
+        direct_reply="")
+    assert "未找到" not in reply  # 只有 order_not_found 才引导核对单号
 
 
 @pytest.mark.asyncio
@@ -467,10 +480,11 @@ async def test_order_status_missing_order_id_lists_orders(monkeypatch):
 
     decision = {
         "route": "order",
-        "tool_results": {"list_user_orders": {"orders": [
-            {"order_id": "ORD-1", "status": "SHIPPED", "total_amount": 59.9}]}},
+        "tool_results": {"list_user_orders": {"ok": True, "data": {"orders": [
+            {"order_id": "ORD-1", "status": "SHIPPED", "total_amount": 59.9}]}, "error": None}},
         "tool_events": [{"id": "t1", "name": "list_user_orders", "args": {"limit": 5},
-                         "result": {"orders": [{"order_id": "ORD-1", "status": "SHIPPED"}]}, "status": "success"}],
+                         "result": {"ok": True, "data": {"orders": [{"order_id": "ORD-1", "status": "SHIPPED"}]},
+                                    "error": None}, "status": "success"}],
         "usage": None, "direct_reply": "",
     }
     monkeypatch.setattr(orch, "classify_intent", fake_classify)
@@ -495,10 +509,12 @@ async def test_policy_search_tool_call_and_no_result(monkeypatch):
 
     decision = {
         "route": "policy",
-        "tool_results": {"search_policy": {"results": [
-            {"text": "签收后 7 天内支持无理由退货。", "score": 0.9, "source": "after_sales_policy.md"}]}},
+        "tool_results": {"search_policy": {"ok": True, "data": {"results": [
+            {"text": "签收后 7 天内支持无理由退货。", "score": 0.9, "source": "after_sales_policy.md"}]},
+            "error": None}},
         "tool_events": [{"id": "t1", "name": "search_policy", "args": {"query": "退货政策是什么？"},
-                         "result": {"results": [{"text": "签收后 7 天内支持无理由退货。"}]}, "status": "success"}],
+                         "result": {"ok": True, "data": {"results": [{"text": "签收后 7 天内支持无理由退货。"}]},
+                                    "error": None}, "status": "success"}],
         "usage": None, "direct_reply": "",
     }
 
@@ -519,7 +535,8 @@ async def test_policy_search_tool_call_and_no_result(monkeypatch):
 
     # 无检索结果：兜底话术不含占位热线（直接测组装函数，检索已在决策循环完成）
     emit2 = EmitCollector()
-    reply2, streamed2 = await _compose_policy_answer({"search_policy": {"results": []}}, "不存在的政策", emit2)
+    reply2, streamed2 = await _compose_policy_answer(
+        {"search_policy": {"ok": True, "data": {"results": []}, "error": None}}, "不存在的政策", emit2)
     assert "400-XXX" not in reply2
     assert streamed2 is False
 
@@ -640,8 +657,8 @@ async def test_turn_cache_hit_skips_llm(monkeypatch):
     _reset_usage()
 
     async def fake_get(key):
-        return {"v": 1, "intent": "POLICY_INQUIRY", "reply": "缓存答案：7 天内可退。",
-                "search_policy": {"results": [{"text": "缓存文档"}]}}
+        return {"v": 2, "intent": "POLICY_INQUIRY", "reply": "缓存答案：7 天内可退。",
+                "search_policy": {"ok": True, "data": {"results": [{"text": "缓存文档"}]}, "error": None}}
 
     # 命中路径任何一环（意图/决策/生成）被调用即炸，证明零 LLM
     async def boom(*a, **kw):
@@ -677,10 +694,13 @@ async def test_turn_cache_write_on_policy_turn(monkeypatch):
 
     decision = {
         "route": "policy",
-        "tool_results": {"search_policy": {"results": [
-            {"text": "签收后 7 天内支持无理由退货。", "score": 0.9, "source": "after_sales_policy.md"}]}},
+        "tool_results": {"search_policy": {"ok": True, "data": {"results": [
+            {"text": "签收后 7 天内支持无理由退货。", "score": 0.9, "source": "after_sales_policy.md"}]},
+            "error": None}},
         "tool_events": [{"id": "t1", "name": "search_policy",
-                         "args": {"query": "退货政策是什么？"}, "result": {"results": []}, "status": "success"}],
+                         "args": {"query": "退货政策是什么？"},
+                         "result": {"ok": True, "data": {"results": []}, "error": None},
+                         "status": "success"}],
         "usage": None, "direct_reply": "",
     }
 
@@ -711,7 +731,7 @@ async def test_turn_cache_write_on_policy_turn(monkeypatch):
     assert "7天内" in reply
     assert written["payload"]["intent"] == "POLICY_INQUIRY"
     assert written["payload"]["reply"] == reply
-    assert written["payload"]["search_policy"]["results"]
+    assert written["payload"]["search_policy"]["data"]["results"]
     assert written["key"].startswith("cs:turn:")
 
 
@@ -719,13 +739,14 @@ async def test_turn_cache_write_on_policy_turn(monkeypatch):
 
 def _policy_decision(search_policy=None, with_result=True) -> dict:
     """构造 policy 决策：with_result 控制是否带 search_policy 结果（无 → "暂未收录"兜底）。"""
-    sp = {"results": [{"text": "签收后 7 天内支持无理由退货。", "score": 0.9,
-                       "source": "after_sales_policy.md"}]}
+    sp = {"ok": True, "data": {"results": [{"text": "签收后 7 天内支持无理由退货。", "score": 0.9,
+                       "source": "after_sales_policy.md"}]}, "error": None}
+    empty = {"ok": True, "data": {"results": []}, "error": None}
     return {
         "route": "policy",
-        "tool_results": {"search_policy": sp if with_result else {"results": []}},
+        "tool_results": {"search_policy": sp if with_result else empty},
         "tool_events": [{"id": "t1", "name": "search_policy",
-                         "args": {"query": "x"}, "result": sp if with_result else {"results": []},
+                         "args": {"query": "x"}, "result": sp if with_result else empty,
                          "status": "success"}],
         "usage": None, "direct_reply": "",
     }

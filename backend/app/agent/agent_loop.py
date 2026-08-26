@@ -165,8 +165,11 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
                 # 携带全部 tool_calls，若不给对应 tool 响应，下一轮消息格式悬空（OpenAI 兼容
                 # 服务会校验 400），且 LLM 需要看到被拒理由才改查询或放弃。
                 await _log_call(name, params, None, 0, decision.verdict, decision.reason)
+                # 信封化回灌：与真实工具返回同构，LLM 看到的被拒结构与正常结果一致
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
-                                 "content": json.dumps({"error": f"该工具调用被护栏拒绝：{decision.reason}"},
+                                 "content": json.dumps({"ok": False, "data": None, "error": {
+                                     "code": "guard_rejected",
+                                     "message": f"该工具调用被护栏拒绝：{decision.reason}"}},
                                                        ensure_ascii=False)})
                 continue
             if decision.verdict == "override":
@@ -200,7 +203,7 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
                 "name": name,
                 "args": params,
                 "result": result,
-                "status": "error" if result.get("error") else "success",
+                "status": "error" if not result.get("ok") else "success",
             })
         if limit_hit:
             break  # 截断生效：终止整个决策循环，按已有 tool_results 出路由
@@ -213,7 +216,7 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
         tool_events.append({
             "id": str(time.time_ns()), "name": "search_policy",
             "args": {"query": user_message[:50]}, "result": result,
-            "status": "error" if result.get("error") else "success",
+            "status": "error" if not result.get("ok") else "success",
         })
         logger.info("event=fc_force_policy_search")
 

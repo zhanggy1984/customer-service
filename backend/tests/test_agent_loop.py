@@ -41,7 +41,7 @@ async def test_policy_hit_loop(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append((name, params))
-        return {"results": [{"text": "签收后 7 天内支持无理由退货。", "score": 0.9, "source": "x.md"}]}
+        return {"ok": True, "data": {"results": [{"text": "签收后 7 天内支持无理由退货。", "score": 0.9, "source": "x.md"}]}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         if any(m.get("role") == "tool" for m in messages):
@@ -68,7 +68,7 @@ async def test_order_query_loop(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append((name, params))
-        return {"order": {"order_id": "ORD-1", "status": "PAID"}}
+        return {"ok": True, "data": {"order": {"order_id": "ORD-1", "status": "PAID"}}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         if any(m.get("role") == "tool" for m in messages):
@@ -127,7 +127,7 @@ async def test_query_order_missing_id_override(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append((name, params))
-        return {"orders": [{"order_id": "ORD-1", "status": "SHIPPED"}]}
+        return {"ok": True, "data": {"orders": [{"order_id": "ORD-1", "status": "SHIPPED"}]}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         if any(m.get("role") == "tool" for m in messages):
@@ -152,7 +152,7 @@ async def test_max_rounds_exhausted_routes_by_intent(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append(params.get("order_id"))
-        return {"order": {"order_id": params.get("order_id"), "status": "PAID"}}
+        return {"ok": True, "data": {"order": {"order_id": params.get("order_id"), "status": "PAID"}}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         calls["round"] += 1
@@ -165,7 +165,7 @@ async def test_max_rounds_exhausted_routes_by_intent(monkeypatch):
     out = await al.run_decision_loop("查订单", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"  # 跑满轮数按已得工具结果路由
     assert calls["execute"] == ["ORD-1", "ORD-2"]  # 两轮不同参数各执行一次
-    assert out["tool_results"]["query_order"]["order"]["order_id"] == "ORD-2"
+    assert out["tool_results"]["query_order"]["data"]["order"]["order_id"] == "ORD-2"
 
 
 @pytest.mark.asyncio
@@ -175,7 +175,7 @@ async def test_duplicate_tool_call_deduped(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append((name, params))
-        return {"order": {"order_id": "ORD-1", "status": "PAID"}}
+        return {"ok": True, "data": {"order": {"order_id": "ORD-1", "status": "PAID"}}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         if any(m.get("role") == "tool" for m in messages):
@@ -188,7 +188,7 @@ async def test_duplicate_tool_call_deduped(monkeypatch):
     out = await al.run_decision_loop("查 ORD-1", "ORDER_STATUS", _Session(), 1)
     assert calls["execute"] == [("query_order", {"order_id": "ORD-1"})]  # 同参数只执行一次
     assert len(out["tool_events"]) == 1  # 缓存命中不透出重复事件
-    assert out["tool_results"]["query_order"]["order"]["order_id"] == "ORD-1"
+    assert out["tool_results"]["query_order"]["data"]["order"]["order_id"] == "ORD-1"
 
 
 @pytest.mark.asyncio
@@ -214,7 +214,7 @@ async def test_force_policy_search_gate(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append((name, params))
-        return {"results": [{"text": "政策文档", "score": 0.9, "source": "x.md"}]}
+        return {"ok": True, "data": {"results": [{"text": "政策文档", "score": 0.9, "source": "x.md"}]}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         return _resp(content="直接作答")
@@ -234,7 +234,7 @@ async def test_trivial_policy_query_rejected(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"] += 1
-        return {"results": [{"text": "政策文档", "score": 0.9, "source": "x.md"}]}
+        return {"ok": True, "data": {"results": [{"text": "政策文档", "score": 0.9, "source": "x.md"}]}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         if calls["round"] == 0:
@@ -259,7 +259,7 @@ async def test_call_limit_truncates_loop(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append(params.get("order_id"))
-        return {"order": {"order_id": params.get("order_id"), "status": "PAID"}}
+        return {"ok": True, "data": {"order": {"order_id": params.get("order_id"), "status": "PAID"}}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         if calls["round"] == 0:
@@ -287,7 +287,7 @@ async def test_decision_loop_writes_tool_call_log(monkeypatch):
         calls.append(kwargs)
 
     async def fake_execute(name, params, user_id, session_id):
-        return {"order": {"order_id": "ORD-1", "status": "PAID"}}
+        return {"ok": True, "data": {"order": {"order_id": "ORD-1", "status": "PAID"}}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         if any(m.get("role") == "tool" for m in messages):
@@ -319,7 +319,7 @@ async def test_call_limit_truncates_before_final_round(monkeypatch):
 
     async def fake_execute(name, params, user_id, session_id):
         calls["execute"].append(params.get("order_id"))
-        return {"order": {"order_id": params.get("order_id"), "status": "PAID"}}
+        return {"ok": True, "data": {"order": {"order_id": params.get("order_id"), "status": "PAID"}}, "error": None}
 
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         calls["chat"] += 1

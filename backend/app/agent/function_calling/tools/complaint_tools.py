@@ -5,7 +5,7 @@ from app.services import complaint_service
 async def create_complaint(params: dict, user_id: int, session_id: str) -> dict:
     description = params.get("description", "")
     if not description:
-        return {"error": "缺少 description 参数"}
+        return {"ok": False, "data": None, "error": {"code": "missing_description", "message": "缺少 description 参数"}}
     result = await complaint_service.create_complaint(
         user_id=user_id,
         order_id=params.get("order_id"),
@@ -15,8 +15,12 @@ async def create_complaint(params: dict, user_id: int, session_id: str) -> dict:
         session_id=session_id,
     )
     return {
-        "success": result.success,
-        "ticket_id": result.ticket_id,
-        "severity": result.severity,
-        "message": result.message,
+        "ok": True,
+        "data": {
+            "success": result.success,
+            "ticket_id": result.ticket_id,
+            "severity": result.severity,
+            "message": result.message,
+        },
+        "error": None,
     }
