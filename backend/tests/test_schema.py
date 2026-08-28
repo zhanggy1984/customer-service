@@ -30,8 +30,14 @@ class _FakePool:
 
 def test_init_schema_executes_all_statements(monkeypatch):
     """init.sql 全部 14 条语句（SET/USE + 9 建表 + 3 种子）+ admin 创建（共 15 条）均被切分并执行"""
+    from app.config import settings
+
     fake = _FakePool()
     monkeypatch.setattr(schema, "mysql_pool", fake)
+    # init_schema 末尾必走 _ensure_admin_password（fail-fast：空密码拒绝启动），其读
+    # settings.admin_default_password。CI/干净环境未设 ADMIN_DEFAULT_PASSWORD 即空 →
+    # RuntimeError；测试必须自包含 mock 非空（与其余 admin 测试一致），不隐式依赖运行环境 env。
+    monkeypatch.setattr(settings, "admin_default_password", "str0ng-admin-pw")
     asyncio.run(schema.init_schema())
 
     assert len(fake.executed) == 15, f"应为 15 条语句（14 init.sql + 1 admin 创建），实际 {len(fake.executed)}"
