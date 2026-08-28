@@ -16,6 +16,8 @@ classify_intent() 开头短路调用 match_intent_rules()：命中返回 RuleHit
 import re
 from dataclasses import dataclass, field
 
+from app.infrastructure import metrics
+
 # 订单号：ORD-20240801-001 / ORD20240801001（允许中段与尾段数字）
 ORDER_ID_RE = re.compile(r"[Oo][Rr][Dd][-]?\d{6,}(?:-\d{1,4})?")
 
@@ -80,6 +82,11 @@ def _partial_return_items(text: str) -> list[dict] | None:
     return [{"name": name}]
 
 
+def _hit(intent: str) -> None:
+    """规则命中入指标（可观测：规则层 vs LLM 层接管比例，命中率可量化）。"""
+    metrics.inc("intent_rule_hit", {"intent": intent})
+
+
 def match_intent_rules(text: str) -> RuleHit | None:
     """规则匹配入口：命中返回 RuleHit，未命中返回 None（交给 LLM 分类）。"""
     text = _strip_tail(text)
@@ -88,10 +95,12 @@ def match_intent_rules(text: str) -> RuleHit | None:
 
     # 1. 纯问候
     if _GREETING_RE.match(text):
+        _hit("CHITCHAT")
         return RuleHit(intent="CHITCHAT", summary="问候")
 
     # 2. 裸查单（整句订单查询）
     if _BARE_ORDER_QUERY_RE.match(text):
+        _hit("ORDER_STATUS")
         return RuleHit(intent="ORDER_STATUS", missing_slots=["order_id"], summary="查询订单状态")
 
     # 3. 疑问词门：疑问句式回退 LLM
@@ -105,6 +114,7 @@ def match_intent_rules(text: str) -> RuleHit | None:
         items = _partial_return_items(text)
         if items:
             slots["items"] = items
+        _hit("RETURN_REQUEST")
         return RuleHit(
             intent="RETURN_REQUEST",
             slots=slots,
@@ -113,6 +123,7 @@ def match_intent_rules(text: str) -> RuleHit | None:
         )
     if _REFUND_RE.search(text):
         oid = _order_id_of(text)
+        _hit("REFUND_REQUEST")
         return RuleHit(
             intent="REFUND_REQUEST",
             slots={"order_id": oid} if oid else {},
@@ -121,6 +132,7 @@ def match_intent_rules(text: str) -> RuleHit | None:
         )
     if _COMPLAINT_RE.search(text):
         oid = _order_id_of(text)
+        _hit("COMPLAINT")
         return RuleHit(
             intent="COMPLAINT",
             slots={"order_id": oid} if oid else {},
@@ -131,6 +143,7 @@ def match_intent_rules(text: str) -> RuleHit | None:
     # 5. 订单号 + 状态语义词 → 订单状态查询
     oid = _order_id_of(text)
     if oid and _ORDER_STATUS_SEMANTIC_RE.search(text):
+        _hit("ORDER_STATUS")
         return RuleHit(
             intent="ORDER_STATUS",
             slots={"order_id": oid},

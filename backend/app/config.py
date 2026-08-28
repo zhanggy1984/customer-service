@@ -32,6 +32,10 @@ class Settings(BaseSettings):
 
     # ---------- 运行模式 ----------
     service_mode: str = "local"          # local | remote（对接层）
+    # 部署环境：dev | prod。字段名 app_env ↔ 环境变量 APP_ENV（pydantic-settings 自动映射）。
+    # prod 下弱口令逃生开关 ALLOW_WEAK_ADMIN_PASSWORD 强制失效（逃生是演示便利，不得误入生产；
+    # 生产部署必须设 APP_ENV=prod 上锁）。
+    app_env: str = "dev"
 
     # ---------- 基础设施 ----------
     redis_url: str = "redis://redis:6379/1"   # 共享 Redis db index 1（隔离规范 cs=/1）
@@ -85,7 +89,10 @@ class Settings(BaseSettings):
 
     # ---------- Admin 默认账号 ----------
     admin_default_username: str = "admin"
-    admin_default_password: str = "admin123"
+    # 密码强制来自 env（空默认）。弱口令/空值由 validate_security_config() 启动时拒绝。
+    admin_default_password: str = ""
+    # 逃生开关：仅演示环境确知无生产风险时置 True（仍建议改强密码）
+    allow_weak_admin_password: bool = False
 
     @property
     def deepseek_api_key_list(self) -> list[str]:
@@ -98,3 +105,34 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def validate_security_config() -> None:
+    """启动强校验（fail-fast）：弱 JWT 密钥 / 弱 admin 口令拒绝启动。
+
+    安全基线不靠文档提醒，靠强制。JWT 弱密钥 = 任何人都能伪造 token，无逃生开关；
+    admin 弱口令仅当显式 ALLOW_WEAK_ADMIN_PASSWORD=true 且非生产环境（APP_ENV=dev）
+    时放行（演示环境逃生）。生产（APP_ENV=prod）下逃生开关强制失效——防止演示便利
+    被误用进生产。
+    """
+    if (
+        not settings.jwt_secret_key
+        or settings.jwt_secret_key == "change-me"
+        or len(settings.jwt_secret_key) < 32
+    ):
+        raise RuntimeError(
+            "JWT_SECRET_KEY 必须替换为随机长字符串（>=32 字符）。"
+            '生成：python -c "import secrets;print(secrets.token_urlsafe(48))"'
+        )
+    pw = settings.admin_default_password
+    if not pw or pw == "admin123":
+        in_prod = settings.app_env == "prod"
+        if in_prod or not settings.allow_weak_admin_password:
+            hint = (
+                "生产环境（APP_ENV=prod）下逃生开关 ALLOW_WEAK_ADMIN_PASSWORD 强制失效。"
+                if in_prod
+                else "确认为演示环境无生产风险可设 ALLOW_WEAK_ADMIN_PASSWORD=true"
+            )
+            raise RuntimeError(
+                f"ADMIN_DEFAULT_PASSWORD 为空或弱口令(admin123)，拒绝启动。{hint}"
+            )

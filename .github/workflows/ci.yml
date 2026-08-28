@@ -1,0 +1,39 @@
+# CI：提交/PR 自动门禁。backend 单测零外部依赖（conftest 降级，无 MySQL/Redis/Milvus 可跑）；
+# 集成测试（test_integration.py）需运行中的服务栈，一期不在 CI 跑（本地手动）。
+# 触发：main/dev 的 push + 面向 main 的 PR。
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-test:
+    name: Backend tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # 与 docker/Dockerfile.backend 一致
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Run unit tests (no external infra needed)
+        run: cd backend && python -m pytest tests/ --ignore=tests/test_integration.py -q
+
+  frontend-test:
+    name: Frontend tests + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: cd frontend && npm ci
+      - name: Run vitest
+        run: cd frontend && npm test
+      - name: Build (vue-tsc + vite)
+        run: cd frontend && npm run build

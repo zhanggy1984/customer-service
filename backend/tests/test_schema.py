@@ -5,6 +5,8 @@
 """
 import asyncio
 
+import pytest
+
 from app.infrastructure import schema
 
 
@@ -14,21 +16,31 @@ class _FakePool:
     def __init__(self) -> None:
         self.executed: list[str] = []
         self.one: dict | None = {"c": 1}  # 默认 content_hash 列已存在 → 不触发 ALTER 迁移
+        # admin 查询（SELECT ... FROM users WHERE username）返回：None=不存在→走创建分支
+        self.admin_row: dict | None = None
 
-    async def execute(self, sql: str) -> None:
+    async def execute(self, sql: str, params: tuple | None = None) -> None:
         self.executed.append(sql)
 
     async def fetchone(self, sql: str, params: tuple | None = None) -> dict | None:
+        if "FROM users WHERE username" in sql:
+            return self.admin_row
         return self.one
 
 
 def test_init_schema_executes_all_statements(monkeypatch):
-    """init.sql 全部 14 条语句（SET/USE + 9 建表 + 3 种子）均被切分并执行"""
+    """init.sql 全部 14 条语句（SET/USE + 9 建表 + 3 种子）+ admin 创建（共 15 条）均被切分并执行"""
+    from app.config import settings
+
     fake = _FakePool()
     monkeypatch.setattr(schema, "mysql_pool", fake)
+    # init_schema 末尾必走 _ensure_admin_password（fail-fast：空密码拒绝启动），其读
+    # settings.admin_default_password。CI/干净环境未设 ADMIN_DEFAULT_PASSWORD 即空 →
+    # RuntimeError；测试必须自包含 mock 非空（与其余 admin 测试一致），不隐式依赖运行环境 env。
+    monkeypatch.setattr(settings, "admin_default_password", "str0ng-admin-pw")
     asyncio.run(schema.init_schema())
 
-    assert len(fake.executed) == 14, f"应为 14 条语句，实际 {len(fake.executed)}"
+    assert len(fake.executed) == 15, f"应为 15 条语句（14 init.sql + 1 admin 创建），实际 {len(fake.executed)}"
     joined = "\n".join(fake.executed)
     # 建表（抽查关键表）
     assert "CREATE TABLE IF NOT EXISTS users" in joined
@@ -157,3 +169,123 @@ def test_ensure_created_at_index_skips_when_present(monkeypatch):
     monkeypatch.setattr(schema, "mysql_pool", fake)
     asyncio.run(schema._ensure_created_at_index())
     assert not any("ADD KEY idx_created_at" in s for s in fake.executed)
+
+
+# ---------- _ensure_admin_password（admin 弱口令安全兜底）----------
+
+def test_ensure_admin_password_creates_when_missing(monkeypatch):
+    """users 表无 admin → 按 env 密码创建 admin（不再依赖 init.sql 弱口令种子）"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "admin_default_username", "admin")
+    monkeypatch.setattr(settings, "admin_default_password", "str0ng-admin-pw")
+    fake = _FakePool()
+    fake.admin_row = None  # admin 不存在 → 走创建分支
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_admin_password())
+    inserts = [s for s in fake.executed if "INSERT INTO users" in s]
+    assert len(inserts) == 1
+    assert "INSERT INTO users (username" in inserts[0]  # 按 env 用户名参数化插入
+
+
+def test_ensure_admin_password_overrides_weak_hash(monkeypatch):
+    """存量 admin 是弱口令 hash（历史 init.sql 种子/未知弱口令）→ 覆盖为 env 密码"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "admin_default_username", "admin")
+    monkeypatch.setattr(settings, "admin_default_password", "str0ng-admin-pw")
+    fake = _FakePool()
+    fake.admin_row = {"id": 7, "password_hash": "$2b$12$weakhashhistoricalseed"}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_admin_password())
+    assert any("UPDATE users SET password_hash" in s for s in fake.executed)
+
+
+def test_ensure_admin_password_overrides_strong_hash(monkeypatch):
+    """存量 admin 已是强 hash 也覆盖——env 是唯一事实来源（本系统无改密入口，无条件同步）"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "admin_default_username", "admin")
+    monkeypatch.setattr(settings, "admin_default_password", "str0ng-admin-pw")
+    fake = _FakePool()
+    fake.admin_row = {"id": 7, "password_hash": "$2b$12$somestronghashnotweak"}
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    asyncio.run(schema._ensure_admin_password())
+    assert any("UPDATE users SET password_hash" in s for s in fake.executed)
+
+
+def test_ensure_admin_password_empty_env_rejects(monkeypatch):
+    """env 密码为空 → RuntimeError 拒绝启动（fail-fast 兜底，防误用）"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "admin_default_username", "admin")
+    monkeypatch.setattr(settings, "admin_default_password", "")
+    fake = _FakePool()
+    monkeypatch.setattr(schema, "mysql_pool", fake)
+    with pytest.raises(RuntimeError, match="ADMIN_DEFAULT_PASSWORD"):
+        asyncio.run(schema._ensure_admin_password())
+
+
+# ---------- validate_security_config（启动 fail-fast 强校验）----------
+
+def test_validate_security_config_rejects_weak_jwt(monkeypatch):
+    """JWT 密钥为 change-me → 拒绝启动（伪造 token 风险，无逃生）"""
+    from app.config import settings, validate_security_config
+
+    monkeypatch.setattr(settings, "jwt_secret_key", "change-me")
+    monkeypatch.setattr(settings, "admin_default_password", "str0ng-admin-pw")
+    with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
+        validate_security_config()
+
+
+def test_validate_security_config_rejects_weak_admin(monkeypatch):
+    """admin 密码为弱口令(admin123) 且未开逃生 → 拒绝启动"""
+    from app.config import settings, validate_security_config
+
+    monkeypatch.setattr(settings, "jwt_secret_key", "a" * 48)
+    monkeypatch.setattr(settings, "admin_default_password", "admin123")
+    monkeypatch.setattr(settings, "allow_weak_admin_password", False)
+    with pytest.raises(RuntimeError, match="ADMIN_DEFAULT_PASSWORD"):
+        validate_security_config()
+
+
+def test_validate_security_config_accepts_strong(monkeypatch):
+    """JWT + admin 密码均强 → 启动校验通过"""
+    from app.config import settings, validate_security_config
+
+    monkeypatch.setattr(settings, "jwt_secret_key", "a" * 48)
+    monkeypatch.setattr(settings, "admin_default_password", "str0ng-admin-pw")
+    validate_security_config()  # 不抛即通过
+
+
+def test_validate_security_config_allow_weak_admin_escape(monkeypatch):
+    """显式 ALLOW_WEAK_ADMIN_PASSWORD=true + 非生产(APP_ENV=dev) → 弱 admin 口令放行（演示逃生）"""
+    from app.config import settings, validate_security_config
+
+    monkeypatch.setattr(settings, "jwt_secret_key", "a" * 48)
+    monkeypatch.setattr(settings, "admin_default_password", "admin123")
+    monkeypatch.setattr(settings, "app_env", "dev")
+    monkeypatch.setattr(settings, "allow_weak_admin_password", True)
+    validate_security_config()  # 逃生开关放行
+
+
+def test_validate_security_config_weak_admin_rejected_in_prod(monkeypatch):
+    """生产(APP_ENV=prod)下逃生开关强制失效：弱 admin 口令仍拒绝启动"""
+    from app.config import settings, validate_security_config
+
+    monkeypatch.setattr(settings, "jwt_secret_key", "a" * 48)
+    monkeypatch.setattr(settings, "admin_default_password", "admin123")
+    monkeypatch.setattr(settings, "app_env", "prod")
+    monkeypatch.setattr(settings, "allow_weak_admin_password", True)
+    with pytest.raises(RuntimeError, match="ADMIN_DEFAULT_PASSWORD"):
+        validate_security_config()
+
+
+def test_settings_maps_app_env_from_env_var(monkeypatch):
+    """APP_ENV 环境变量正确映射到 settings.app_env——防字段名↔env 名不一致（踩过的坑：
+    字段曾叫 deploy_env 映射 DEPLOY_ENV，导致 APP_ENV=prod 不生效、逃生开关误放行）"""
+    from app.config import Settings
+
+    monkeypatch.setenv("APP_ENV", "prod")
+    s = Settings()
+    assert s.app_env == "prod"

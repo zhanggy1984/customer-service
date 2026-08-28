@@ -50,6 +50,28 @@ def _fake_session_lock_redis(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fake_bge_tokenizer(monkeypatch):
+    """单测不下载 BGE tokenizer：分块 token 计数按字符近似（1 字符 ≈ 1 token）。
+
+    生产用 BGE tokenizer 精确计数（chunk_size=448 对齐 max_seq_length=512 留 12.5%
+    余量），但加载走 AutoTokenizer.from_pretrained 要下载模型文件；CI 无 HF 缓存
+    即 OSError（test_knowledge 的 upsert → chunk_document 全挂）。splitter 的
+    section 切分/heading 路径是纯正则不依赖模型，只有 _count_tokens 与
+    SentenceSplitter 的 tokenizer 回调走 BGE，mock 掉即可。样板原在 test_splitter.py
+    文件级，提升为全局（test_knowledge 等所有走 chunk_document 的测试同样受益）。
+    """
+    from app.rag import splitter
+
+    class _FakeTokenizer:
+        """字符近似编码器：1 中文字符 ≈ 1 token，避免测试加载真实 BGE 模型。"""
+
+        def encode(self, text: str) -> list[int]:
+            return [ord(c) for c in text]
+
+    monkeypatch.setattr(splitter, "_get_tokenizer", lambda: _FakeTokenizer())
+
+
+@pytest.fixture(autouse=True)
 def _reset_module_fault_state():
     """reset 模块级熔断/冷却状态（挑战 2/3）：防跨测试污染。
 

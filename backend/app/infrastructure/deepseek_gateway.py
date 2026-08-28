@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.config import settings
+from app.infrastructure import metrics
 from app.infrastructure.cooldown import RedisCooldown
 from app.infrastructure.deepseek_keypool import KeyPool
 from app.utils.logger import logger
@@ -84,6 +85,7 @@ class DeepSeekGateway:
         if self._breaker["failures"] >= _LLM_BREAKER_FAIL_THRESHOLD:
             self._breaker["open_until"] = time.time() + _LLM_BREAKER_COOLDOWN
             await self._cooldown.open()  # 广播：让其他节点不必再打失败的 LLM
+            metrics.inc("llm_circuit_open")
             logger.error(
                 "event=llm_circuit_open",
                 extra={"cooldown": _LLM_BREAKER_COOLDOWN},
@@ -102,6 +104,12 @@ class DeepSeekGateway:
         """换 Key 重试前的指数退避；最后一次尝试失败不再等（循环将退出，白睡无意义）。"""
         if attempt < len(_LLM_RETRY_BACKOFF):
             await asyncio.sleep(_LLM_RETRY_BACKOFF[attempt])
+
+    def _record_call(self, model: str | None, t0: float, ok: bool) -> None:
+        """LLM 调用结果入指标：调用量{model,ok} + 延迟 summary（排障：失败率/慢调用可查）。"""
+        m = model or settings.deepseek_model_chat
+        metrics.inc("llm_calls", {"model": m, "ok": "true" if ok else "false"})
+        metrics.observe("llm_latency_seconds", time.monotonic() - t0, {"model": m})
 
     async def init(self) -> None:
         self._pool.start_cleanup()
@@ -131,6 +139,7 @@ class DeepSeekGateway:
         """
         if await self._breaker_open():
             # 熔断冷却期：入口直接快速失败，零网络尝试（防 LLM 慢挂时每请求 3 连打放大延迟）
+            metrics.inc("llm_circuit_rejected")
             logger.warning("event=llm_circuit_rejected")
             raise LLMUnavailableError("LLM 服务暂时不可用，请稍后重试")
         try:
@@ -140,14 +149,22 @@ class DeepSeekGateway:
                 timeout=settings.deepseek_queue_timeout,
             )
         except asyncio.TimeoutError:
+            metrics.inc("llm_queue_timeout")
             logger.warning("event=queue_wait_timeout")
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
+        t0 = time.monotonic()
         try:
             result = await self._call(messages, model, timeout, temperature, tools, tool_choice, thinking)
             await self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
+            self._record_call(model, t0, ok=True)
             return result
         except LLMUnavailableError:
+            self._record_call(model, t0, ok=False)
             await self._breaker_fail()  # 网络/超时/重试耗尽 → 累计；AllKeysDown/Capacity 不累计
+            raise
+        except (AllKeysDownError, CapacityExceededError):
+            # 无 healthy Key / 排队超时：调用未成功，计失败指标（非网络故障，不累计熔断）
+            self._record_call(model, t0, ok=False)
             raise
         finally:
             self._semaphore.release()
@@ -242,6 +259,7 @@ class DeepSeekGateway:
         - 首个 content/reasoning delta 之后的任何异常 → 直接上抛，不回滚已流出 token
         """
         if await self._breaker_open():
+            metrics.inc("llm_circuit_rejected")
             logger.warning("event=llm_circuit_rejected")
             raise LLMUnavailableError("LLM 服务暂时不可用，请稍后重试")
         try:
@@ -250,17 +268,22 @@ class DeepSeekGateway:
                 timeout=settings.deepseek_queue_timeout,
             )
         except asyncio.TimeoutError:
+            metrics.inc("llm_queue_timeout")
             logger.warning("event=queue_wait_timeout")
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
+        t0 = time.monotonic()
         try:
             async for item in self._stream(messages, model, timeout, temperature):
                 yield item
             await self._breaker_reset()  # 正常流结束 → 成功
+            self._record_call(model, t0, ok=True)
         except StreamInterruptedError:
             # 已产出首个 delta 后的流中断：连接级抖动/用户断连，非网关整体故障，不累计熔断
             # （挑战1：单次长流中途断不应误熔断全网关）。仍冒泡给上层规则引擎兜底。
+            self._record_call(model, t0, ok=False)
             raise
         except LLMUnavailableError:
+            self._record_call(model, t0, ok=False)
             await self._breaker_fail()
             raise
         finally:
