@@ -549,6 +549,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.4.3** | 2026-08-28 | 资源层门面：infrastructure 统一门面（interfaces 4 Protocol + re-export 单例 llm_gateway/mysql_pool/retriever），agent 7 文件改依赖抽象不依赖实现，retriever 惰性导出破除循环导入，新增门面身份测试；README 架构图重构为四层（交互/控制/能力/资源）+ 职责表 + 目录分层标注，措辞专业化，测试数字统一（386/383/41） |
 | **2.4.2** | 2026-08-28 | 上线前安全加固三件套：JWT/admin 弱口令 fail-fast 拒绝启动（`ALLOW_WEAK_ADMIN_PASSWORD` 逃生开关仅 dev 生效、生产强制失效）、全站 HTTPS + 自签证书 + 80→443 跳转、Prometheus `/metrics` 指标导出；GitHub Actions CI 门禁（backend pytest + frontend vitest/build，dev/main/PR 全触发）；多副本状态外置实测：compose backend 去固定容器名/宿主端口（静态端口与 `--scale` 冲突）、原容器名改网络别名 + 共享网关 DNS 多 IP 自动轮询（网关配置零改动），`verify_multinode.py` 四层验证（部署可达 / 锁互斥跨进程 / 端到端并发 / 熔断广播）实测 11 PASS；测试收敛 CI 环境隐式依赖（BGE tokenizer 全局 mock、admin 密码测试自包含 mock） |
 | **2.4.0** | 2026-08-26 | 统一 API 网关接入：前端 nginx 改反代共享网关 `api-gateway:8099`（Host: cs.local），网关负责 X-Request-ID traceId 根生成（后端日志 `trace_id` 对齐）、按真实 IP 限流（cs_chat 2r/s + cs_auth 5r/m 接管登录限流）、SSE 透传；DeepSeek thinking 参数化（意图分类/投诉评估关闭省思考 token）+ reasoning 事件全链路展示（决策非流式全文 / 生成流式增量）+ 前端思考/来源折叠；检索来源 `[来源N]` 上下文序号化 + 前端来源内容展示；测试扩充至 369 项 |
 | **2.3.0** | 2026-08-26 | 多节点状态外置（自由扩缩容）：per-session Redis 分布式锁（SET NX PX + token Lua 释放 + 看门狗续期 + Redis 抖动容忍，替代进程内 asyncio.Lock）；DB/LLM/KB 熔断计数留本地、冷却信号 Redis 广播共享（close 仅本地广播方生效防撤销他人广播）；Milvus 同步检索走 to_thread 不阻塞事件循环/锁看门狗；StorageRouter Redis key 失效回退 MySQL；Redis 不可用 fail-fast 503、锁等待超时 429；测试扩充至 361 项 |
