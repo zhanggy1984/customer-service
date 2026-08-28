@@ -3,9 +3,12 @@
 统一返回信封 {ok, data, error}（FC 契约）：data 含 results/source_count/max_score 聚合字段，
 供决策 LLM 判断"是否已检索到足够依据"与观测层聚合（对应 good-question 的 source_count 思路）。
 """
-from app.infrastructure.turn_cache import normalize_query
-from app.rag.interfaces import source_label
-from app.rag.retriever import RetrievalUnavailableError, retriever
+from app.infrastructure import (
+    RetrievalUnavailableError,
+    normalize_query,
+    retriever,
+    source_label,
+)
 
 _QUERY_MAX_LEN = 100  # LLM 可能传整段对话，超长前缀截断（简单截断，不引入切句逻辑）
 

@@ -6,7 +6,7 @@ P4 判定只走 logger；P5 建 tool_call_log 表落库。观测层对决策层�
 import json
 import logging
 
-from app.infrastructure.mysql import mysql_pool
+from app.infrastructure import mysql_pool
 
 logger = logging.getLogger(__name__)
 

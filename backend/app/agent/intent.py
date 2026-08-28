@@ -11,7 +11,7 @@ from app.agent.intent_rules import match_intent_rules
 from app.agent.prompts.guard import guard_user_content
 from app.agent.prompts.intent import build_intent_system
 from app.config import settings
-from app.infrastructure.deepseek import deepseek_client
+from app.infrastructure import llm_gateway
 from app.utils.logger import logger
 
 # 规则命中视为确定性分类（> SWITCH_THRESHOLD=0.8），业务流内规则已禁用，不会触发意外切换
@@ -83,7 +83,7 @@ async def classify_intent(
 
     for attempt in range(max_retries):
         try:
-            data = await deepseek_client.chat(
+            data = await llm_gateway.chat(
                 messages,
                 model=settings.deepseek_model_chat,
                 temperature=0.1,  # 意图分类需确定性，低温度抑制同 query 分类抖动

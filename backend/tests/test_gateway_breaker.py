@@ -377,7 +377,7 @@ async def test_compose_policy_answer_empty_content_fallback(monkeypatch):
         yield "", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
                    "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}, None
 
-    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    monkeypatch.setattr(orch.llm_gateway, "chat_stream", fake_stream)
     reply, streamed = await orch._compose_policy_answer(
         {"search_policy": {"ok": True, "data": {"results": [{"source": "售后政策.md", "text": "七天无理由退货"}]}}},
         "退货政策是什么", None)
@@ -392,7 +392,7 @@ async def test_handle_chitchat_empty_content_fallback(monkeypatch):
         if False:
             yield  # async generator：运行时不产出任何内容
 
-    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    monkeypatch.setattr(orch.llm_gateway, "chat_stream", fake_stream)
     reply, streamed = await orch._handle_chitchat(_mk_session(), "你好", 1)
     assert reply == orch._EMPTY_ANSWER_FALLBACK
     assert streamed is False
@@ -405,7 +405,7 @@ async def test_compose_policy_fallback_answer_empty_body_fallback(monkeypatch):
         if False:
             yield
 
-    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    monkeypatch.setattr(orch.llm_gateway, "chat_stream", fake_stream)
     reply = await orch._compose_policy_fallback_answer("退货政策是什么")
     assert orch._EMPTY_ANSWER_FALLBACK in reply
     assert "知识库检索暂不可用" in reply  # 前缀低可信度声明保留
@@ -430,7 +430,7 @@ async def test_compose_policy_answer_whitespace_only_content_contract(monkeypatc
     async def emit(ev):
         emitted.append(ev)
 
-    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    monkeypatch.setattr(orch.llm_gateway, "chat_stream", fake_stream)
     reply, streamed = await orch._compose_policy_answer(
         {"search_policy": {"ok": True, "data": {"results": [{"source": "售后政策.md", "text": "七天无理由退货"}]}}},
         "退货政策是什么", emit)
@@ -451,7 +451,7 @@ async def test_handle_chitchat_whitespace_only_content_contract(monkeypatch):
     async def emit(ev):
         emitted.append(ev)
 
-    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    monkeypatch.setattr(orch.llm_gateway, "chat_stream", fake_stream)
     reply, streamed = await orch._handle_chitchat(_mk_session(), "你好", 1, emit)
     assert streamed is True
     assert reply == "  " + orch._EMPTY_ANSWER_FALLBACK

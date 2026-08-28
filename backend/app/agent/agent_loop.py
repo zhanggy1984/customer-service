@@ -23,10 +23,7 @@ from app.agent.function_calling.tool_call_log import write_tool_call
 from app.agent.intent_rules import ORDER_ID_RE
 from app.agent.prompts.guard import guard_user_content
 from app.config import settings
-from app.infrastructure.deepseek import (
-    LLM_FALLBACK_ERRORS,
-    deepseek_client,
-)
+from app.infrastructure import LLM_FALLBACK_ERRORS, llm_gateway
 from app.utils.logger import logger
 
 DECISION_PROMPT = (
@@ -183,7 +180,7 @@ async def run_decision_loop(user_message: str, intent: str, session, user_id: in
 
     for round_no in range(1, settings.agent_loop_max_rounds + 1):
         try:
-            data = await deepseek_client.chat(
+            data = await llm_gateway.chat(
                 messages,
                 model=settings.deepseek_model_chat,
                 temperature=0.1,  # 工具决策需确定性

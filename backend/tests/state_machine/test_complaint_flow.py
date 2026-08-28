@@ -50,7 +50,7 @@ async def test_assess_severity_uses_chat_model(monkeypatch):
         captured["timeout"] = timeout
         return {"choices": [{"message": {"content": '{"severity":"HIGH"}'}}], "usage": None}
 
-    monkeypatch.setattr(complaint_flow.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(complaint_flow.llm_gateway, "chat", fake_chat)
     sev = await complaint_flow._assess_severity("商品质量极差，手机屏幕碎裂划伤手指")
     assert sev == "HIGH"
     assert captured["model"] == settings.deepseek_model_chat
@@ -68,7 +68,7 @@ async def test_assess_severity_levels(monkeypatch, payload, expected):
     """三档 severity 透出。"""
     async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         return {"choices": [{"message": {"content": payload}}], "usage": None}
-    monkeypatch.setattr(complaint_flow.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(complaint_flow.llm_gateway, "chat", fake_chat)
     assert await complaint_flow._assess_severity("test") == expected
 
 
@@ -77,7 +77,7 @@ async def test_assess_severity_invalid_falls_back_medium(monkeypatch):
     """非法 severity 值 → 降级 MEDIUM。"""
     async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         return {"choices": [{"message": {"content": '{"severity":"URGENT"}'}}], "usage": None}
-    monkeypatch.setattr(complaint_flow.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(complaint_flow.llm_gateway, "chat", fake_chat)
     assert await complaint_flow._assess_severity("test") == "MEDIUM"
 
 
@@ -86,5 +86,5 @@ async def test_assess_severity_exception_falls_back_medium(monkeypatch):
     """LLM 异常 → 降级 MEDIUM。"""
     async def fake_chat(messages, model=None, timeout=None, temperature=None, **kwargs):
         raise RuntimeError("upstream down")
-    monkeypatch.setattr(complaint_flow.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(complaint_flow.llm_gateway, "chat", fake_chat)
     assert await complaint_flow._assess_severity("test") == "MEDIUM"

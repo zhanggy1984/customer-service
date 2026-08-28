@@ -97,7 +97,7 @@ async def test_policy_answer_document_delimiter(monkeypatch):
         captured["messages"] = messages
         yield "根据文档", None
 
-    monkeypatch.setattr(orch.deepseek_client, "chat_stream", fake_stream)
+    monkeypatch.setattr(orch.llm_gateway, "chat_stream", fake_stream)
     results = [{"source": "退货政策", "text": "7 天内可退"}]
     tool_results = {"search_policy": {"ok": True, "data": {"results": results}, "error": None}}
     await _compose_policy_answer(tool_results, "退货政策是什么")
