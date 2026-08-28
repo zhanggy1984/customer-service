@@ -340,6 +340,10 @@ async def test_call_thinking_override(monkeypatch):
         captured["json"] = kw["json"]
         return _FakeResp(200, {"content": "ok"})
 
+    # key 池非空：_call 发请求前校验 key，无 key 抛 AllKeysDownError。本测试只关心
+    # thinking 参数透传，不关心 key；CI/无 .env 环境无真 key，必须 mock 掉（否则
+    # 环境缺 key 时测试失败，而非验证目标失败）
+    monkeypatch.setattr(settings, "deepseek_api_keys", "sk-ci-fake")
     monkeypatch.setattr(settings, "deepseek_thinking_enabled", True)
     gw = _mk_gateway()
     gw._client.post = fake_post
