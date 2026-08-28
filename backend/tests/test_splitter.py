@@ -1,20 +1,6 @@
-"""切分器单测（mock tokenizer 为字符近似，不依赖模型文件/网络）。"""
-import pytest
-
+"""切分器单测（tokenizer 已由 conftest 全局 mock 为字符近似，不依赖模型文件/网络）。"""
 from app.rag import splitter
 from app.rag.splitter import chunk_document
-
-
-class _FakeTokenizer:
-    """字符近似编码器：1 中文字符 ≈ 1 token，避免测试加载真实 BGE 模型。"""
-
-    def encode(self, text: str) -> list[int]:
-        return [ord(c) for c in text]
-
-
-@pytest.fixture(autouse=True)
-def _fake_tokenizer(monkeypatch):
-    monkeypatch.setattr(splitter, "_get_tokenizer", lambda: _FakeTokenizer())
 
 
 def test_split_sections_heading_stack():
