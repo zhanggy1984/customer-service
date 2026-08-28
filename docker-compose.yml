@@ -37,7 +37,6 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.backend
-    container_name: customer-service-backend
     env_file:
       - .env
     environment:
@@ -45,13 +44,15 @@ services:
       # HF 模型走离线缓存（hf_cache volume）：bge 模型由本地 volume 加载
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
-    ports:
-      - "8000:8000"
+    # 多副本 scale：无固定容器名/宿主端口（静态端口与 --scale 冲突）；原容器名作
+    # 网络别名，共享网关按 DNS 多 IP 自动轮询（网关配置零改动）
     volumes:
       - hf_cache:/root/.cache/huggingface
     restart: unless-stopped
     networks:
-      - shared-infra
+      shared-infra:
+        aliases:
+          - customer-service-backend
 
 volumes:
   hf_cache:
