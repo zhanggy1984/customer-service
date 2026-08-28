@@ -7,6 +7,9 @@
 import logging
 from pathlib import Path
 
+import bcrypt
+
+from app.config import settings
 from app.infrastructure.mysql import mysql_pool
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,7 @@ async def init_schema() -> None:
     await _ensure_refund_order_unique()
     await _ensure_ticket_idempotency_key()
     await _ensure_created_at_index()
+    await _ensure_admin_password()
     logger.info("schema init done（%s 条语句）", len(statements))
 
 
@@ -127,3 +131,36 @@ async def _ensure_created_at_index() -> None:
         if (row or {}).get("c", 0) == 0:
             await mysql_pool.execute(f"ALTER TABLE {table} ADD KEY idx_created_at (created_at)")
             logger.info("schema: %s 补 idx_created_at 索引（存量库迁移）", table)
+
+
+async def _ensure_admin_password() -> None:
+    """admin 账号安全兜底：admin 密码以 env 为唯一事实来源，启动时无条件同步。
+
+    背景：init.sql 不再种 admin（密码移交 env），但存量库可能仍是用弱口令种子建的
+    admin，且可能是「未知弱口令」（历史版本可能用了非 admin123 的弱密码，无法穷举识别）。
+    INSERT IGNORE 只在不存在时插入，改 seed 不更新已有密码，必须显式覆盖。
+    策略：无条件 UPDATE 为 env 密码——本系统无 admin 改密入口（前端仅登录/注册），
+    env 是唯一事实来源，不存在"用户手动改过密"需保留的场景；空 env 密码在
+    validate_security_config() 已被拒，此处再 guard 一次（fail-fast 兜底，防误用）。
+    """
+    username = settings.admin_default_username
+    password = settings.admin_default_password
+    if not password:
+        raise RuntimeError(
+            "ADMIN_DEFAULT_PASSWORD 为空：admin 密码必须以 env 注入，拒绝启动"
+        )
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    row = await mysql_pool.fetchone(
+        "SELECT id, password_hash FROM users WHERE username=%s", (username,)
+    )
+    if row is None:
+        await mysql_pool.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'admin')",
+            (username, hashed),
+        )
+        logger.info("schema: 创建默认 admin 账号（密码取自 env）")
+    else:
+        await mysql_pool.execute(
+            "UPDATE users SET password_hash=%s WHERE id=%s", (hashed, row["id"])
+        )
+        logger.info("schema: admin 密码已同步为 env 配置（env 唯一事实来源，无条件覆盖）")

@@ -6,9 +6,11 @@
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 
 from app.api import auth, contracts, routes
+from app.config import settings, validate_security_config
+from app.infrastructure import metrics
 from app.infrastructure.deepseek import deepseek_client
 from app.infrastructure.mysql import mysql_pool
 from app.infrastructure.schema import init_schema
@@ -25,6 +27,9 @@ logger.addFilter(TraceIdFilter())
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    validate_security_config()  # fail-fast：弱 JWT 密钥 / 弱 admin 口令拒绝启动
+    if settings.allow_weak_admin_password and settings.app_env != "prod":
+        logger.warning("ALLOW_WEAK_ADMIN_PASSWORD=true：admin 弱口令逃生开关已开启，仅限演示环境（APP_ENV=dev）")
     logger.info("event=app_startup")
     await session_manager.init()
     await mysql_pool.init()
@@ -67,3 +72,9 @@ app.include_router(contracts.router, prefix="/api")
 @app.get("/healthz")
 async def healthz() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus 文本格式指标：LLM 调用量/失败率/熔断/排队、会话锁等待、意图规则命中率。"""
+    return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")

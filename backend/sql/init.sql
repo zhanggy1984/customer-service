@@ -150,10 +150,11 @@ CREATE TABLE IF NOT EXISTS tool_call_log (
 -- =============================================================
 -- 种子数据
 -- =============================================================
--- 密码: admin/admin123, user_1/user_2 均为 123456（bcrypt 预生成 hash）
+-- 密码: user_1/user_2 均为 123456（bcrypt 预生成 hash）
+-- admin 不在此 seed：密码移交 env（ADMIN_DEFAULT_PASSWORD），由应用启动时
+-- infrastructure/schema.py 的 _ensure_admin_password() 创建/同步（防弱口令随镜像分发）
 -- 幂等：INSERT IGNORE 依赖 username UNIQUE，重复启动不重复插入
 INSERT IGNORE INTO users (username, password_hash, role, phone) VALUES
-    ('admin',  '$2b$12$K3vOmcMr0lF8hKB1.tfecu.22mtv6RK01l7B/.eR4kgryCclvflSW', 'admin', '13800000000'),
     ('user_1', '$2b$12$jl38CVX4S2zf2sdwxweUyuN/WMk2zbCifYtx.EPJfnxUyLAmTDvdC', 'user',  '13800000001'),
     ('user_2', '$2b$12$jl38CVX4S2zf2sdwxweUyuN/WMk2zbCifYtx.EPJfnxUyLAmTDvdC', 'user',  '13800000002');
 

@@ -20,6 +20,7 @@ import uuid
 import redis.asyncio as aioredis
 
 from app.config import settings
+from app.infrastructure import metrics
 
 _LOCK_PREFIX = "cs:lock:session:"
 # Lua：释放（比对 token，防误删持锁者之外的锁）
@@ -90,6 +91,7 @@ class RedisSessionLock:
                 self._acquired = True
                 return
             if time.monotonic() >= deadline:
+                metrics.inc("session_lock_timeout")
                 raise SessionLockTimeoutError(f"会话 {self._sid} 正在处理中")
             await asyncio.sleep(settings.session_lock_poll_interval)
 

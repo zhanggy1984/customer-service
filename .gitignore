@@ -1,6 +1,8 @@
 # ---------- 环境与密钥 ----------
 .env
 .env.local
+# TLS 证书（含私钥，本机生成不入库；scripts/gen_cert.sh 重建）
+certs/
 # 本机端口覆盖（docker compose 自动合并，不入库）
 docker-compose.override.yml
 

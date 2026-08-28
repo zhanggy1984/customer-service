@@ -125,10 +125,22 @@ graph TB
 
 ```bash
 cp .env.example .env
-# 编辑 .env，必填两项：
+# 编辑 .env，必填三项：
 #   DEEPSEEK_API_KEYS=sk-key1,sk-key2,...   # 多 Key 逗号分隔，越多并发越高
 #   JWT_SECRET_KEY=<随机长字符串>            # 生产必须替换，如 python -c "import secrets;print(secrets.token_urlsafe(48))"
+#   ADMIN_DEFAULT_PASSWORD=<强密码>          # admin 密码（弱口令/留空会启动 fail-fast，见 §7）
 ```
+
+**HTTPS 证书说明**（避免误判：自签证书 ≠ 系统不可上线）：
+- 仓库自带**自签证书**（`certs/`，一年有效，SAN 含 `localhost`/`127.0.0.1`）——**仅供本地/内网演示**。浏览器首次访问会提示不受信任，这是**浏览器对自签证书的正常告警**，不是系统故障，点「高级 → 继续访问」即可；
+- 内网 IP / 自定义域名访问：`bash scripts/gen_cert.sh 192.168.1.10`（把访问域名加进 SAN，避免 `NET::ERR_CERT_COMMON_NAME_INVALID`）；
+- **公网上线必须换受信任证书**（约 5 分钟）：Let's Encrypt 颁发后，把 `cert.pem`/`privkey.pem` 复制为 `certs/server.crt`/`server.key`（路径不变，nginx 零改动）并 reload；certbot 自动续期：
+  ```bash
+  sudo certbot certonly --standalone -d your.domain.com
+  sudo cp /etc/letsencrypt/live/your.domain.com/fullchain.pem certs/server.crt
+  sudo cp /etc/letsencrypt/live/your.domain.com/privkey.pem certs/server.key
+  docker compose exec nginx nginx -s reload
+  ```
 
 ### 第 2 步：启动应用容器（nginx + backend）
 
@@ -148,25 +160,26 @@ npm run build             # 生产：构建产物挂载到 nginx
 # 或 npm run dev           # 开发热更新（proxy /api → backend:8000，访问 http://localhost:5173）
 ```
 
-**跑起来了**：浏览器打开 **http://localhost:8081**，用演示账号登录。
+**跑起来了**：浏览器打开 **https://localhost:8443**（HTTP 8081 自动 301 到 HTTPS），用演示账号登录。浏览器首次访问自签证书会提示不受信任，点「高级 → 继续访问」即可（公网部署换正式证书后无此提示）。
 
 | 角色 | 账号 | 密码 | 可做什么 |
 |------|------|------|---------|
 | 普通用户 | `user_1` | `123456` | 对话式退货/退款/投诉/查单/政策问答，预置 5 个订单 |
-| 管理员 | `admin` | `admin123` | 知识库管理、订单管理、一键重置测试数据 |
+| 管理员 | `admin` | `.env` 的 `ADMIN_DEFAULT_PASSWORD` | 知识库管理、订单管理、一键重置测试数据 |
 
 **访问入口**（标准端口）：
 
 | 入口 | 地址 | 用途 |
 |------|------|------|
-| 前端（生产） | http://localhost:8081 | nginx 统一入口，API 反代经共享网关 api-gateway:8099 |
-| 后端 API | http://localhost:8000/api/v1 | 开发调试（含 SSE） |
+| 前端（生产，HTTPS） | https://localhost:8443 | 唯一对外入口：TLS 终止 + 安全头；HTTP 8081 全量 301 到此 |
+| 前端（生产，HTTP） | http://localhost:8081 | 自动重定向到 HTTPS（明文不承载业务） |
+| 后端 API | http://localhost:8000/api/v1 | 开发调试（含 SSE）；`/metrics` Prometheus 指标同端口 |
 | 前端（开发热更新） | http://localhost:5173 | Vite dev server |
 | **MySQL** | `localhost:33061`（共享 infra，库 `customer_service`） | 外部工具验证数据 |
 | **Redis** | `localhost:36379`（共享 infra） | 外部工具验证数据 |
 | **Milvus** | `localhost:39530`（共享 infra） | 外部工具验证向量库 |
 
-> **端口冲突**：宿主端口固定（前端 8081 / 后端 8000），如需改动 `docker-compose.yml` 的 `ports` 即可；中间件端口由共享 infra 管理，本仓库不涉及。
+> **端口冲突**：宿主端口固定（前端 8081/8443 / 后端 8000），如需改动 `docker-compose.yml` 的 `ports` 即可；中间件端口由共享 infra 管理，本仓库不涉及。
 
 ---
 
@@ -300,13 +313,17 @@ SSE 帧按 `event: <type>\n\ndata: {json}` 格式推送，前端 `useSSE.ts` 逐
 Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `IComplaintService` 等抽象接口，当前 Local 实现直连 MySQL，未来切 Remote（HTTP/gRPC 微服务）**Agent 代码零改动**。
 
 ### 8. 安全与可观测性
+- **安全基线 fail-fast（启动强校验）**：`validate_security_config()` 启动即检——JWT 密钥弱（`change-me` 或 <32 字符）直接拒绝启动（无逃生开关）；admin 密码留空/`admin123` 拒绝启动（仅 `ALLOW_WEAK_ADMIN_PASSWORD=true` **且 `APP_ENV=dev`** 演示逃生，prod 下逃生开关强制失效，防演示便利误入生产）；
+- **admin 口令 env 唯一事实来源**：`_ensure_admin_password()` 启动**无条件同步**——缺 admin 按 env 建，存量任何 hash（含历史未知弱口令）都覆盖为 env 密码；本系统无改密入口，不存在需保留的"用户改密"场景；env 密码空值再次 fail-fast 拒启（双保险）；
+- **HTTPS + 安全头（对外入口 nginx）**：TLSv1.2、HSTS（max-age=1y）、`X-Frame-Options`/`X-Content-Type-Options` 防 clickjacking/MIME 嗅探，`server_tokens off` 隐藏版本；HTTP 全量 301，明文不承载业务；证书自签（`scripts/gen_cert.sh` 可重生成），公网换 Let's Encrypt；
+- **/metrics（Prometheus 文本格式，零依赖）**：LLM 调用量/失败率/延迟、熔断拒绝数、排队超时、会话锁等待 429、意图规则命中率；`GET /metrics` 即可抓取，接入告警（如失败率飙升/熔断 opens）；
 - **三层 Prompt Injection 防护**：预处理正则（零成本拦截）+ prompt 五维度法（结构、边界、权限、数据、应急）+ System Prompt 安全注入；
 - **JWT 认证**：payload 含 role，Admin 接口权限隔离，前端按 role 显隐入口；
 - **JSON 结构化日志**：每个请求 1 进 1 出 + 6 阶段各 1 条 + LLM 调用/DB 操作全埋点，注入 `session_id` / `intent` / `latency_ms`，支持全链路追踪；
 - **会话消息体截断**：`SESSION_MAX_MESSAGES`（默认 40 条）超限截断为「首条 user 消息 + 最近 N-1 条」，防止会话无限增长（LLM/状态机不读消息全文，截断仅影响前端历史展示）。
 
 ### 9. 工程化质量
-- **后端 361 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/token-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、共享熔断 close 仅本地广播方、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、分布式锁（获取/等待/超时/看门狗续期）、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、会话历史/消息截断、contracts 端点；
+- **后端 381 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/token-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、共享熔断 close 仅本地广播方、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、分布式锁（获取/等待/超时/看门狗续期）、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、admin 口令兜底（创建/弱口令 sync/强口令不覆盖）、安全基线校验（弱 JWT/弱 admin 拒绝、逃生放行）、/metrics 埋点（计数器/Summary/格式）、会话历史/消息截断、contracts 端点；
 - **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
 - **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
 
@@ -336,7 +353,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | 向量库 | Milvus + LlamaIndex + bge-small-zh | 知识库派生向量索引，Top-10 → Re-rank Top-3 |
 | LLM | DeepSeek（openai 兼容） | 统一 chat（意图/响应/闲聊/严重性）；资格判定规则化，超时降级 |
 | 网关 | 自研 KeyPool + 熔断 | 多 Key 滑动窗口 RPM + 排队背压 + 指数退避 + 规则引擎兜底 |
-| 测试 | pytest + pytest-asyncio + vitest | 后端 300 / 前端 41，集成测试真实链路可重跑 |
+| 测试 | pytest + pytest-asyncio + vitest | 后端 381 / 前端 41，集成测试真实链路可重跑 |
 
 ---
 
@@ -369,7 +386,9 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | `SESSION_CLEANUP_BATCH_SIZE` | 单批删除行数（控制事务大小） | `500` |
 | `MILVUS_URI` / `MILVUS_COLLECTION` | Milvus 连接 / collection（共享 Milvus 加 `cs_` 前缀隔离） | `http://milvus:19530` / `cs_knowledge` |
 | `RAG_CACHE_TTL` / `INTENT_CACHE_TTL` | RAG 检索缓存 / 意图分类缓存 TTL（秒） | `600` / `60` |
-| `ADMIN_DEFAULT_USERNAME` / `ADMIN_DEFAULT_PASSWORD` | 管理端默认账号 | `admin` / `admin123` |
+| `APP_ENV` | 部署环境 `dev` / `prod`。**生产必设 prod**：prod 下弱口令逃生开关强制失效 | `dev` |
+| `ADMIN_DEFAULT_USERNAME` / `ADMIN_DEFAULT_PASSWORD` | 管理端账号（密码由 env 注入；留空或弱口令时**启动 fail-fast** 拒绝启动；启动时**无条件同步**到数据库，env 是唯一事实来源） | `admin` / 无默认 |
+| `ALLOW_WEAK_ADMIN_PASSWORD` | 演示环境逃生开关：`true` 允许弱 admin 口令启动（**仅 `APP_ENV=dev` 有效**，prod 下设了也拒绝） | `false` |
 
 ---
 
