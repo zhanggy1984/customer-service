@@ -1,6 +1,5 @@
 """上下文装配：把 RAG 检索结果装配成 LLM 可用的政策上下文。"""
-from app.rag.interfaces import source_label
-from app.rag.retriever import retriever
+from app.infrastructure import retriever, source_label
 
 
 async def search_policy_context(query: str) -> tuple[str, list]:

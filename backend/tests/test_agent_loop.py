@@ -51,7 +51,7 @@ async def test_policy_hit_loop(monkeypatch):
         return _resp(tool_calls=[_tool("search_policy", {"query": "退货政策是什么？"})])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("退货政策是什么？", "POLICY_INQUIRY", _Session(), 1)
     assert out["route"] == "policy"
     assert "search_policy" in out["tool_results"]
@@ -78,7 +78,7 @@ async def test_order_query_loop(monkeypatch):
         return _resp(tool_calls=[_tool("query_order", {"order_id": "ORD-1"})])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     # 输入不带订单号（避免触发优化③规则短路），保持"LLM 决策 query_order"语义
     out = await al.run_decision_loop("查询我的订单状态", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"
@@ -92,7 +92,7 @@ async def test_no_tool_direct_reply(monkeypatch):
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         return _resp(content="订单已发货，预计明天送达。")
 
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("我订单到哪了", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"
     assert out["tool_results"] == {}
@@ -122,7 +122,7 @@ async def test_decision_reasoning_aggregated(monkeypatch):
         return _resp(content="基于政策文档回答...", reasoning="工具结果已足够，直接作答。")
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("退货政策是什么？", "POLICY_INQUIRY", _Session(), 1)
     assert out["route"] == "policy"
     assert "search_policy" in out["tool_results"]
@@ -137,7 +137,7 @@ async def test_decision_direct_reply_reasoning(monkeypatch):
     async def fake_chat(messages, model=None, timeout=None, temperature=None, tools=None, tool_choice=None):
         return _resp(content="订单已发货，预计明天送达。", reasoning="用户问物流进度，无工具可查，直接告知。")
 
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("我订单到哪了", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"
     assert out["direct_reply"] == "订单已发货，预计明天送达。"
@@ -157,7 +157,7 @@ async def test_side_effect_guard_routes_business(monkeypatch):
         return _resp(tool_calls=[_tool("create_return_order", {"order_id": "ORD-1", "items": ["SKU-1"]})])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     # 输入不带订单号（避免触发规则短路），保持"LLM 决策副作用工具 → 护栏拦截"语义
     out = await al.run_decision_loop("我要退货", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "business"
@@ -184,7 +184,7 @@ async def test_query_order_missing_id_override(monkeypatch):
         return _resp(tool_calls=[_tool("query_order", {})])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("我有哪些订单", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"
     assert calls["execute"][0][0] == "list_user_orders"
@@ -209,7 +209,7 @@ async def test_max_rounds_exhausted_routes_by_intent(monkeypatch):
         return _resp(tool_calls=[_tool("query_order", {"order_id": oid})])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     monkeypatch.setattr(al.settings, "agent_loop_max_rounds", 2)
     out = await al.run_decision_loop("查订单", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"  # 跑满轮数按已得工具结果路由
@@ -232,7 +232,7 @@ async def test_duplicate_tool_call_deduped(monkeypatch):
         return _resp(tool_calls=[_tool("query_order", {"order_id": "ORD-1"})])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     monkeypatch.setattr(al.settings, "agent_loop_max_rounds", 3)
     # 输入不带订单号（避免触发规则短路），保持"LLM 重复决策 → dedupe"语义
     out = await al.run_decision_loop("查询订单详情", "ORDER_STATUS", _Session(), 1)
@@ -250,7 +250,7 @@ async def test_decision_loop_passes_deepseek_tools_direct(monkeypatch):
         received["tools"] = tools
         return _resp(content="直接作答")
 
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     await al.run_decision_loop("退货政策", "POLICY_INQUIRY", _Session(), 1)
     assert received["tools"] is al.TOOL_SCHEMAS  # 同一对象直传，无二次包装
     assert received["tools"][0]["type"] == "function"
@@ -270,7 +270,7 @@ async def test_force_policy_search_gate(monkeypatch):
         return _resp(content="直接作答")
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     monkeypatch.setattr(al.settings, "agent_loop_force_policy_search", True)
     out = await al.run_decision_loop("退货政策", "POLICY_INQUIRY", _Session(), 1)
     assert "search_policy" in out["tool_results"]
@@ -294,7 +294,7 @@ async def test_trivial_policy_query_rejected(monkeypatch):
         return _resp(tool_calls=[_tool("search_policy", {"query": "退货政策是什么"}, cid="c2")])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("退货政策", "POLICY_INQUIRY", _Session(), 1)
     assert calls["execute"] == 1  # 首轮过短被拒不执行，次轮改写后执行一次
     assert out["route"] == "policy"
@@ -320,7 +320,7 @@ async def test_call_limit_truncates_loop(monkeypatch):
                                  _tool("query_order", {"order_id": "ORD-4"}, cid="c4")])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     monkeypatch.setattr(al.settings, "agent_loop_max_rounds", 2)
     out = await al.run_decision_loop("查订单", "ORDER_STATUS", _Session(), 1)
     assert calls["execute"] == ["ORD-1", "ORD-2", "ORD-3"]  # 第 4 次调用被护栏截断
@@ -346,7 +346,7 @@ async def test_decision_loop_writes_tool_call_log(monkeypatch):
 
     monkeypatch.setattr(al, "write_tool_call", fake_log)  # 覆盖 conftest 的 no-op，改为收集
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     # 输入不带订单号（避免触发规则短路），保持"LLM 循环真执行 → 落库"语义
     out = await al.run_decision_loop("查询订单详情", "ORDER_STATUS", _Session(), 1)
     assert out["route"] == "order"
@@ -382,7 +382,7 @@ async def test_call_limit_truncates_before_final_round(monkeypatch):
         ])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("查订单", "ORDER_STATUS", _Session(), 1)  # 默认 max_rounds=3
     assert calls["execute"] == ["ORD-1", "ORD-2", "ORD-3"]  # 第 4 个被截断
     assert calls["chat"] == 1  # 截断后不再发下一轮 LLM 请求（外层循环被终止）
@@ -412,7 +412,7 @@ async def test_rule_shortcut_order_status_hit(monkeypatch):
         calls["log"].append(kwargs)
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     monkeypatch.setattr(al, "write_tool_call", fake_log)
     out = await al.run_decision_loop("查 ORD-20240801-001", "ORDER_STATUS", _Session(), 1)
     assert calls["chat"] == 0  # 决策轮 LLM 零调用
@@ -450,7 +450,7 @@ async def test_rule_shortcut_not_found_chains_list(monkeypatch):
         calls["log"].append(kwargs)
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     monkeypatch.setattr(al, "write_tool_call", fake_log)
     out = await al.run_decision_loop("查 ORD-999999999", "ORDER_STATUS", _Session(), 1)
     assert calls["execute"] == [("query_order", {"order_id": "ORD-999999999"}),
@@ -482,7 +482,7 @@ async def test_rule_shortcut_miss_falls_back_llm(monkeypatch):
         return _resp(tool_calls=[_tool("search_policy", {"query": "退货政策"})])
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     # POLICY_INQUIRY 带单号 → 不短路（政策侧不接管，防检索 query 改写丢失）
     out = await al.run_decision_loop("ORD-20240801-001 能退吗", "POLICY_INQUIRY", _Session(), 1)
     assert calls["chat"] >= 1  # 走 LLM 决策循环（非短路）
@@ -508,7 +508,7 @@ async def test_rule_shortcut_exception_falls_back_llm(monkeypatch):
         return _resp(content="订单查询暂时不可用")
 
     monkeypatch.setattr(al, "execute", fake_execute)
-    monkeypatch.setattr(al.deepseek_client, "chat", fake_chat)
+    monkeypatch.setattr(al.llm_gateway, "chat", fake_chat)
     out = await al.run_decision_loop("查 ORD-20240801-001", "ORDER_STATUS", _Session(), 1)
     assert calls["execute"][0] == ("query_order", {"order_id": "ORD-20240801-001"})  # 短路先执行
     assert calls["chat"] == 1  # 短路异常 → 回退 LLM 决策循环

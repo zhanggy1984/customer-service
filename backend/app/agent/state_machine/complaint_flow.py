@@ -15,7 +15,7 @@ from app.agent import usage
 from app.agent.state_machine.base import BaseStateMachine
 from app.agent.state_machine.edges import is_deny
 from app.config import settings
-from app.infrastructure.deepseek import deepseek_client
+from app.infrastructure import llm_gateway
 from app.services import complaint_service
 from app.utils.logger import logger
 
@@ -58,7 +58,7 @@ async def _assess_severity(description: str) -> str:
     安全类明确含漏电/起火/鼓包/中毒；LOW 收紧为"无实际损失"。
     """
     try:
-        data = await deepseek_client.chat(
+        data = await llm_gateway.chat(
             [
                 {
                     "role": "system",
