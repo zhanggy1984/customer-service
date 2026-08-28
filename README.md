@@ -53,32 +53,36 @@
 
 ```mermaid
 graph TB
-    WEB["Vue3 + Element Plus 前端（frontend）"]
-    NGINX["nginx :80<br/>静态服务 + /api/v1 反代 + TLS"]
-    GATEWAY["统一 API 网关 api-gateway:8099（共享 infra）<br/>Host 虚拟域名路由 + X-Request-ID traceId<br/>按真实 IP 限流 + SSE 透传"]
-
-    subgraph 交互层[交互层 Interaction]
-        API["FastAPI Agent :8000<br/>REST API + SSE 流式<br/>认证鉴权 / 参数校验 / 结果格式化"]
+    subgraph 客户端入口
+        WEB["Vue3 + Element Plus 前端（frontend）"]
+        NGINX["nginx :80 静态服务 + /api/v1 反代 + TLS"]
+        GATEWAY["统一 API 网关 api-gateway:8099（共享 infra）<br/>Host 虚拟域名路由 + X-Request-ID + 按真实 IP 限流 + SSE 透传"]
     end
-    subgraph 控制层[控制层 Control]
-        ORCH["orchestrator 6 阶段流水线<br/>预处理→意图识别→上下文装配→状态推进→动作执行→SSE 响应"]
-        INTENT["意图分类<br/>deepseek-chat + 规则前置短路"]
-        SM["LangGraph 状态机<br/>退货 / 仅退款 / 投诉（业务动作闭环）"]
-        LOOP["LLM 工具决策循环 + 实时护栏<br/>只读工具自主决策（allow/reject/override）"]
-        RULE["规则引擎兜底<br/>LLM 熔断时 10 条正则接管"]
+    subgraph 交互层["交互层 Interaction · app/api/"]
+        API["FastAPI REST + SSE 流式<br/>认证鉴权 / 参数校验 / 结果格式化"]
     end
-    subgraph 能力层[能力层 Capability]
+    subgraph 控制层["控制层 Control · app/agent/"]
+        ORCH["orchestrator 6 阶段流水线<br/>预处理→意图→上下文→状态推进→动作→SSE"]
+        INTENT["意图分类 + 规则前置短路"]
+        SM["LangGraph 状态机：退货 / 仅退款 / 投诉"]
+        LOOP["LLM 工具决策循环 + 实时护栏"]
+        RULE["规则引擎兜底"]
+    end
+    subgraph 能力层["能力层 Capability · app/services/"]
         SVC["services/interfaces（ABC）<br/>IOrderService / IReturnService / IRefundService / IComplaintService"]
-        IMPL["Local 实现直连资源层<br/>可切 Remote 微服务，Agent 零改动"]
+        IMPL["Local 实现直连资源层<br/>可切 Remote 微服务"]
     end
-    subgraph 资源层[资源层 Resource]
+    subgraph 资源层["资源层 Resource · app/infrastructure/ + rag/ + session/"]
         FACADE["infrastructure 门面<br/>llm_gateway / mysql_pool / retriever / cooldown"]
-        GW["DeepSeek Gateway<br/>多 Key 池化 + RPM + 排队背压 + 熔断"]
-        RAG["RAG 检索<br/>bge-small-zh Embedding + Milvus Top-10 → Re-rank Top-3 → 缓存"]
-        SESS["会话存储<br/>Redis 主存 + MySQL 兜底 + 分布式锁 + 快照"]
-        MYSQL[(MySQL 8<br/>业务事实 + 知识库原文源)]
-        REDIS[(Redis<br/>会话主存 + 缓存 + 锁信号)]
-        MILVUS[(Milvus<br/>知识向量派生索引)]
+        GW["DeepSeek Gateway<br/>多 Key 池化 + 排队背压 + 熔断"]
+        RAG["RAG 检索<br/>Embedding + 重排 + 缓存"]
+        SESS["会话存储 + 分布式锁<br/>Redis 主存 + MySQL 兜底"]
+    end
+    subgraph 外部依赖
+        DS["DeepSeek LLM"]
+        MYSQL[(MySQL 8 业务事实 + 知识库原文源)]
+        REDIS[(Redis 会话主存 + 缓存 + 锁信号)]
+        MILVUS[(Milvus 知识向量派生索引)]
     end
 
     WEB --> NGINX --> GATEWAY
@@ -96,31 +100,41 @@ graph TB
     FACADE --> GW
     FACADE --> RAG
     FACADE --> SESS
-    GW --> MYSQL
+    GW --> DS
     RAG --> MILVUS
     SESS --> REDIS
     SESS --> MYSQL
 ```
 
-**分层架构（四层，单向依赖）**：后端按 **交互 → 控制 → 能力 → 资源** 四层组织——上层依赖下层、下层绝不反向依赖；层间经抽象接口交互，控制权在控制层（能力层与资源层被动响应调用），数据流自上而下单向流动：
+> 箭头即**调用方向**：客户端请求经 nginx → 网关 → 交互层逐层下钻（依赖自交互层单向到资源层），结果自下而上经 SSE 返回；DeepSeek / MySQL / Redis / Milvus 等外部依赖由资源层经门面访问。
 
-| 层 | 职责 | 对齐代码 |
-|----|------|---------|
-| **交互层** | 接收请求、认证鉴权、参数校验、结果格式化 | `app/api/`（REST 路由 / auth / contracts） |
-| **控制层** | 意图理解、对话状态、任务编排、路由到能力层 | `app/agent/`（orchestrator / intent / 状态机 / 决策循环+护栏 / 规则兜底） |
-| **能力层** | 接收控制层指令执行业务操作、返回结果（被动响应） | `app/services/`（interfaces ABC + local 实现） |
-| **资源层** | 工具 / 数据 / 记忆的抽象接口 | `app/infrastructure/`（门面）+ `app/rag/` + `app/session/` |
+### 后端代码分层：四层单向依赖
 
-四个约束在代码中的落地：
+上图一张图同时表达**对外链路**（客户端 → 网关 → 后端）与**后端四层代码分层**。代码组织按"是否有业务语义"切四层，依赖单向、控制权在控制层（能力层与资源层被动响应调用）、数据流自上而下单向流动：
+
+**各层职责与模块归属：**
+
+| 层 | 模块 | 职责 |
+|----|------|------|
+| **交互层** | `app/api/`（routes / auth / deps / contracts） | 接收请求、认证鉴权、参数校验、结果格式化（薄） |
+| **控制层** | `app/agent/`（orchestrator / intent / state_machine / function_calling / rule_engine） | 意图理解、对话状态、任务编排、路由到能力层 |
+| **能力层** | `app/services/`（interfaces ABC + local 实现） | 接收控制层指令执行业务操作、返回结果 |
+| **资源层** | `app/infrastructure/`（门面）+ `app/rag/` + `app/session/` | 工具 / 数据 / 记忆的抽象接口，向外部依赖抽象 |
+
+**四个约束在代码中的落地：**
 
 - **单向依赖**：`api → agent → services → infrastructure`，资源层不反向 import 上层；
 - **依赖抽象**：控制层只经 `infrastructure` 门面访问 `llm_gateway / mysql_pool / retriever`，能力层只依赖 `services/interfaces` 抽象（ABC），不直接引用具体实现；
 - **控制反转**：LangGraph 状态机 + orchestrator 持有控制权，能力/资源组件不主动发起请求，只响应调用；
 - **数据流单向**：`AgentState` 自上而下流转，下层仅返回结果供上层决策，无旁路回调。
 
-**对外链路（统一 API 网关）**：浏览器只访问前端 nginx；nginx 将 `/api/v1` 反代到共享网关 `api-gateway:8099`（`Host: cs.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。宿主端口映射的 backend 地址（如 `localhost:8000`）仅供开发调试直连，绕过网关。
+**演进说明**：分层是随重构逐步收敛的，不是一次性设计——2.4.3 将控制层 8 处对资源层具体实现的直接依赖收敛到 `infrastructure` 统一门面（`llm_gateway / mysql_pool / retriever` 经门面导出，retriever 惰性加载破除导入环），控制层从此只依赖抽象接口；换实现只改门面一处绑定。
 
-**核心链路（以退货为例）**：
+### 对外链路（统一 API 网关）
+
+浏览器只访问前端 nginx；nginx 将 `/api/v1` 反代到共享网关 `api-gateway:8099`（`Host: cs.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。宿主端口映射的 backend 地址（如 `localhost:8000`）仅供开发调试直连，绕过网关。
+
+### 核心链路（以退货为例）
 
 ```
 「我要退货 ORD-20240801-001」
@@ -134,7 +148,9 @@ graph TB
   → 回复：「退货单 RC-xxx 已创建，退款 ¥69.70 将在 1-3 个工作日内原路返回」
 ```
 
-**编排模式：LLM 自主决策 + 规则护栏（P3-P5）**：对订单查询/政策问答两类意图，LLM 带只读工具列表自主决定调哪些工具（`search_policy`/`query_order`/`list_user_orders`），护栏在决策与执行之间做确定性校验（`allow/reject/override` 三态）；业务副作用工具（建退货/退款/投诉单、资格判定）的决策一律被护栏拦截，转由 LangGraph 状态机确定性接手——**决策与执行分离，LLM 不裸调业务动作**。每轮护栏判定落库 `tool_call_log`，为管理侧调用分析预留数据底座。
+### 编排模式：LLM 自主决策 + 规则护栏（P3-P5）
+
+对订单查询/政策问答两类意图，LLM 带只读工具列表自主决定调哪些工具（`search_policy`/`query_order`/`list_user_orders`），护栏在决策与执行之间做确定性校验（`allow/reject/override` 三态）；业务副作用工具（建退货/退款/投诉单、资格判定）的决策一律被护栏拦截，转由 LangGraph 状态机确定性接手——**决策与执行分离，LLM 不裸调业务动作**。每轮护栏判定落库 `tool_call_log`，为管理侧调用分析预留数据底座。
 
 ---
 
@@ -463,6 +479,15 @@ customer-service/
 └── README.md
 ```
 
+**后端代码分层归属**（依赖单向：交互 → 控制 → 能力 → 资源，详见架构章"后端代码分层：四层单向依赖"）：
+
+| 层 | 目录 | 依赖 |
+|----|------|------|
+| 交互层 | `backend/app/api/` | 仅依赖控制层 |
+| 控制层 | `backend/app/agent/` | 依赖能力层 + 资源层门面 |
+| 能力层 | `backend/app/services/` | 依赖资源层门面 |
+| 资源层 | `backend/app/infrastructure/` + `rag/` + `session/` | 不反向依赖上层，经门面访问外部依赖 |
+
 ---
 
 ## 九、测试与验收
@@ -549,6 +574,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.4.4** | 2026-08-28 | README 架构章对齐 good-question 格式：架构图重构为「客户端入口 + 后端四层（每层 subgraph 标注代码目录归属）+ 外部依赖独立 subgraph」，图后补「箭头即调用方向」说明；新增「后端代码分层：四层单向依赖」小节（职责表带模块列 + 四约束落地 + 演进说明）；目录结构后补分层归属总结表；对外链路/核心链路/编排模式升级为小节标题 |
 | **2.4.3** | 2026-08-28 | 资源层门面：infrastructure 统一门面（interfaces 4 Protocol + re-export 单例 llm_gateway/mysql_pool/retriever），agent 7 文件改依赖抽象不依赖实现，retriever 惰性导出破除循环导入，新增门面身份测试；README 架构图重构为四层（交互/控制/能力/资源）+ 职责表 + 目录分层标注，措辞专业化，测试数字统一（386/383/41） |
 | **2.4.2** | 2026-08-28 | 上线前安全加固三件套：JWT/admin 弱口令 fail-fast 拒绝启动（`ALLOW_WEAK_ADMIN_PASSWORD` 逃生开关仅 dev 生效、生产强制失效）、全站 HTTPS + 自签证书 + 80→443 跳转、Prometheus `/metrics` 指标导出；GitHub Actions CI 门禁（backend pytest + frontend vitest/build，dev/main/PR 全触发）；多副本状态外置实测：compose backend 去固定容器名/宿主端口（静态端口与 `--scale` 冲突）、原容器名改网络别名 + 共享网关 DNS 多 IP 自动轮询（网关配置零改动），`verify_multinode.py` 四层验证（部署可达 / 锁互斥跨进程 / 端到端并发 / 熔断广播）实测 11 PASS；测试收敛 CI 环境隐式依赖（BGE tokenizer 全局 mock、admin 密码测试自包含 mock） |
 | **2.4.0** | 2026-08-26 | 统一 API 网关接入：前端 nginx 改反代共享网关 `api-gateway:8099`（Host: cs.local），网关负责 X-Request-ID traceId 根生成（后端日志 `trace_id` 对齐）、按真实 IP 限流（cs_chat 2r/s + cs_auth 5r/m 接管登录限流）、SSE 透传；DeepSeek thinking 参数化（意图分类/投诉评估关闭省思考 token）+ reasoning 事件全链路展示（决策非流式全文 / 生成流式增量）+ 前端思考/来源折叠；检索来源 `[来源N]` 上下文序号化 + 前端来源内容展示；测试扩充至 369 项 |
