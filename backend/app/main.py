@@ -64,7 +64,7 @@ async def trace_middleware(request: Request, call_next):
     return response
 
 
-app.include_router(auth.router, prefix="/api/v1")
+app.include_router(auth.router, prefix="/api")  # T15：登录路由统一 /api/auth/login（与 gq/cc 一致）
 app.include_router(routes.router, prefix="/api/v1")
 app.include_router(contracts.router, prefix="/api")
 

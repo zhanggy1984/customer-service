@@ -25,7 +25,7 @@
 - 编写 `backend/sql/init.sql`：
   - 建表：users、orders、order_items、return_orders、refund_orders、complaint_tickets、conversation_history
   - return_orders 加 `UNIQUE(order_id, user_id)` 约束
-  - 种子数据：admin（密码 admin123 bcrypt 预生成 hash）、user_1、user_2 + 5 个订单 + 8 种商品明细
+  - 种子数据：admin（密码 123456 bcrypt 预生成 hash）、user_1、user_2 + 5 个订单 + 8 种商品明细
   - order_items 含 `status` 字段（NORMAL / RETURN_REQUESTED / RETURNED / REFUNDED）
 - 编写 `backend/app/infrastructure/mysql.py`：asyncmy 连接池（pool_size=20, overflow=40，从 .env 读）
 
