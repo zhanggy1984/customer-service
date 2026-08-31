@@ -193,6 +193,8 @@ npm run build             # 生产：构建产物挂载到 nginx
 # 或 npm run dev           # 开发热更新（proxy /api → backend:8000，访问 http://localhost:5173）
 ```
 
+> ⚠️ **改过 `frontend/src/` 后必须重新 `npm run build`**——dist 挂载 nginx volume，旧构建不生效（T15 实测：`/api/auth/login` 路由统一后旧 dist 仍请求 `/api/v1/auth/login` → 登录 404）。
+
 **跑起来了**：浏览器打开 **https://localhost:8443**（HTTP 8081 自动 301 到 HTTPS），用预置账号登录。浏览器首次访问自签证书会提示不受信任，点「高级 → 继续访问」即可（公网部署换正式证书后无此提示）。
 
 | 角色 | 账号 | 密码 | 可做什么 |
