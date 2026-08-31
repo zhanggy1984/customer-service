@@ -117,6 +117,14 @@ class LocalReturnService(IReturnService):
         if order.status == "CANCELLED":
             return {"eligible": False, "reason": "订单已取消，无法操作", "refund_amount": 0.0, "items": []}
         if order.status == "PAID":
+            # 未发货可仅退款，但定制类(returnable=false)商品本身不可退：显式列出，避免只给
+            # 通用话术误导（评测 3139 实测：问"定制支架能退吗"只答"建议仅退款"漏关键信息）。
+            non_refundable = [it for it in order.items if not it.returnable and it.status == "NORMAL"]
+            if non_refundable:
+                names = "、".join(it.name for it in non_refundable)
+                return {"eligible": False,
+                        "reason": f"订单未发货。其中{names}为定制商品，不支持退货退款；其余商品可申请仅退款",
+                        "refund_amount": 0.0, "items": []}
             return {"eligible": False, "reason": "订单未发货，建议申请仅退款", "refund_amount": 0.0, "items": []}
         if order.status == "SHIPPED":
             return {"eligible": False, "reason": "订单运输中，请先拒收或等待签收后走退货", "refund_amount": 0.0, "items": []}

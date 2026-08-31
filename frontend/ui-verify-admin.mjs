@@ -21,7 +21,7 @@ async function main() {
     await page.goto(`${BASE}/login`)
     await page.waitForSelector('text=智能客服', { timeout: 15000 })
     await page.fill('input[placeholder="请输入用户名"]', 'admin')
-    await page.fill('input[placeholder="请输入密码"]', 'admin123')
+    await page.fill('input[placeholder="请输入密码"]', '123456')
     await page.click('button.submit')
     await page.waitForURL('**/chat', { timeout: 15000 })
     step('admin 登录', true)

@@ -46,6 +46,10 @@ services:
       - TRANSFORMERS_OFFLINE=1
     # 多副本 scale：无固定容器名/宿主端口（静态端口与 --scale 冲突）；原容器名作
     # 网络别名，共享网关按 DNS 多 IP 自动轮询（网关配置零改动）
+    # ⚠️ 本地单副本调试用：暴露 8000:8000 供平台直连探测；会破坏 --scale 多副本语义，
+    #    仅限本地开发，生产部署务必移除。端口 8000 与 cc(8003)/gq(8080)/sp(18002) 互不冲突。
+    ports:
+      - "8000:8000"
     volumes:
       - hf_cache:/root/.cache/huggingface
     restart: unless-stopped

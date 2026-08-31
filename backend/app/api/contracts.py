@@ -17,7 +17,7 @@ MANIFEST = {
         {"name": "chat", "path": "/api/v1/sessions/{sid}/messages", "method": "POST",
          "contract_type": "sse", "llm": True,
          "description": "客服会话对话（SSE 流式，透出 token/usage/done；token 事件含 content+delta 双字段，平台 field_map 可映射 answer）"},
-        {"name": "login", "path": "/api/v1/auth/login", "method": "POST",
+        {"name": "login", "path": "/api/auth/login", "method": "POST",
          "llm": False, "description": "会话鉴权（辅助接口）"},
     ],
     "scenes": [
@@ -28,8 +28,10 @@ MANIFEST = {
     ],
     "contract": {
         "type": "sse", "timeout": 120,
+        # SSE 事件名映射：agent 用 token 事件承载最终答案，平台据此采集 answer
+        "sse": {"field_map": {"token": "answer"}},
         "prepare": [
-            {"name": "login", "method": "POST", "path": "/api/v1/auth/login",
+            {"name": "login", "method": "POST", "path": "/api/auth/login",
              "body": {"username": "{{auth.username}}", "password": "{{auth.password}}"},
              "extract": {"token": "access_token"}},
             # 建 session 返回 {session_id}（非 id）：extract 指定映射

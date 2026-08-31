@@ -300,7 +300,7 @@ conversation_history(id, session_id, user_id, intent, messages, agent_state, sum
 
 两个普通用户（user_1、user_2）各自归各自订单，测试用户隔离：user_2 不能退 user_1 的订单。
 
-admin 账号密码 `admin123`，bcrypt 预生成 hash 写入 init.sql。
+admin 账号密码 `123456`，bcrypt 预生成 hash 写入 init.sql。
 
 ### ABC 接口 + Local 实现（校验 order_items.status 防重复退）+ 写入重试 + 依赖注入
 
@@ -474,7 +474,7 @@ CHROMA_PERSIST_DIR=./data/chroma
 CHROMA_HOST=chroma   # 空=嵌入式 PersistentClient；非空=HttpClient 连独立 chroma 服务
 CHROMA_PORT=8000
 RAG_CACHE_TTL=600 / INTENT_CACHE_TTL=60
-ADMIN_DEFAULT_USERNAME=admin / ADMIN_DEFAULT_PASSWORD=admin123
+ADMIN_DEFAULT_USERNAME=admin / ADMIN_DEFAULT_PASSWORD=123456
 ```
 
 ---
@@ -604,7 +604,7 @@ pytest tests/ -v
 ### 已实现并验证（2026-08-07）
 
 - 服务栈 nginx/backend/redis/mysql 全部运行；`/healthz` OK
-- MySQL 种子数据 3 用户 + 5 订单 + 8 商品明细（admin/admin123、user_1/user_2 密码 123456）
+- MySQL 种子数据 3 用户 + 5 订单 + 8 商品明细（admin/123456、user_1/user_2 密码 123456）
 - JWT 注册/登录（payload 含 role），admin 种子账号登录 OK
 - Redis 会话 TTL 3600s 滑动过期（已验证）
 - 简单对话 → DeepSeek 真实调用（4 个 key 已配置）中文回复 OK
