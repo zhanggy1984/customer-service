@@ -12,12 +12,12 @@ from app.agent import usage
 from app.agent.state_machine.complaint_flow import ComplaintFlow
 from app.infrastructure.mysql import mysql_pool
 
-BASE = "http://localhost:8000/api/v1"
+BASE = "http://localhost:8000/api/auth"  # T15：登录路由统一 /api/auth/login
 
 
 async def _get_user_id() -> int:
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(BASE + "/auth/login", json={"username": "cs_verify", "password": "verify123456"})
+        r = await c.post(BASE + "/login", json={"username": "cs_verify", "password": "verify123456"})
         r.raise_for_status()
         return r.json()["user"]["id"]
 
