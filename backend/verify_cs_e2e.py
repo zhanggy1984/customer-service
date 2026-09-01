@@ -14,7 +14,8 @@ import json
 
 import httpx
 
-BASE = "http://localhost:8000/api/v1"
+# T15 契约：auth 挂 /api/auth/*，sessions 挂 /api/v1/*，故 BASE=/api 再按段拼接
+BASE = "http://localhost:8000/api"
 USER = "cs_verify"
 PASS = "verify123456"
 
@@ -36,7 +37,7 @@ async def _register_login() -> str:
 
 
 async def _new_session(token: str) -> str:
-    r = await _post("/sessions", {}, token)
+    r = await _post("/v1/sessions", {}, token)
     r.raise_for_status()
     return r.json()["session_id"]
 
@@ -47,7 +48,7 @@ async def _send(token: str, sid: str, content: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=90) as c:
         async with c.stream(
             "POST",
-            f"{BASE}/sessions/{sid}/messages",
+            f"{BASE}/v1/sessions/{sid}/messages",
             json={"content": content},
             headers={"Authorization": f"Bearer {token}"},
         ) as resp:
