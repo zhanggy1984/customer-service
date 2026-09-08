@@ -20,7 +20,16 @@ from app.utils.logger import logger
 
 
 class LLMUnavailableError(Exception):
-    """LLM 调用失败（网络/超时/重试耗尽）。"""
+    """LLM 调用失败（网络/超时/重试耗尽）。
+
+    error_type（可选，v 观测带出）：网关内部把 429/5xx/timeout/network 折叠为本异常
+    前，把**最后一次**失败类别经此字段带出（§11.3 cs llm_call 分型）——外层打点
+    record_llm 直接读，不再二次猜。不传 = 非打点场景（熔断前置拒绝等）默认 None。
+    """
+
+    def __init__(self, message: str, *, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class StreamInterruptedError(LLMUnavailableError):
@@ -38,6 +47,35 @@ class CapacityExceededError(Exception):
 
 class AllKeysDownError(Exception):
     """全部 Key 冷却，触发熔断降级。"""
+
+
+def _obs_sdk():
+    """惰性取已 init 的 obs_sdk：未安装 / 未 init 返回 None（观测边带，测试免装依赖）。
+
+    cs init 只在 lifespan 里 config.obs_ready 且 init 成功才置位 → is_initialized 即
+    隐含 config gate；这里不再重复读 settings。llm_call 出口打点（§11.3 cs #3）。
+    """
+    try:
+        import obs_sdk
+    except ImportError:
+        return None
+    return obs_sdk if obs_sdk.is_initialized() else None
+
+
+def _llm_error_type(exc: Exception, default: str) -> str:
+    """异常 → llm_call error_type（平台聚类用自由字符串，§2.5 全集 + 业务扩展）。
+
+    网关内部折叠后经异常 error_type 带出的类别优先（429/5xx/timeout/network 由 _call/
+    _stream 在最终 raise 前刻入）；无带出（本地排队/全冷却）按类映射，仍无则用 default。
+    """
+    et = getattr(exc, "error_type", None)
+    if et:
+        return et
+    if isinstance(exc, AllKeysDownError):
+        return "ALL_KEYS_DOWN"
+    if isinstance(exc, CapacityExceededError):
+        return "QUEUE_TIMEOUT"
+    return default
 
 
 # LLM 网关熔断（仿 services/retry.py 的 DB _breaker 模式）：累计"一次逻辑调用彻底失败"
@@ -153,18 +191,39 @@ class DeepSeekGateway:
             logger.warning("event=queue_wait_timeout")
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
         t0 = time.monotonic()
+        obs = _obs_sdk()  # 观测边带（§11.3 cs #3）；未装/未 init = None，下方零开销直通
         try:
             result = await self._call(messages, model, timeout, temperature, tools, tool_choice, thinking)
             await self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
             self._record_call(model, t0, ok=True)
+            if obs is not None:  # llm_call ok：usage 从非流式响应顶层 usage 取（含 cache 字段，消费端只读 3 键）
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "ok",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    usage=(result.get("usage") or None),
+                )
             return result
-        except LLMUnavailableError:
+        except LLMUnavailableError as exc:
             self._record_call(model, t0, ok=False)
             await self._breaker_fail()  # 网络/超时/重试耗尽 → 累计；AllKeysDown/Capacity 不累计
+            if obs is not None:  # 先记 error 再抛（§2.4 前提）：失败类别由 _call 经 exc.error_type 带出
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "error",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    error_type=_llm_error_type(exc, "LLM_ERROR"),
+                    error_msg=str(exc),
+                )
             raise
-        except (AllKeysDownError, CapacityExceededError):
+        except (AllKeysDownError, CapacityExceededError) as exc:
             # 无 healthy Key / 排队超时：调用未成功，计失败指标（非网络故障，不累计熔断）
             self._record_call(model, t0, ok=False)
+            if obs is not None:
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "error",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    error_type=_llm_error_type(exc, "LLM_ERROR"),
+                    error_msg=str(exc),
+                )
             raise
         finally:
             self._semaphore.release()
@@ -197,6 +256,7 @@ class DeepSeekGateway:
             payload["tool_choice"] = tool_choice
         request_timeout = timeout or settings.deepseek_timeout_chat
 
+        last_fail_type: str | None = None  # 最后一次失败类别：换 Key 重试耗尽后带出（§11.3 cs #3）
         for attempt in range(3):  # 换 Key 最多重试 2 次
             key = await self._pool.select_key()
             if key is None:
@@ -223,22 +283,29 @@ class DeepSeekGateway:
                     retry_after = int(resp.headers.get("retry-after", "30") or 30)
                     logger.warning("event=llm_429", extra={"key_index": key.index, "retry_after": retry_after})
                     await key.mark_rate_limited(retry_after)
+                    last_fail_type = f"HTTP_{resp.status_code}"
                     await self._backoff_sleep(attempt)
                     continue  # 冷却后换 Key
                 if resp.status_code >= 500:
                     logger.warning("event=llm_5xx", extra={"key_index": key.index, "status": resp.status_code})
+                    last_fail_type = f"HTTP_{resp.status_code}"
                     await self._backoff_sleep(attempt)
                     continue  # 服务端错误换 Key
                 resp.raise_for_status()  # 其他 4xx（参数错误等）不重试
             except httpx.TimeoutException:
                 logger.error("event=llm_timeout", extra={"attempt": attempt})
+                last_fail_type = "TIMEOUT"
                 break  # 超时不重试
             except httpx.HTTPError as exc:
                 logger.error("event=llm_http_error", extra={"attempt": attempt, "error": str(exc)})
+                last_fail_type = (
+                    f"HTTP_{exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError)
+                    else "NETWORK"  # 连接级失败（非超时/非状态码）
+                )
                 await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
                 continue
 
-        raise LLMUnavailableError("LLM 调用失败，请稍后重试")
+        raise LLMUnavailableError("LLM 调用失败，请稍后重试", error_type=last_fail_type or "LLM_ERROR")
 
     async def chat_stream(
         self,
@@ -272,19 +339,43 @@ class DeepSeekGateway:
             logger.warning("event=queue_wait_timeout")
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
         t0 = time.monotonic()
+        obs = _obs_sdk()  # 观测边带（§11.3 cs #3）；未装/未 init = None，下方零开销直通
+        usage: dict | None = None  # 流末 usage chunk（include_usage）→ llm_call ok 的 token 计数
         try:
             async for item in self._stream(messages, model, timeout, temperature):
+                if item[1]:  # (delta, usage, reasoning)：usage 仅最后 chunk 携带
+                    usage = item[1]
                 yield item
             await self._breaker_reset()  # 正常流结束 → 成功
             self._record_call(model, t0, ok=True)
-        except StreamInterruptedError:
+            if obs is not None:
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "ok",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    usage=usage,
+                )
+        except StreamInterruptedError as exc:
             # 已产出首个 delta 后的流中断：连接级抖动/用户断连，非网关整体故障，不累计熔断
             # （挑战1：单次长流中途断不应误熔断全网关）。仍冒泡给上层规则引擎兜底。
             self._record_call(model, t0, ok=False)
+            if obs is not None:  # 先记 error 再抛（§2.4 前提）
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "error",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    error_type="STREAM_INTERRUPTED",
+                    error_msg=str(exc),
+                )
             raise
-        except LLMUnavailableError:
+        except LLMUnavailableError as exc:
             self._record_call(model, t0, ok=False)
             await self._breaker_fail()
+            if obs is not None:
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "error",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    error_type=_llm_error_type(exc, "LLM_ERROR"),
+                    error_msg=str(exc),
+                )
             raise
         finally:
             self._semaphore.release()
@@ -310,6 +401,7 @@ class DeepSeekGateway:
             payload["temperature"] = temperature
         request_timeout = timeout or settings.deepseek_timeout_chat
 
+        last_fail_type: str | None = None  # 未进内容流阶段的最后失败类别（换 Key 重试耗尽后带出）
         for attempt in range(3):  # 换 Key 最多重试 2 次
             key = await self._pool.select_key()
             if key is None:
@@ -335,15 +427,17 @@ class DeepSeekGateway:
                                 "event=llm_429", extra={"key_index": key.index, "retry_after": retry_after}
                             )
                             await key.mark_rate_limited(retry_after)
+                            last_fail_type = f"HTTP_{resp.status_code}"
                             await self._backoff_sleep(attempt)
                             continue
                         if resp.status_code >= 500:
                             logger.warning(
                                 "event=llm_5xx", extra={"key_index": key.index, "status": resp.status_code}
                             )
+                            last_fail_type = f"HTTP_{resp.status_code}"
                             await self._backoff_sleep(attempt)
                             continue
-                        resp.raise_for_status()
+                        resp.raise_for_status()  # 其他 4xx：HTTPStatusError → 下方 HTTPError 分支
 
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
@@ -386,6 +480,7 @@ class DeepSeekGateway:
                 )
                 if started:
                     raise StreamInterruptedError("LLM 流式中断") from None
+                last_fail_type = "TIMEOUT"
                 continue  # 未流出内容，可换 Key 重试
             except httpx.HTTPError as exc:
                 logger.error(
@@ -394,7 +489,11 @@ class DeepSeekGateway:
                 )
                 if started:
                     raise StreamInterruptedError("LLM 流式中断") from None
+                last_fail_type = (
+                    f"HTTP_{exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError)
+                    else "NETWORK"  # 连接级失败（非超时/非状态码）
+                )
                 await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
                 continue
 
-        raise LLMUnavailableError("LLM 调用失败，请稍后重试")
+        raise LLMUnavailableError("LLM 调用失败，请稍后重试", error_type=last_fail_type or "LLM_ERROR")

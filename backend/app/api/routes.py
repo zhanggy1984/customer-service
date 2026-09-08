@@ -110,6 +110,9 @@ async def send_message(
         task = asyncio.create_task(run_and_finish())
         while True:
             if await request.is_disconnected():
+                # 观测：断连经 request.state.obs_aborted 置位 → obs 中间件记 error+CLIENT_DISCONNECT
+                # （HTTP 200 不足以表达"未拿到完整响应"）；正常收尾不置位。
+                request.state.obs_aborted = True
                 task.cancel()
                 break
             try:

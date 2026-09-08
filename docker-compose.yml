@@ -37,6 +37,12 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.backend
+      # obs-sdk named context：观测 SDK 源码（归属 agent-evaluation-online 仓 sdk/，§11.3 接入）。
+      # 构建期经 BuildKit 独立 context 注入镜像（Dockerfile COPY --from=obs-sdk），
+      # 无需改动本仓目录结构。绝对路径针对本地共享 infra；换机/CI 部署时改相对 compose 的
+      # ../agent-evaluation-online/sdk 或注入环境变量。
+      additional_contexts:
+        obs-sdk: D:/study/aiprojcet/agent-evaluation-online/sdk
     env_file:
       - .env
     environment:
