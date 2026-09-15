@@ -11,6 +11,8 @@
 全程 monkeypatch _obs_sdk / _call / _stream，不触真实 HTTP、不依赖 sdk 安装、不依赖 Redis
 （各用例单次失败熔断计数 < 阈值 2，不触发 cooldown 广播）。
 """
+import asyncio
+
 import pytest
 
 from app.config import settings
@@ -121,6 +123,113 @@ async def test_chat_obs_error_type_breaker_classes(monkeypatch):
         await gw.chat([{"role": "user", "content": "hi"}])
     assert fake.calls[1]["status"] == "error"
     assert fake.calls[1]["error_type"] == "llm_other"
+
+
+# ---------- chat（非流式）的取消窗口 ----------
+#
+# 三处窗口**各自独立**，必须各自驱动：只驱动一处时，删掉另两处的守卫全量仍全绿
+# （sp 侧同批已踩过一次）。上游触发同为客户断连（starlette 取消请求任务）。
+#
+# **驱动方式必须是「等到确已到达窗口」的事件，不能数 `sleep(0)` 轮数**（首版即踩）：
+# 数轮数时取消可能落在 `_breaker_open` / 信号量 `wait_for` 上——那两处在主 try **之外**，
+# 关掉守卫也照样「不落账」，用例于是**因驱动未就位而红**（实测 5 轮后 `_call` 尚未进入），
+# 与它要测的窗口无关。事件驱动同时给出「前提成立」的正面证据。
+
+
+@pytest.mark.asyncio
+async def test_chat_cancelled_on_breaker_reset_still_records_ok(monkeypatch):
+    """窗口①：响应已到手、取消落在 `await self._breaker_reset()` ⇒ 仍须记 ok，且只有一条。
+
+    记账原先排在 `_breaker_reset` **之后** ⇒ 取消时这条**成功**调用零账面。
+    """
+    fake = _FakeObs()
+    monkeypatch.setattr(dgw, "_obs_sdk", lambda: fake)
+    gw = _mk_gateway()
+    never = asyncio.Event()
+    at_window = asyncio.Event()
+
+    async def _hang():
+        at_window.set()  # 正面证据：确已停在本窗口
+        await never.wait()  # 永不返回 ⇒ 取消必然落在本 await 上
+
+    async def fake_call(*a, **kw):
+        return {"content": "ok", "usage": {"total_tokens": 7}}
+
+    monkeypatch.setattr(gw, "_call", fake_call)
+    monkeypatch.setattr(gw, "_breaker_reset", _hang)
+    task = asyncio.create_task(gw.chat([{"role": "user", "content": "hi"}]))
+    await asyncio.wait_for(at_window.wait(), timeout=5)
+    assert not task.done(), "前提：确实停在 _breaker_reset，而非提前结束"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(fake.calls) == 1, "一次调用一条账（既不能丢，也不能被取消守卫重复记）"
+    assert fake.calls[0]["status"] == "ok", "调用已成功 ⇒ 取消不得把它记成 error"
+    assert fake.calls[0]["usage"]["total_tokens"] == 7
+
+
+@pytest.mark.asyncio
+async def test_chat_cancelled_on_breaker_fail_still_records_error(monkeypatch):
+    """窗口②：失败已判定、取消落在 `await self._breaker_fail()` ⇒ 仍须记 error，且只有一条。
+
+    记账原先排在该 await **之后** ⇒ 取消时账目半截（一次调用零记录）。
+    """
+    fake = _FakeObs()
+    monkeypatch.setattr(dgw, "_obs_sdk", lambda: fake)
+    gw = _mk_gateway()
+    never = asyncio.Event()
+    at_window = asyncio.Event()
+
+    async def _hang():
+        at_window.set()  # 正面证据：确已停在本窗口
+        await never.wait()
+
+    async def fake_call(*a, **kw):
+        raise LLMUnavailableError("失败", error_type="HTTP_503")
+
+    monkeypatch.setattr(gw, "_call", fake_call)
+    monkeypatch.setattr(gw, "_breaker_fail", _hang)
+    task = asyncio.create_task(gw.chat([{"role": "user", "content": "hi"}]))
+    await asyncio.wait_for(at_window.wait(), timeout=5)
+    assert not task.done(), "前提：确实停在 _breaker_fail，而非提前结束"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(fake.calls) == 1, "取消不得让这条 error 丢失，也不得重复记"
+    assert fake.calls[0]["status"] == "error"
+    assert fake.calls[0]["error_type"] == "llm_other", "折叠进平台白名单，不引入新词"
+
+
+@pytest.mark.asyncio
+async def test_chat_cancelled_inside_call_still_records_error(monkeypatch):
+    """窗口③：取消落在 `_call` 内部（换 Key 的退避等待）⇒ 两个 except 都接不住，须补记 error。
+
+    退避实测 `_LLM_RETRY_BACKOFF = (0.1, 0.2)` —— 窗口**窄于** sp 侧（0.5~4s），但机理同形：
+    CancelledError 承 BaseException，不落进上面两个具体 except ⇒ 原先整条 llm_call 静默消失。
+    """
+    fake = _FakeObs()
+    monkeypatch.setattr(dgw, "_obs_sdk", lambda: fake)
+    gw = _mk_gateway()
+    never = asyncio.Event()
+    at_window = asyncio.Event()
+
+    async def fake_call(*a, **kw):
+        at_window.set()  # 正面证据：确已进入 _call
+        await never.wait()  # 等价于悬在 _backoff_sleep 上
+
+    monkeypatch.setattr(gw, "_call", fake_call)
+    task = asyncio.create_task(gw.chat([{"role": "user", "content": "hi"}]))
+    await asyncio.wait_for(at_window.wait(), timeout=5)
+    assert not task.done(), "前提：确实悬在 _call 内，而非提前结束"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(fake.calls) == 1, "整条 llm_call 原会静默消失"
+    assert fake.calls[0]["status"] == "error"
+    assert fake.calls[0]["error_type"] == "llm_other"
 
 
 # ---------- chat_stream 出口打点 ----------

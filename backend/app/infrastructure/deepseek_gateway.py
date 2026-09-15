@@ -209,9 +209,9 @@ class DeepSeekGateway:
             raise CapacityExceededError("系统繁忙，请稍后再试") from None
         t0 = time.monotonic()
         obs = _obs_sdk()  # 观测边带（§11.3 cs #3）；未装/未 init = None，下方零开销直通
+        recorded = False  # 已记账标志：取消守卫据此避免重复记（见下方 except asyncio.CancelledError）
         try:
             result = await self._call(messages, model, timeout, temperature, tools, tool_choice, thinking)
-            await self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
             self._record_call(model, t0, ok=True)
             if obs is not None:  # llm_call ok：usage 从非流式响应顶层 usage 取（含 cache 字段，消费端只读 3 键）
                 obs.record_llm(
@@ -219,10 +219,11 @@ class DeepSeekGateway:
                     duration_ms=int((time.monotonic() - t0) * 1000),
                     usage=(result.get("usage") or None),
                 )
+            recorded = True  # 记账已提到 await 之前：取消落在 _breaker_reset 上时账目已完整
+            await self._breaker_reset()  # 一次逻辑调用成功（含换 Key 重试后成功）→ 重置计数
             return result
         except LLMUnavailableError as exc:
             self._record_call(model, t0, ok=False)
-            await self._breaker_fail()  # 网络/超时/重试耗尽 → 累计；AllKeysDown/Capacity 不累计
             if obs is not None:  # 先记 error 再抛（§2.4 前提）：失败类别由 _call 经 exc.error_type 带出
                 obs.record_llm(
                     model or settings.deepseek_model_chat, "error",
@@ -230,11 +231,28 @@ class DeepSeekGateway:
                     error_type=_llm_error_type(exc, "LLM_ERROR"),
                     error_msg=str(exc),
                 )
+            recorded = True  # 同上：记账先于下面的 await
+            await self._breaker_fail()  # 网络/超时/重试耗尽 → 累计；AllKeysDown/Capacity 不累计
             raise
         except (AllKeysDownError, CapacityExceededError) as exc:
             # 无 healthy Key / 排队超时：调用未成功，计失败指标（非网络故障，不累计熔断）
             self._record_call(model, t0, ok=False)
             if obs is not None:
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "error",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    error_type=_llm_error_type(exc, "LLM_ERROR"),
+                    error_msg=str(exc),
+                )
+            recorded = True
+            raise
+        except asyncio.CancelledError as exc:
+            # 取消窗口（源头与流式侧同为客户断连）：取消落在 `_call` 内部（含换 Key 的退避等待
+            # `_backoff_sleep`/退避 sleep）时，CancelledError 承 BaseException，上面两个 except 都
+            # 接不住 ⇒ 原先直接冲出本函数，**整条 llm_call 静默消失**。上面两条分支的记账已提到各自
+            # await 之前（recorded 置位），故此处只在「一次都没记过」时补 —— 本调用确实一次都没成功，
+            # 记 ok 是假成功。error_type 经 _llm_error_type 折叠进平台白名单，不引入新词。
+            if not recorded and obs is not None:
                 obs.record_llm(
                     model or settings.deepseek_model_chat, "error",
                     duration_ms=int((time.monotonic() - t0) * 1000),
