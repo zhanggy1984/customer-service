@@ -4,9 +4,9 @@
 语义不变即证明观测不掺入主链路）；本文件只验证**启用观测**分支：
 - chat 成功：record_llm ok + usage（非流式响应顶层 usage）透传
 - chat 失败：先记 error 再抛（§2.4 前提）；error_type 分型——真实 _call 折叠 5xx 重试耗尽
-  经 exc.error_type=HTTP_503 带出（验证 #86 核心改动），熔断类按类映射
+  经 exc.error_type=HTTP_503 带出（验证 #86 核心改动），熔断类按类映射，**上报前折叠进平台白名单**
 - chat_stream 成功：流末 usage chunk → ok 打点，观测不吞/改流事件
-- chat_stream 中断：StreamInterruptedError → STREAM_INTERRUPTED；LLMUnavailableError → error_type
+- chat_stream 中断：StreamInterruptedError → llm_connection；LLMUnavailableError → error_type 折叠进白名单
 
 全程 monkeypatch _obs_sdk / _call / _stream，不触真实 HTTP、不依赖 sdk 安装、不依赖 Redis
 （各用例单次失败熔断计数 < 阈值 2，不触发 cooldown 广播）。
@@ -73,7 +73,7 @@ async def test_chat_obs_records_ok_with_usage(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_obs_error_type_http_5xx_via_real_call(monkeypatch):
-    """真实 _call 折叠 5xx 重试耗尽 → LLMUnavailableError(error_type=HTTP_503) → 先记 error 再抛。
+    """真实 _call 折叠 5xx 重试耗尽 → LLMUnavailableError(error_type=HTTP_503) → 先记 error 再抛（折叠为 llm_other）。
 
     验证 #86 核心链路：_call 在最终 raise 前把最后一次失败类别刻入异常，chat 外层
     record_llm 读 exc.error_type，不再二次猜。
@@ -92,14 +92,14 @@ async def test_chat_obs_error_type_http_5xx_via_real_call(monkeypatch):
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["status"] == "error"
-    assert call["error_type"] == "HTTP_503", "last_fail_type 折叠 5xx → HTTP_503 带出"
+    assert call["error_type"] == "llm_other", "5xx 无对应白名单词，带出后折叠为 llm_other"
     assert "LLM 调用失败" in call["error_msg"]
     assert call["usage"] is None
 
 
 @pytest.mark.asyncio
 async def test_chat_obs_error_type_breaker_classes(monkeypatch):
-    """_call 抛熔断类异常（无 error_type 字段）→ 按类映射 ALL_KEYS_DOWN / QUEUE_TIMEOUT。"""
+    """_call 抛熔断类异常（无 error_type 字段）→ 按类映射后仍折叠进白名单（均 llm_other）。"""
     fake = _FakeObs()
     monkeypatch.setattr(dgw, "_obs_sdk", lambda: fake)
     gw = _mk_gateway()
@@ -111,7 +111,7 @@ async def test_chat_obs_error_type_breaker_classes(monkeypatch):
     with pytest.raises(AllKeysDownError):
         await gw.chat([{"role": "user", "content": "hi"}])
     assert fake.calls[0]["status"] == "error"
-    assert fake.calls[0]["error_type"] == "ALL_KEYS_DOWN"
+    assert fake.calls[0]["error_type"] == "llm_other"
 
     async def fake_capacity(*a, **kw):
         raise CapacityExceededError("系统繁忙")
@@ -120,7 +120,7 @@ async def test_chat_obs_error_type_breaker_classes(monkeypatch):
     with pytest.raises(CapacityExceededError):
         await gw.chat([{"role": "user", "content": "hi"}])
     assert fake.calls[1]["status"] == "error"
-    assert fake.calls[1]["error_type"] == "QUEUE_TIMEOUT"
+    assert fake.calls[1]["error_type"] == "llm_other"
 
 
 # ---------- chat_stream 出口打点 ----------
@@ -149,7 +149,7 @@ async def test_chat_stream_obs_records_ok_with_stream_usage(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_stream_obs_interrupt_records_then_raises(monkeypatch):
-    """流中断（已产出首个 delta）→ 先记 error+STREAM_INTERRUPTED 再抛（§2.4 前提）。"""
+    """流中断（已产出首个 delta）→ 先记 error（折叠 llm_connection）再抛（§2.4 前提）。"""
     fake = _FakeObs()
     monkeypatch.setattr(dgw, "_obs_sdk", lambda: fake)
     gw = _mk_gateway()
@@ -165,13 +165,13 @@ async def test_chat_stream_obs_interrupt_records_then_raises(monkeypatch):
             got.append(item)
     assert [i[0] for i in got] == ["部分"], "已流出内容保留、先记再抛"
     assert fake.calls[0]["status"] == "error"
-    assert fake.calls[0]["error_type"] == "STREAM_INTERRUPTED"
+    assert fake.calls[0]["error_type"] == "llm_connection"
     assert fake.calls[0]["error_msg"] == "LLM 流式中断"
 
 
 @pytest.mark.asyncio
 async def test_chat_stream_obs_error_type_from_unavailable(monkeypatch):
-    """_stream 重试耗尽折叠 → LLMUnavailableError(error_type=HTTP_503) → error_type 透传。"""
+    """_stream 重试耗尽折叠 → LLMUnavailableError(error_type=HTTP_503) → 带出后折叠为白名单词。"""
     fake = _FakeObs()
     monkeypatch.setattr(dgw, "_obs_sdk", lambda: fake)
     gw = _mk_gateway()
@@ -186,7 +186,7 @@ async def test_chat_stream_obs_error_type_from_unavailable(monkeypatch):
         async for _ in gw.chat_stream([{"role": "user", "content": "hi"}]):
             pass
     assert fake.calls[0]["status"] == "error"
-    assert fake.calls[0]["error_type"] == "HTTP_503"
+    assert fake.calls[0]["error_type"] == "llm_other"
 
 
 # ---------- 直通路径（观测未启用）不该有打点 ----------
@@ -251,3 +251,30 @@ class _FakeResp:
 
     def json(self) -> dict:
         return self._data
+
+
+# 平台错误分类白名单（§4.3 L1+L2 词表）。llm_call 的 error_type 若落在此集合外，
+# 平台不产生回流候选 ⇒ 值域卫生是本表唯一护栏。
+_PLATFORM_ERR_WHITELIST = {
+    "llm_timeout", "llm_rate_limit", "llm_connection", "llm_context_exceeded",
+    "llm_empty_response", "llm_parse_error", "llm_other",
+    "llm_interface_business", "external_non_llm", "db_error", "redis_error",
+}
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (LLMUnavailableError("x", error_type="HTTP_429"), "llm_rate_limit"),
+    (LLMUnavailableError("x", error_type="HTTP_503"), "llm_other"),
+    (LLMUnavailableError("x", error_type="HTTP_401"), "llm_other"),
+    (LLMUnavailableError("x", error_type="TIMEOUT"), "llm_timeout"),
+    (LLMUnavailableError("x", error_type="NETWORK"), "llm_connection"),
+    (LLMUnavailableError("x"), "llm_other"),
+    (AllKeysDownError("全冷却"), "llm_other"),
+    (CapacityExceededError("排队超时"), "llm_other"),
+    (StreamInterruptedError("流中断"), "llm_connection"),
+])
+def test_llm_error_type_maps_into_platform_whitelist(exc, expected):
+    """每个分支的返回值都必须在白名单内（网关内部细词 HTTP_{code}/TIMEOUT/NETWORK 均不在册）。"""
+    got = dgw._llm_error_type(exc, "LLM_ERROR")
+    assert got == expected
+    assert got in _PLATFORM_ERR_WHITELIST, f"{got} 不在平台白名单，平台不会据此产生回流候选"

@@ -62,20 +62,37 @@ def _obs_sdk():
     return obs_sdk if obs_sdk.is_initialized() else None
 
 
+# 网关内部细词 → 平台错误分类白名单（§4.3）。**白名单外的值平台不产生回流候选**，
+# 故所有上报值必须经此表折叠；细词仍留在日志与 error_msg 里，不丢可读性。
+# 5xx 与其余 4xx 无对应词，统一归 llm_other。
+_ERR_TYPE_MAP = {
+    "HTTP_429": "llm_rate_limit",
+    "TIMEOUT": "llm_timeout",
+    "NETWORK": "llm_connection",
+    "STREAM_INTERRUPTED": "llm_connection",
+    "ALL_KEYS_DOWN": "llm_other",
+    "QUEUE_TIMEOUT": "llm_other",
+    "LLM_ERROR": "llm_other",
+}
+
+
 def _llm_error_type(exc: Exception, default: str) -> str:
-    """异常 → llm_call error_type（平台聚类用自由字符串，§2.5 全集 + 业务扩展）。
+    """异常 → llm_call error_type（平台错误分类白名单值域，**非自由字符串**）。
 
     网关内部折叠后经异常 error_type 带出的类别优先（429/5xx/timeout/network 由 _call/
-    _stream 在最终 raise 前刻入）；无带出（本地排队/全冷却）按类映射，仍无则用 default。
+    _stream 在最终 raise 前刻入）；无带出（本地排队/全冷却/流中断）按类映射，
+    仍无则用 default。所有分支的返回值都经 _ERR_TYPE_MAP 折叠进白名单。
     """
     et = getattr(exc, "error_type", None)
     if et:
-        return et
+        return _ERR_TYPE_MAP.get(et, "llm_other")
     if isinstance(exc, AllKeysDownError):
-        return "ALL_KEYS_DOWN"
+        return _ERR_TYPE_MAP["ALL_KEYS_DOWN"]
     if isinstance(exc, CapacityExceededError):
-        return "QUEUE_TIMEOUT"
-    return default
+        return _ERR_TYPE_MAP["QUEUE_TIMEOUT"]
+    if isinstance(exc, StreamInterruptedError):
+        return _ERR_TYPE_MAP["STREAM_INTERRUPTED"]
+    return _ERR_TYPE_MAP.get(default, "llm_other")
 
 
 # LLM 网关熔断（仿 services/retry.py 的 DB _breaker 模式）：累计"一次逻辑调用彻底失败"
@@ -362,7 +379,7 @@ class DeepSeekGateway:
                 obs.record_llm(
                     model or settings.deepseek_model_chat, "error",
                     duration_ms=int((time.monotonic() - t0) * 1000),
-                    error_type="STREAM_INTERRUPTED",
+                    error_type=_llm_error_type(exc, "LLM_ERROR"),
                     error_msg=str(exc),
                 )
             raise
