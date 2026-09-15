@@ -148,6 +148,34 @@ async def test_chat_stream_obs_records_ok_with_stream_usage(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_obs_records_ok_when_consumer_closes_midstream(monkeypatch):
+    """消费方中途弃用（客户端断连 → aclose()）：ok 收口仍须记账。
+
+    GeneratorExit 落在 yield 点且承 BaseException，两个 except 都接不住 ⇒ 收口若写在 try
+    之后会静默全丢。**真机对照**（gq 侧 2026-09-15，三仓同形缺陷）：截断驱动的请求只有
+    request、零 llm_call；完整 drain 才有 llm_call ok —— 本用例即该对照的单测复现。
+    """
+    fake = _FakeObs()
+    monkeypatch.setattr(dgw, "_obs_sdk", lambda: fake)
+    gw = _mk_gateway()
+
+    async def fake_stream(*a, **kw):
+        yield "你好", None, None
+        yield "", {"total_tokens": 15}, None
+
+    monkeypatch.setattr(gw, "_stream", fake_stream)
+    gen = gw.chat_stream([{"role": "user", "content": "hi"}])
+    first = await gen.__anext__()
+    assert first[0] == "你好", "只驱动一步 = 断连现场"
+    await gen.aclose()  # 等价于上层 SSE 断连时的清理
+
+    assert len(fake.calls) == 1, "一次调用一条账（既不能丢，也不能 finally 重复记）"
+    call = fake.calls[0]
+    assert call["status"] == "ok", "调用已成功（已产出增量）⇒ ok，不是 error"
+    assert call["usage"] is None, "断连早于 usage chunk ⇒ usage 空，但状态仍为 ok"
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_obs_interrupt_records_then_raises(monkeypatch):
     """流中断（已产出首个 delta）→ 先记 error（折叠 llm_connection）再抛（§2.4 前提）。"""
     fake = _FakeObs()

@@ -358,6 +358,7 @@ class DeepSeekGateway:
         t0 = time.monotonic()
         obs = _obs_sdk()  # 观测边带（§11.3 cs #3）；未装/未 init = None，下方零开销直通
         usage: dict | None = None  # 流末 usage chunk（include_usage）→ llm_call ok 的 token 计数
+        recorded = False  # 已记账标志：两个 except 分支须置位，否则 finally 会补记一条 ok
         try:
             async for item in self._stream(messages, model, timeout, temperature):
                 if item[1]:  # (delta, usage, reasoning)：usage 仅最后 chunk 携带
@@ -365,15 +366,10 @@ class DeepSeekGateway:
                 yield item
             await self._breaker_reset()  # 正常流结束 → 成功
             self._record_call(model, t0, ok=True)
-            if obs is not None:
-                obs.record_llm(
-                    model or settings.deepseek_model_chat, "ok",
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                    usage=usage,
-                )
         except StreamInterruptedError as exc:
             # 已产出首个 delta 后的流中断：连接级抖动/用户断连，非网关整体故障，不累计熔断
             # （挑战1：单次长流中途断不应误熔断全网关）。仍冒泡给上层规则引擎兜底。
+            recorded = True
             self._record_call(model, t0, ok=False)
             if obs is not None:  # 先记 error 再抛（§2.4 前提）
                 obs.record_llm(
@@ -384,6 +380,7 @@ class DeepSeekGateway:
                 )
             raise
         except LLMUnavailableError as exc:
+            recorded = True
             self._record_call(model, t0, ok=False)
             await self._breaker_fail()
             if obs is not None:
@@ -396,6 +393,17 @@ class DeepSeekGateway:
             raise
         finally:
             self._semaphore.release()
+            # ok 收口**必须在 finally**（不能写在 try 之后）：消费方中途弃用（客户端断连 →
+            # aclose()）时 GeneratorExit 落在上面的 yield 点、承 BaseException，两个 except
+            # 都接不住 ⇒ 收口静默全丢（gq 侧真机对照：截断驱动零 llm_call、完整 drain 才有）。
+            # 本帧无重试环（重试在 _stream 内部），故 finally 只因「流穷尽 / 异常 / 被弃用」
+            # 三种出口各触发一次，不会重复记账。
+            if obs is not None and not recorded:
+                obs.record_llm(
+                    model or settings.deepseek_model_chat, "ok",
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    usage=usage,
+                )
 
     async def _stream(
         self,
