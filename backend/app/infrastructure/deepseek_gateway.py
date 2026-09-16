@@ -17,6 +17,7 @@ from app.infrastructure import metrics
 from app.infrastructure.cooldown import RedisCooldown
 from app.infrastructure.deepseek_keypool import KeyPool
 from app.utils.logger import logger
+from app.utils.trace import mark_llm_hard_fail
 
 
 class LLMUnavailableError(Exception):
@@ -224,11 +225,13 @@ class DeepSeekGateway:
             return result
         except LLMUnavailableError as exc:
             self._record_call(model, t0, ok=False)
+            et = _llm_error_type(exc, "LLM_ERROR")
+            mark_llm_hard_fail(et)  # 请求级标记：本轮最终没拿到 LLM 结果（出口据此记 root=error）
             if obs is not None:  # 先记 error 再抛（§2.4 前提）：失败类别由 _call 经 exc.error_type 带出
                 obs.record_llm(
                     model or settings.deepseek_model_chat, "error",
                     duration_ms=int((time.monotonic() - t0) * 1000),
-                    error_type=_llm_error_type(exc, "LLM_ERROR"),
+                    error_type=et,
                     error_msg=str(exc),
                 )
             recorded = True  # 同上：记账先于下面的 await
@@ -237,11 +240,13 @@ class DeepSeekGateway:
         except (AllKeysDownError, CapacityExceededError) as exc:
             # 无 healthy Key / 排队超时：调用未成功，计失败指标（非网络故障，不累计熔断）
             self._record_call(model, t0, ok=False)
+            et = _llm_error_type(exc, "LLM_ERROR")
+            mark_llm_hard_fail(et)  # 同上：调用未成功即本轮无 LLM 结果
             if obs is not None:
                 obs.record_llm(
                     model or settings.deepseek_model_chat, "error",
                     duration_ms=int((time.monotonic() - t0) * 1000),
-                    error_type=_llm_error_type(exc, "LLM_ERROR"),
+                    error_type=et,
                     error_msg=str(exc),
                 )
             recorded = True
@@ -252,11 +257,13 @@ class DeepSeekGateway:
             # 接不住 ⇒ 原先直接冲出本函数，**整条 llm_call 静默消失**。上面两条分支的记账已提到各自
             # await 之前（recorded 置位），故此处只在「一次都没记过」时补 —— 本调用确实一次都没成功，
             # 记 ok 是假成功。error_type 经 _llm_error_type 折叠进平台白名单，不引入新词。
+            et = _llm_error_type(exc, "LLM_ERROR")
+            mark_llm_hard_fail(et)  # 无条件置位：recorded=True 也说明本次调用一次都没成功
             if not recorded and obs is not None:
                 obs.record_llm(
                     model or settings.deepseek_model_chat, "error",
                     duration_ms=int((time.monotonic() - t0) * 1000),
-                    error_type=_llm_error_type(exc, "LLM_ERROR"),
+                    error_type=et,
                     error_msg=str(exc),
                 )
             raise

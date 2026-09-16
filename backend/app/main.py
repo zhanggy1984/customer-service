@@ -19,7 +19,7 @@ from app.rag.retriever import retriever
 from app.session.cleaner import session_cleaner
 from app.session.manager import session_manager
 from app.utils.logger import logger
-from app.utils.trace import TraceIdFilter, trace_id_var
+from app.utils.trace import TraceIdFilter, llm_health_var, trace_id_var
 
 # 链路追踪：trace_id 注入 JSON 日志（JsonFormatter 自动合并非保留字段，formatter 零改动）
 logger.addFilter(TraceIdFilter())
@@ -41,21 +41,30 @@ def _obs():
     return obs_sdk
 
 
-def _obs_end(obs, response, request, aborted: bool = False) -> None:
-    """request 出口统一收口：断连 > HTTP 状态码 > ok。
+def _obs_end(obs, response, request, health: dict, aborted: bool = False) -> None:
+    """request 出口统一收口：断连 > LLM 硬失败 > HTTP 状态码 > ok。
 
     SSE 业务层断连（routes.send_message 断连处置已置 request.state.obs_aborted）与 body
     迭代异常（客户端中途关闭未走业务层）都归 error + CLIENT_DISCONNECT——trace 如实反映
     「未拿到完整响应」；非 2xx 按 HTTP_xxx 记 error；其余 ok。end_request 自判 status
     合法性/补 duration，此处不重复。
 
-    入参由业务路由置 request.state.obs_input（同 obs_aborted 惯例），三条出口都带上——
+    入参由业务路由置 request.state.obs_input（同 obs_aborted 惯例），四条出口都带上——
     error 路径同样需要现场，否则失败 trace 建不出簇。
+
+    LLM 硬失败（health）排在状态码之前：SSE 接口恒返回 200，状态码判不出「LLM 挂了、
+    用户拿到兜底话术」；这类请求必须记 error —— 平台判定侧只认 root 终态，记 ok 会让
+    它把真实故障当作「已被业务吸收」切掉。error_type 直接用网关折叠出的白名单词
+    （llm_timeout 等），不另造词。
     """
     obs_input = getattr(request.state, "obs_input", None)
     if aborted or getattr(request.state, "obs_aborted", False):
         obs.end_request("error", error_type="CLIENT_DISCONNECT", error_msg="客户端连接中断",
                         input=obs_input)
+        return
+    if health["hard_fail"]:
+        obs.end_request("error", error_type=health["error_type"],
+                        error_msg="LLM 调用失败，本轮为降级兜底响应", input=obs_input)
         return
     code = response.status_code
     if code >= 400:
@@ -139,6 +148,11 @@ async def obs_request_middleware(request: Request, call_next):
     - 客户端断连：routes.send_message 业务层断连处置置 request.state.obs_aborted → 记
       error+CLIENT_DISCONNECT；body 迭代异常（上传中断等）同记。未启用时零开销直通。
     """
+    # 请求级 LLM 健康标记：先于 call_next 置入 context（下游失败出口就地改它），
+    # 出口直接读同一个 dict —— 不依赖「子任务里的写能传回中间件上下文」。
+    health: dict = {"hard_fail": False, "error_type": None}
+    llm_health_var.set(health)
+
     obs = _obs()
     if obs is None:
         return await call_next(request)
@@ -154,7 +168,7 @@ async def obs_request_middleware(request: Request, call_next):
     body_iter = getattr(response, "body_iterator", None)
     if body_iter is None:
         # 非流式响应体已整体生成：直接收口（status_code 即可判定）
-        _obs_end(obs, response, request)
+        _obs_end(obs, response, request, health)
         return response
 
     async def _body_with_obs():
@@ -162,10 +176,10 @@ async def obs_request_middleware(request: Request, call_next):
             async for chunk in body_iter:
                 yield chunk
         except BaseException:
-            _obs_end(obs, response, request, aborted=True)
+            _obs_end(obs, response, request, health, aborted=True)
             raise
         else:
-            _obs_end(obs, response, request)
+            _obs_end(obs, response, request, health)
 
     response.body_iterator = _body_with_obs()
     return response
