@@ -50,6 +50,10 @@ async def send_message(
     同一 session 的并发请求通过 SessionLocks 串行化（Phase 4.5），
     锁内重新加载最新会话状态，防止并发读写导致状态机覆盖。
     """
+    # 观测现场（§6.2）：本接口是评测对象，入参须随 request 事件上报——下游据它产
+    # root_input_hash（聚类去重键）与 evidence.input（离线回放渲染用 {"content": ...}）。
+    # 置 request.state 由中间件出口统一读，与 obs_aborted 同惯例。
+    request.state.obs_input = req.model_dump()
     lock = await session_locks.get(sid)
 
     async def event_gen():

@@ -48,15 +48,20 @@ def _obs_end(obs, response, request, aborted: bool = False) -> None:
     迭代异常（客户端中途关闭未走业务层）都归 error + CLIENT_DISCONNECT——trace 如实反映
     「未拿到完整响应」；非 2xx 按 HTTP_xxx 记 error；其余 ok。end_request 自判 status
     合法性/补 duration，此处不重复。
+
+    入参由业务路由置 request.state.obs_input（同 obs_aborted 惯例），三条出口都带上——
+    error 路径同样需要现场，否则失败 trace 建不出簇。
     """
+    obs_input = getattr(request.state, "obs_input", None)
     if aborted or getattr(request.state, "obs_aborted", False):
-        obs.end_request("error", error_type="CLIENT_DISCONNECT", error_msg="客户端连接中断")
+        obs.end_request("error", error_type="CLIENT_DISCONNECT", error_msg="客户端连接中断",
+                        input=obs_input)
         return
     code = response.status_code
     if code >= 400:
-        obs.end_request("error", error_type=f"HTTP_{code}")
+        obs.end_request("error", error_type=f"HTTP_{code}", input=obs_input)
         return
-    obs.end_request("ok")
+    obs.end_request("ok", input=obs_input)
 
 
 @asynccontextmanager
