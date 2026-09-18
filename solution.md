@@ -388,8 +388,8 @@ customer-service/
 
 | Method | Path | 说明 |
 |--------|------|------|
-| POST | /api/v1/auth/register | 注册 |
-| POST | /api/v1/auth/login | 登录，返回 JWT（含 role） |
+| POST | /api/auth/register | 注册 |
+| POST | /api/auth/login | 登录，返回 JWT（含 role） |
 | POST | /api/v1/sessions | 创建会话 |
 | POST | /api/v1/sessions/{id}/messages | 发送消息 |
 | GET | /api/v1/sessions/{id}/stream | **SSE 流式响应** |
@@ -448,7 +448,7 @@ volumes: {mysql_data, chroma_data, redis_data, hf_cache}
 - backend 开发期 1 实例；多实例扩展时 chroma 独立服务已支持
 ```
 
-Nginx：`/api/` 全局高并发限流 + `/api/v1/auth/` 单独 5r/m（防暴力破解），`proxy_buffering off` 保证 SSE 逐帧推送。
+Nginx：`/api/*` 反代到统一网关，`proxy_buffering off` 保证 SSE 逐帧推送。限流已收敛到网关（`api-gateway`），本层不再单独限流。
 
 ---
 
@@ -621,7 +621,7 @@ pytest tests/ -v
 | asyncmy 池 | pool_size / max_overflow | minsize / maxsize | asyncmy 继承 aiomysql 语义，无 overflow |
 | 后端实例 | 3 replicas | 1（开发期） | ChromaDB 共享卷并发写需先解决 |
 | 会话不存在 | 自动新建+问候语 | Phase 1 返回 404 | 兜底逻辑随 Phase 3.8 完善 |
-| 路由前缀 | /api/v1/* | 认证 /api/v1/auth/*、业务 /api/v1/* | 避免 prefix 重复拼接 |
+| 路由前缀 | /api/v1/* | 认证 /api/auth/*、业务 /api/v1/* | 避免 prefix 重复拼接；认证于 T15 与 gq/cc 统一 |
 
 ### Phase 2 补充：ChromaDB 改为独立容器（2026-08-07）
 

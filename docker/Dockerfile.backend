@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # 后端镜像
 # 基础镜像用 python:3.11-slim: asyncmy 0.2.9 仅提供 cp311 wheel，
 # 3.12 slim 镜像无编译工具链会导致 pip 安装失败。
@@ -14,6 +15,13 @@ COPY backend/requirements.txt /app/requirements.txt
 # torch 单独装 CPU 版（PyPI 默认 CUDA 版 ~2GB，CPU 版几百 MB），供 sentence-transformers 使用
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install -r /app/requirements.txt
+
+# obs-sdk 观测 SDK（§11.3 接入）：源码经 compose additional_contexts 独立 context 注入
+# （docker-compose.yml build.additional_contexts.obs-sdk → 本 COPY 的 --from=obs-sdk）。
+# 装拷贝副本而非 -e editable（镜像内无仓外路径）；kafka-python 由 sdk pyproject 声明自动解析。
+# 观测边带在 .env 关闭时（OBS_ENABLED=false）代码路径不触碰本包，此层仍装以保证可回切。
+COPY --from=obs-sdk / /obs-sdk-src
+RUN pip install --no-cache-dir /obs-sdk-src
 
 COPY backend/ /app/
 

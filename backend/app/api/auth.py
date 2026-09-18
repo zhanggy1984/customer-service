@@ -1,7 +1,7 @@
 """注册 / 登录认证接口（JWT）。
 
-- POST /api/v1/auth/register  注册（role 固定 user，由 DB 默认值保证，不可自选）
-- POST /api/v1/auth/login     登录，返回 JWT（payload 含 sub/username/role）
+- POST /api/auth/register  注册（role 固定 user，由 DB 默认值保证，不可自选）
+- POST /api/auth/login     登录，返回 JWT（payload 含 sub/username/role）
 """
 from datetime import datetime, timedelta, timezone
 

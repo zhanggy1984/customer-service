@@ -1,7 +1,7 @@
 """FastAPI 入口。
 
 - lifespan: 启动时初始化 Redis 会话 + MySQL 连接池；关闭时优雅回收。
-- 路由挂载: /api/v1/auth/* 认证, /api/v1/* 业务。
+- 路由挂载: /api/auth/* 认证, /api/v1/* 业务。
 """
 import uuid
 from contextlib import asynccontextmanager
@@ -19,10 +19,58 @@ from app.rag.retriever import retriever
 from app.session.cleaner import session_cleaner
 from app.session.manager import session_manager
 from app.utils.logger import logger
-from app.utils.trace import TraceIdFilter, trace_id_var
+from app.utils.trace import TraceIdFilter, llm_health_var, trace_id_var
 
 # 链路追踪：trace_id 注入 JSON 日志（JsonFormatter 自动合并非保留字段，formatter 零改动）
 logger.addFilter(TraceIdFilter())
+
+
+def _obs():
+    """惰性取 obs_sdk 模块：未启用（config 三要素缺一）或未安装时返回 None。
+
+    观测边带不阻塞业务（§11.3 接入）：装配是可选增强，配置缺失/包缺失都让服务照常跑。
+    放模块级而非 lifespan——request 中间件（http 层，与 lifespan 无关）也要每请求判观测。
+    """
+    if not settings.obs_ready:
+        return None
+    try:
+        import obs_sdk
+    except ImportError:
+        logger.warning("[obs] obs_sdk 未安装，观测边带关闭（OBS_ENABLED=true 但包缺失）")
+        return None
+    return obs_sdk
+
+
+def _obs_end(obs, response, request, health: dict, aborted: bool = False) -> None:
+    """request 出口统一收口：断连 > LLM 硬失败 > HTTP 状态码 > ok。
+
+    SSE 业务层断连（routes.send_message 断连处置已置 request.state.obs_aborted）与 body
+    迭代异常（客户端中途关闭未走业务层）都归 error + CLIENT_DISCONNECT——trace 如实反映
+    「未拿到完整响应」；非 2xx 按 HTTP_xxx 记 error；其余 ok。end_request 自判 status
+    合法性/补 duration，此处不重复。
+
+    入参由业务路由置 request.state.obs_input（同 obs_aborted 惯例），四条出口都带上——
+    error 路径同样需要现场，否则失败 trace 建不出簇。
+
+    LLM 硬失败（health）排在状态码之前：SSE 接口恒返回 200，状态码判不出「LLM 挂了、
+    用户拿到兜底话术」；这类请求必须记 error —— 平台判定侧只认 root 终态，记 ok 会让
+    它把真实故障当作「已被业务吸收」切掉。error_type 直接用网关折叠出的白名单词
+    （llm_timeout 等），不另造词。
+    """
+    obs_input = getattr(request.state, "obs_input", None)
+    if aborted or getattr(request.state, "obs_aborted", False):
+        obs.end_request("error", error_type="CLIENT_DISCONNECT", error_msg="客户端连接中断",
+                        input=obs_input)
+        return
+    if health["hard_fail"]:
+        obs.end_request("error", error_type=health["error_type"],
+                        error_msg="LLM 调用失败，本轮为降级兜底响应", input=obs_input)
+        return
+    code = response.status_code
+    if code >= 400:
+        obs.end_request("error", error_type=f"HTTP_{code}", input=obs_input)
+        return
+    obs.end_request("ok", input=obs_input)
 
 
 @asynccontextmanager
@@ -38,6 +86,25 @@ async def lifespan(_: FastAPI):
     await retriever.init()
     await deepseek_client.init()
     session_cleaner.start()  # TTL 清理：依赖 mysql_pool 已就绪
+    # obs_sdk 装配（观测边带，§11.3 cs #1）：cs 业务 logger "cs" propagate=False → root
+    # handler 收不到，须 extra_loggers=["cs"] 点名（sdk>=0.1.1）。init 失败仅告警不拦启动。
+    obs = _obs()
+    if obs is not None:
+        try:
+            obs.init(
+                "customer-service",
+                kafka_servers=settings.obs_kafka_servers,
+                topic=settings.obs_kafka_topic,
+                sasl_username=settings.obs_kafka_sasl_username or None,
+                sasl_password=settings.obs_kafka_sasl_password or None,
+                flush_batch=settings.obs_flush_batch,
+                flush_interval_s=settings.obs_flush_interval_s,
+                log_mode="stdlib",
+                extra_loggers=["cs"],
+            )
+            logger.info("[obs] obs_sdk 已初始化 topic=%s", settings.obs_kafka_topic)
+        except Exception as e:  # 观测边带故障不拦服务启动
+            logger.warning("[obs] obs_sdk init 失败（观测边带关闭）: %s", e)
     yield
     # ---- 优雅关闭 ----
     logger.info("event=shutdown_start 停止接受新请求，等待活跃请求完成")
@@ -47,6 +114,11 @@ async def lifespan(_: FastAPI):
     await mysql_pool.close()
     await retriever.close()
     await deepseek_client.close()
+    if obs is not None:
+        try:
+            obs.shutdown()  # 终刷剩余事件后关线程（幂等：未 init 也安全）
+        except Exception as e:
+            logger.warning("[obs] obs_sdk shutdown 异常: %s", e)
     logger.info("event=shutdown_done")
 
 
@@ -61,6 +133,55 @@ async def trace_middleware(request: Request, call_next):
     trace_id_var.set(rid)
     response = await call_next(request)
     response.headers.setdefault("X-Request-ID", rid)
+    return response
+
+
+@app.middleware("http")
+async def obs_request_middleware(request: Request, call_next):
+    """观测 request 入口/出口（§11.3 cs #2）：SSE 在 body 迭代完成后聚合打一条。
+
+    - begin_request：method/path 交给 SDK 归一 interface（动态段 → {id}）；trace_id 沿用
+      网关透传 X-Request-ID（trace_middleware 同源，无则 SDK 自造）。
+    - end_request 时点：StreamingResponse 的 body 迭代完成才收口——SSE 的 LLM 调用发生在
+      response body 发送期（call_next 返回时尚未开始），若即时 end 则 request duration≈0
+      且锚点(seq=0)晚于子节点事件。包一层透传迭代器，真实流式不缓冲。
+    - 客户端断连：routes.send_message 业务层断连处置置 request.state.obs_aborted → 记
+      error+CLIENT_DISCONNECT；body 迭代异常（上传中断等）同记。未启用时零开销直通。
+    """
+    # 请求级 LLM 健康标记：先于 call_next 置入 context（下游失败出口就地改它），
+    # 出口直接读同一个 dict —— 不依赖「子任务里的写能传回中间件上下文」。
+    health: dict = {"hard_fail": False, "error_type": None}
+    llm_health_var.set(health)
+
+    obs = _obs()
+    if obs is None:
+        return await call_next(request)
+
+    obs.begin_request(method=request.method, path=request.url.path,
+                      trace_id=request.headers.get("X-Request-ID"))
+    try:
+        response = await call_next(request)
+    except Exception:
+        obs.end_request("error", error_type="UNHANDLED_EXCEPTION")
+        raise
+
+    body_iter = getattr(response, "body_iterator", None)
+    if body_iter is None:
+        # 非流式响应体已整体生成：直接收口（status_code 即可判定）
+        _obs_end(obs, response, request, health)
+        return response
+
+    async def _body_with_obs():
+        try:
+            async for chunk in body_iter:
+                yield chunk
+        except BaseException:
+            _obs_end(obs, response, request, health, aborted=True)
+            raise
+        else:
+            _obs_end(obs, response, request, health)
+
+    response.body_iterator = _body_with_obs()
     return response
 
 

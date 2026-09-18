@@ -82,6 +82,20 @@ class Settings(BaseSettings):
     turn_cache_enabled: bool = True
     turn_cache_ttl: int = 7200
 
+    # ---------- 观测上报 obs_sdk（观测边带；缺开关/地址/主题三项任一项 = 完全关闭，业务零侵入） ----------
+    obs_enabled: bool = False
+    obs_kafka_servers: str = ""            # 如 localhost:39092（容器内 kafka:9092）
+    obs_kafka_topic: str = ""              # {env}.obs.agent.customer-service
+    obs_kafka_sasl_username: str = ""      # 生产 SASL；空 = PLAINTEXT（dev 无鉴权）
+    obs_kafka_sasl_password: str = ""
+    obs_flush_batch: int = 500
+    obs_flush_interval_s: float = 2.0
+
+    @property
+    def obs_ready(self) -> bool:
+        """观测通道就绪判定：三项齐备才启用（同 gq 口径，防配置残缺静默半开）。"""
+        return bool(self.obs_enabled and self.obs_kafka_servers and self.obs_kafka_topic)
+
     # ---------- Milvus（VECTOR_STORE=milvus 时生效） ----------
     milvus_uri: str = "http://milvus:19530"          # compose 内服务名；本地开发改 http://localhost:19533
     milvus_collection: str = "cs_knowledge"   # 共享 Milvus 加 cs_ 前缀（隔离规范）
