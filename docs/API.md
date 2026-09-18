@@ -1,12 +1,14 @@
 # API 文档
 
-Base URL: `http://localhost:8000/api/v1`（经 nginx 为 `http://localhost/api/v1`）
+业务接口 Base URL: `http://localhost:8000/api/v1`（经 nginx：`https://localhost:8443/api/v1`；宿主 80/8081 会 301 到该地址）
+
+> ⚠️ 认证接口**不在**上面的 base 下 —— 挂载点是 `/api/auth/*`（`main.py:188` 挂 `prefix="/api"`），见下方「认证」一节。
 
 ## 认证
 
 ### 注册
 ```bash
-curl -X POST http://localhost:8000/api/v1/auth/register \
+curl -X POST http://localhost:8000/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{"username":"demo","password":"demo123","phone":"13800000000"}'
 # 201 {"msg":"注册成功"}
@@ -14,7 +16,7 @@ curl -X POST http://localhost:8000/api/v1/auth/register \
 
 ### 登录
 ```bash
-curl -X POST http://localhost:8000/api/v1/auth/login \
+curl -X POST http://localhost:8000/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"user_1","password":"123456"}'
 # 200 {"access_token":"eyJ...","token_type":"bearer","user":{"id":2,"username":"user_1","role":"user",...}}

@@ -1,7 +1,7 @@
 """FastAPI 入口。
 
 - lifespan: 启动时初始化 Redis 会话 + MySQL 连接池；关闭时优雅回收。
-- 路由挂载: /api/v1/auth/* 认证, /api/v1/* 业务。
+- 路由挂载: /api/auth/* 认证, /api/v1/* 业务。
 """
 import uuid
 from contextlib import asynccontextmanager
