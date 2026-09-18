@@ -39,3 +39,6 @@ frontend/*.tsbuildinfo
 
 # ---------- UI 验证失败截图 ----------
 frontend/ui-verify-fail.png
+
+# ---------- 一次性取证/调试脚本（跑完即弃，不入库） ----------
+.tmp-probe/
