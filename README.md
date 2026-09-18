@@ -1,12 +1,13 @@
 # AI 智能客服系统
 
-> **高并发 AI Agent 智能客服系统**：面向电商售后场景，从**退换货政策问答、订单状态查询**，到**退货、仅退款、投诉**等可完成的业务动作，在对话内一站式闭环，并具备从 **Agent 编排、LangGraph 状态机、RAG 检索、存储高可用到 LLM 网关治理**的全链路工程化能力。
+> **高并发 AI Agent 智能客服系统**：面向电商售后场景，从**退换货政策问答、订单状态查询**，到**退货、仅退款、投诉**等可完成的业务动作，在对话内一站式闭环，并具备从 **Agent 编排、LangGraph 状态机、RAG 检索、存储高可用、LLM 网关治理到可观测回流**的全链路工程化能力。
 
-第一次接触这个项目，只看下面三句就够了：
+第一次接触这个项目，看下面四条就够了：
 
 - **做什么**：把电商售后搬进对话。用户在聊天里直接办理退货、仅退款、投诉，也能查订单、问政策——每一步真实落库，退单号/退款/工单号可查，不再是"只能聊不能办"的问答机器人。
-- **怎么做**：LangGraph 状态机驱动三个可完成的业务流（退货/退款/投诉），DeepSeek 多 Key 网关 + RAG 检索生成答复，LLM 自主决策调只读工具（P3）+ 实时护栏（P4）+ 判定落库（P5）；SSE 契约化流式全链路可观测，LLM/存储故障一律熔断降级到规则引擎，**系统永不因 AI 故障崩溃**。
-- **好在哪**：政策有依据不编造、业务动作对话内闭环、故障不崩；对外是契约对齐的 SSE 事件流，有 386 项后端测试（含真实链路集成）+ 41 项前端测试 + E2E 脚本，可直接复验。
+- **怎么做**：LangGraph 状态机驱动三个可完成的业务流（退货/退款/投诉），DeepSeek 多 Key 网关 + RAG 检索生成答复，LLM 自主决策调只读工具 + 实时护栏 + 判定落库；SSE 契约化流式全链路可观测，LLM/存储故障一律熔断降级到规则引擎，**系统永不因 AI 故障崩溃**。
+- **好在哪**：政策有依据不编造、业务动作对话内闭环、故障不崩；对外是契约对齐的 SSE 事件流，有 419 项后端测试（416 passed / 3 skipped，含真实链路集成）+ 41 项前端测试 + E2E 脚本，可直接复验。
+- **可观测**：每条业务链路落结构化事件（`trace_id` / `seq` / `interface` / `status` / `error_type` / `duration_ms` / `usage`），并接进平台的错误回流闭环（观测 → 聚类 → 组装 → 拉取 → 判定 → 回归回推 → 收口）；`/chat` 本身就是 agent 主链路，**真实用户提问即是真实运行事件**——可观测数据来自实际使用，而非构造。
 
 ## 目录
 
@@ -23,6 +24,7 @@
 - [十一、常见问题](#十一常见问题)
 - [十二、已知限制与优化方向](#十二已知限制与优化方向)
 - [十三、附录：状态机数据契约（LangGraph State）](#十三附录状态机数据契约langgraph-state)
+- [文档索引](#文档索引)
 
 ---
 
@@ -113,9 +115,7 @@ graph TB
 - **控制反转**：LangGraph 状态机 + orchestrator 持有控制权，能力/资源组件不主动发起请求，只响应调用；
 - **数据流单向**：`AgentState` 自上而下流转，下层仅返回结果供上层决策，无旁路回调。
 
-**演进说明**：分层是随重构逐步收敛的，不是一次性设计——2.4.3 将控制层 8 处对资源层具体实现的直接依赖收敛到 `infrastructure` 统一门面（`llm_gateway / mysql_pool / retriever` 经门面导出，retriever 惰性加载破除导入环），控制层从此只依赖抽象接口；换实现只改门面一处绑定。
-
-**收敛状态（如实）**：上图为**依赖规则（目标架构）**。当前控制层 `app/agent/` 仍直连资源层门面（`app.infrastructure` 的 `llm_gateway / mysql_pool / retriever / turn_cache / RedisCooldown`）与 `app.session.models`，正在随重构逐项收口到能力层 `app/services/`——收敛后控制层只经能力层编排、不直连资源层。
+**演进与当前收敛状态**：分层是随重构逐步收敛的，不是一次性设计——控制层对资源层具体实现的直接依赖（8 处）已收敛到 `infrastructure` 统一门面（`llm_gateway / mysql_pool / retriever` 经门面导出，retriever 惰性加载破除导入环），换实现只改门面一处绑定。上图为**依赖规则（目标架构）**：当前控制层 `app/agent/` 仍直连资源层门面（`app.infrastructure` 的 `llm_gateway / mysql_pool / retriever / turn_cache / RedisCooldown`）与 `app.session.models`，正在逐项收口到能力层 `app/services/`——收敛后控制层只经能力层编排、不直连资源层。
 
 ### 对外链路（统一 API 网关）
 
@@ -135,9 +135,9 @@ graph TB
   → 回复：「退货单 RC-xxx 已创建，退款 ¥69.70 将在 1-3 个工作日内原路返回」
 ```
 
-### 编排模式：LLM 自主决策 + 规则护栏（P3-P5）
+### 编排模式：LLM 自主决策 + 规则护栏
 
-对订单查询/政策问答两类意图，LLM 带只读工具列表自主决定调哪些工具（`search_policy`/`query_order`/`list_user_orders`），护栏在决策与执行之间做确定性校验（`allow/reject/override` 三态）；业务副作用工具（建退货/退款/投诉单、资格判定）的决策一律被护栏拦截，转由 LangGraph 状态机确定性接手——**决策与执行分离，LLM 不裸调业务动作**。每轮护栏判定落库 `tool_call_log`，为管理侧调用分析预留数据底座。
+对订单查询/政策问答两类意图，LLM 带只读工具列表自主决定调哪些工具（`search_policy`/`query_order`/`list_user_orders`），护栏在决策与执行之间做确定性校验（`allow/reject/override` 三态）；业务副作用工具（建退货/退款/投诉单、资格判定）的决策一律被护栏拦截，转由 LangGraph 状态机确定性接手——**决策与执行分离，LLM 不裸调业务动作**；每轮护栏判定落库 `tool_call_log`（详见「五、技术闪光点」）。
 
 ---
 
@@ -147,9 +147,11 @@ graph TB
 >
 > ```bash
 > # 发布物：clone infra 独立仓库后启动
-> git clone https://github.com/zhanggy1984/share-infra && cd infra && docker compose up -d
+> git clone https://github.com/zhanggy1984/share-infra && cd share-infra && docker compose up -d
+> cd api-gateway && docker compose up -d      # 统一网关是独立 compose，不在根 compose 内
 > # 本地开发：infra 位于 ../infra
 > cd ../infra && docker compose up -d
+> cd api-gateway && docker compose up -d
 > ```
 
 前置：Docker + Docker Compose（`docker compose` v2 语法）、Node.js ≥ 18。
@@ -193,9 +195,9 @@ npm run build             # 生产：构建产物挂载到 nginx
 # 或 npm run dev           # 开发热更新（proxy /api → backend:8000，访问 http://localhost:5173）
 ```
 
-> ⚠️ **改过 `frontend/src/` 后必须重新 `npm run build`**——dist 挂载 nginx volume，旧构建不生效（T15 实测：`/api/auth/login` 路由统一后旧 dist 仍请求 `/api/v1/auth/login` → 登录 404）。
+> ⚠️ **改过 `frontend/src/` 后必须重新 `npm run build`**——dist 挂载 nginx volume，旧构建不生效（实测：`/api/auth/login` 路由统一后旧 dist 仍请求 `/api/v1/auth/login` → 登录 404）。
 
-**跑起来了**：浏览器打开 **https://localhost:8443**（HTTP 8081 自动 301 到 HTTPS），用预置账号登录。浏览器首次访问自签证书会提示不受信任，点「高级 → 继续访问」即可（公网部署换正式证书后无此提示）。
+**跑起来了**：浏览器打开 **https://localhost:8443**（HTTP 8081 自动 301 到 HTTPS），用预置账号登录（自签证书首次访问需手动放行，见上）。
 
 | 角色 | 账号 | 密码 | 可做什么 |
 |------|------|------|---------|
@@ -266,7 +268,7 @@ npm run build             # 生产：构建产物挂载到 nginx
 ```
 
 **场景 5 · Admin 知识库与订单管理**
-`admin/123456` 登录 → 知识库文档上传/编辑/删除 → 订单增删改模拟任意状态 → 一键重置测试数据。
+`admin` 登录（密码为 `.env` 的 `ADMIN_DEFAULT_PASSWORD`）→ 知识库文档上传/编辑/删除 → 订单增删改模拟任意状态 → 一键重置测试数据。
 
 ### 4.3 验收场景（契约声明）
 
@@ -289,92 +291,7 @@ docker compose exec -T backend python verify_cs_e2e.py   # E2E：4 场景契约�
 
 ## 五、技术闪光点
 
-### 1. DeepSeek Gateway：多 Key 池化 + 排队背压 + 熔断（高并发核心）
-单 Key 有 RPM 上限，撑不起海量并发——**控制并发比加连接数更重要**：
-- **KeyPool**：多 Key 滑动窗口 RPM 追踪，选负载最低的 healthy Key；429 → 自动冷却，5xx → 换 Key 重试（最多 2 次，指数退避 0.1s/0.2s）；
-- **排队背压**：无 healthy Key 时排队 2s，超时返回容量告警，不无限堆积；
-- **熔断状态机**：连续 2 次"逻辑调用彻底失败"（重试耗尽/超时）→ 熔断 30s，期间入口直接快速拒绝、**零网络尝试**；冷却到期半开放行探测，成功即重置。超时类慢挂的代价是等满 timeout 才失败，阈值取 2 让慢挂 2×timeout 即进入冷却，用户快速转入规则引擎兜底；
-- **多节点共享熔断**：熔断连续计数留本地（进程私有），冷却期信号经 Redis 广播共享——任一节点熔断，其他节点免去各自重复探测即同步降级；半开放探测成功仅广播方清除共享信号，他节点成功不 DEL（防撤销他人广播），靠 TTL 自然过期兜底；
-- **故障分级**：429 全冷（AllKeysDown）与本地排队超时（CapacityExceeded）**不累计熔断**（前者已被 KeyPool 冷却覆盖，后者是本进程负载非上游故障）；已流出首个 delta 的流式中断（`StreamInterruptedError`）是连接级抖动，同样不累计——5 个并发长流自然中断不会误熔断全网关；
-- **空返回兜底**：LLM 200 但 content 全空 → 固定话术兜底，且已流式/未流式两种情况都保证前端 `token` 拼接 == `done.content`；
-- **usage 全计**：一轮内多次 LLM 调用（意图分类 + 生成 + 资格判定）token 用量经 contextvar 聚合，`done` 前补发单条 `usage` 事件透传对接方（观测/计费侧）。
-
-### 2. StorageRouter：Redis 主存 + MySQL 双写自动切换（存储高可用）
-- Redis 为主存储（会话/快照/缓存），MySQL 异步兜底双写；
-- Redis 故障 → 自动切 MySQL 模式；后台 5s 探测 Redis，恢复后自动切回，日志记录 `storage_mode_switch`；
-- MySQL 兜底读取时重建最近 10 条消息 + 摘要，保证 LLM 上下文完整。
-- **数据保留（TTL 回收）**：会话/护栏判定日志默认保留 30 天（`SESSION_RETENTION_DAYS`），超期回收 MySQL 存储——后台定时 sweep（`conversation_history`/`tool_call_log` 按 `created_at` 分批删除）+ `get_session` 惰性过期（Redis miss 走 MySQL 恢复时判超期即物理回收），`delete_session` 级联清 tool_call_log。判据全在 MySQL 侧 `NOW()`（与 `created_at` 的 `CURRENT_TIMESTAMP` 同基准，无时区错位）。
-
-### 3. RAG 一致性：MySQL 为源 + Milvus 派生索引（数据完整性）
-- **根除行业通病**：纯向量库方案下 chunks 是"可变快照"，改过就无法还原原文；本项目改为 **MySQL 存原始 Markdown（source of truth），Milvus 只存分块向量快照（LlamaIndex 管理）**，每次从源重新生成，不独立演进；
-- **一致性策略**：写向量失败 → 标记 `pending` → 下次写操作增量补偿（O(失败数)），全量对账仅异常恢复时 admin 手动触发；
-- **检索链路**：Embedding(bge-small-zh) → Milvus Top-10 → Re-rank Top-3 → Redis 精确缓存（TTL 600s）；空结果（score<0.3）不注入 prompt，回复引导人工；
-- **增量跳检**：chunks 以 `content_hash` 绑定文档与 embedding 模型，源文档/模型未变则跳过重向量化，知识库更新 O(变更) 而非 O(全量)；
-- **检索可靠性**：检索服务故障 → `RetrievalUnavailableError` → LLM 常识兜底 + 低可信度声明 + 转人工建议 + 3 次/60s 冷却，不因检索挂而崩溃。
-
-### 4. LangGraph 状态机：可完成的业务动作 + 全局可打断
-- **三个业务流**（退货/仅退款/投诉）各为一张图，每轮用户输入推进一节点，停在 `awaiting`（等待输入）或 `final`（终态）；
-- **全局打断**：任一节点可 `取消 / 返回 / 更换 / 转人工`；说「转人工」优先触发渠道模板话术（关键词已收窄，不误触发「人工智能」）；
-- **部分退货多轮指定**：任意轮可补「只退某商品」，items 槽合并进 `return_items`，资格重算后确认页展示子集及其金额；LLM 漏提取时以「只退/就退/只要退/仅退/单退 + 商品名」句式规则兜底（含量词/语气词/多商品/否定句式处理），规避退错全量风险；
-- **意图切换 + 快照**：业务流中切到别的意图自动保存当前进度（按意图各存一份），回来输入「继续退货」即可恢复；
-- **模型路由**：全链路统一 `deepseek-chat`（意图分类/响应/闲聊/投诉严重性评估，200ms-1s）；退货/退款资格判定走**确定性规则**（不走 LLM）；severity 评估异常/超时降级 MEDIUM（配置字段 `deepseek_model_reasoner` 已弃用，保留作一行回退）。
-
-### 5. SSE 契约化：事件齐备 + usage 必选 + 流式一致性（契约 §5.1）
-SSE 帧按 `event: <type>\n\ndata: {json}` 格式推送，前端 `useSSE.ts` 逐帧解析：
-
-| 事件 | 必选 | 说明 |
-|------|------|------|
-| `meta` | 首帧 | 接口身份声明（`agent`/`interface`/`contract_version`） |
-| `status` | 可选 | 阶段进度文案（前端进度条） |
-| `reasoning` | 可选 | 状态机推理依据（如投诉严重性评估依据，content+delta 双字段） |
-| `tool_call` | 可选 | 工具动作透出（`query_order`/`create_return`/`create_complaint`…） |
-| `token` | 流式 | `token.content`/`token.delta` 双字段逐段文本（TTFT 起点；`content`/`delta` 均为本帧增量，拼接即最终回复） |
-| `usage` | **必选** | token 用量聚合（prompt/completion/total + cache 命中/未命中） |
-| `done` | **必选** | 收尾，携带最终 `content` 与 `session_id` |
-| `error` | 失败 | 错误文案 |
-
-- **token 拼接 == done.content**：流式中途熔断/异常/空返回时 reply 拼接「已流部分 + 兜底」，`token` 只补发新增段，前端拼接结果与 `done.content` 严格一致；
-- **content == delta 恒等**：两字段均为本帧增量（`content` 与 `delta` 同值），非累积全文——勿改为累积值，否则 token 拼接与 `done.content` 不再一致；
-- **greeting 路径也补发**：新会话问候无 LLM 调用，同样补发 `token` + `usage` + `done`，契约不因降级而缺帧；
-- **标准契约端点**：`GET /api/contracts` 声明 agent 的对外接口与验收场景清单（chat/login + greeting/order_query/after_sales/human_handoff），供外部系统自动发现与联调。
-
-### 6. 并发与资源治理
-- **同一会话串行锁（分布式）**：Redis 锁（SET NX PX + token Lua 释放 + 看门狗每 ttl/3 续期）串行化同会话并发请求，**多节点共享**——双击发送、多实例负载均衡下状态不覆盖；Redis 不可用 fail-fast 503、等待超时映射 429；看门狗 Redis 抖动不退出（TTL 兜底）；
-- **SSE 断连自取消**：检测 `request.is_disconnected()`，自动保存进度并取消生成，防资源泄露；
-- **优雅关闭**：停止接新请求 → 30s 宽限 → 保存活跃会话 checkpoint → 关闭连接池；
-- **MySQL 写入重试**：连接错误/死锁指数退避（0.1/0.2/0.4s）3 次，失败统一兜底话术。
-
-### 7. 对接层抽象：ABC 接口 + Local/Remote 实现（可演进架构）
-Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `IComplaintService` 等抽象接口，当前 Local 实现直连 MySQL，未来切 Remote（HTTP/gRPC 微服务）**Agent 代码零改动**。
-
-### 8. 安全与可观测性
-- **安全基线 fail-fast（启动强校验）**：`validate_security_config()` 启动即检——JWT 密钥弱（`change-me` 或 <32 字符）直接拒绝启动（无逃生开关）；admin 密码留空/`admin123` 拒绝启动（仅 `ALLOW_WEAK_ADMIN_PASSWORD=true` **且 `APP_ENV=dev`** 本地环境逃生，prod 下逃生开关强制失效，防本地便利误入生产）；
-- **admin 口令 env 唯一事实来源**：`_ensure_admin_password()` 启动**无条件同步**——缺 admin 按 env 建，存量任何 hash（含历史未知弱口令）都覆盖为 env 密码；本系统无改密入口，不存在需保留的"用户改密"场景；env 密码空值再次 fail-fast 拒启（双保险）；
-- **HTTPS + 安全头（对外入口 nginx）**：TLSv1.2、HSTS（max-age=1y）、`X-Frame-Options`/`X-Content-Type-Options` 防 clickjacking/MIME 嗅探，`server_tokens off` 隐藏版本；HTTP 全量 301，明文不承载业务；证书自签（`scripts/gen_cert.sh` 可重生成），公网换 Let's Encrypt；
-- **/metrics（Prometheus 文本格式，零依赖）**：LLM 调用量/失败率/延迟、熔断拒绝数、排队超时、会话锁等待 429、意图规则命中率；`GET /metrics` 即可抓取，接入告警（如失败率飙升/熔断 opens）；
-- **三层 Prompt Injection 防护**：预处理正则（零成本拦截）+ prompt 五维度法（结构、边界、权限、数据、应急）+ System Prompt 安全注入；
-- **JWT 认证**：payload 含 role，Admin 接口权限隔离，前端按 role 显隐入口；
-- **JSON 结构化日志**：每个请求 1 进 1 出 + 6 阶段各 1 条 + LLM 调用/DB 操作全埋点，注入 `session_id` / `intent` / `latency_ms`，支持全链路追踪；
-- **会话消息体截断**：`SESSION_MAX_MESSAGES`（默认 40 条）超限截断为「首条 user 消息 + 最近 N-1 条」，防止会话无限增长（LLM/状态机不读消息全文，截断仅影响前端历史展示）。
-
-### 9. 工程化质量
-- **后端 386 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/token-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、共享熔断 close 仅本地广播方、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、分布式锁（获取/等待/超时/看门狗续期）、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、admin 口令兜底（创建/弱口令 sync/强口令不覆盖）、安全基线校验（弱 JWT/弱 admin 拒绝、逃生放行）、/metrics 埋点（计数器/Summary/格式）、会话历史/消息截断、contracts 端点；
-- **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
-- **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
-
-### 10. LLM 工具决策循环 + 实时护栏（P3-P5）
-- **决策循环**：`ORDER_STATUS` / `POLICY_INQUIRY` 意图下，LLM 自主决定调只读工具（`search_policy` / `query_order` / `list_user_orders`），工具结果回灌后由生成节点组装回复；业务副作用工具（建退货/退款/投诉单、资格判定）的决策被护栏拦截，转由 LangGraph 状态机确定性接手——决策与执行分离，LLM 不裸调业务动作；
-- **规则短路（优化③）**：`ORDER_STATUS` 且输入命中订单号时跳过 LLM 决策、确定性直查 `query_order`（未命中订单连查 `list_user_orders` 兜底），零决策轮调用、单号提取 100% 准确；`POLICY_INQUIRY` 刻意不接管（检索 query 依赖 LLM 改写）；未命中/异常回退 LLM 决策循环；落库 `verdict=rule_shortcut` 可观测；
-- **实时护栏 ToolGuardrail**：决策与执行之间的确定性规则校验，输出 `allow / reject / override` 三态 + 机器可读理由——副作用工具 reject→business、`search_policy` 过短/纯问候 reject、`query_order` 缺单号 override 为列最近订单、同轮同参数 dedupe 复用首次结果、累计工具调用 >3 截断强制出路由；
-- **观测落库**：每次护栏判定写 `tool_call_log`（session / round / tool / verdict / reason / 结果摘要 / 延迟），落库失败静默不阻断决策；为管理侧调用分析预留数据底座。
-
-### 11. 意图分类规则前置短路（少调 LLM）
-- **少调用优于小模型**：DeepSeek 官方仅 deepseek-chat/reasoner 两档，优化空间在"少调用"——意图分类每轮必调 LLM，但问候/查单/退货/退款/投诉等大量 query 是模板化表达，新增正则判定层（`intent_rules.py`）在 `classify_intent` 开头确定性接管，未命中回退 LLM，标准负载下意图分类 LLM 调用估降 40-60%（成本 + 首字延迟双降）；
-- **保守接管**：只接管正则可锁死的模式；疑问句式（"能退货吗" vs "我要退货"）一律回退 LLM（政策/资格咨询语义）；**POLICY_INQUIRY 刻意不接管**（政策问法最复杂，保分类准确率优先）；规则命中置信度 0.97 且 usage=None（聚合器安全跳过）；
-- **安全边界**：业务流内（确认/好的/补充等短词）与注入命中强制禁用规则——短词保留 LLM+state_hint、注入保留防御声明；
-- **可观测**：命中打 `event=intent_rule_hit`（intent + 输入长度），上线可量化命中率与 LLM 调用降幅。
-
-### 12. 可观测接入：客服对话链路即 agent 主链路
+### 1. 可观测接入：客服对话链路即 agent 主链路
 
 系统接入统一的**可观测 SDK**，并接进平台的错误回流闭环，形成
 `观测 → 聚类 → 组装 → 拉取 → 判定 → 回归回推 → 收口` 的完整链路。
@@ -400,6 +317,91 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 另因 `/chat` 即主链路，本仓还取得了一条**由真实用户提问触发**的完整闭环样本
 （观测事件 → 聚类 → 回流信封 → 回归用例 → 判定 → 收口），全链产物逐字可核。
 
+### 2. LangGraph 状态机：可完成的业务动作 + 全局可打断
+- **三个业务流**（退货/仅退款/投诉）各为一张图，每轮用户输入推进一节点，停在 `awaiting`（等待输入）或 `final`（终态）；
+- **全局打断**：任一节点可 `取消 / 返回 / 更换 / 转人工`；说「转人工」优先触发渠道模板话术（关键词已收窄，不误触发「人工智能」）；
+- **部分退货多轮指定**：任意轮可补「只退某商品」，items 槽合并进 `return_items`，资格重算后确认页展示子集及其金额；LLM 漏提取时以「只退/就退/只要退/仅退/单退 + 商品名」句式规则兜底（含量词/语气词/多商品/否定句式处理），规避退错全量风险；
+- **意图切换 + 快照**：业务流中切到别的意图自动保存当前进度（按意图各存一份），回来输入「继续退货」即可恢复；
+- **模型路由**：全链路统一 `deepseek-chat`（意图分类/响应/闲聊/投诉严重性评估，200ms-1s）；退货/退款资格判定走**确定性规则**（不走 LLM）；severity 评估异常/超时降级 MEDIUM（配置字段 `deepseek_model_reasoner` 已弃用，保留作一行回退）。
+
+### 3. LLM 工具决策循环 + 实时护栏
+- **决策循环**：`ORDER_STATUS` / `POLICY_INQUIRY` 意图下，LLM 自主决定调只读工具（`search_policy` / `query_order` / `list_user_orders`），工具结果回灌后由生成节点组装回复；业务副作用工具（建退货/退款/投诉单、资格判定）的决策被护栏拦截，转由 LangGraph 状态机确定性接手——决策与执行分离，LLM 不裸调业务动作；
+- **规则短路**：`ORDER_STATUS` 且输入命中订单号时跳过 LLM 决策、确定性直查 `query_order`（未命中订单连查 `list_user_orders` 兜底），零决策轮调用、单号提取 100% 准确；`POLICY_INQUIRY` 刻意不接管（检索 query 依赖 LLM 改写）；未命中/异常回退 LLM 决策循环；落库 `verdict=rule_shortcut` 可观测；
+- **实时护栏 ToolGuardrail**：决策与执行之间的确定性规则校验，输出 `allow / reject / override` 三态 + 机器可读理由——副作用工具 reject→business、`search_policy` 过短/纯问候 reject、`query_order` 缺单号 override 为列最近订单、同轮同参数 dedupe 复用首次结果、累计工具调用 >3 截断强制出路由；
+- **观测落库**：每次护栏判定写 `tool_call_log`（session / round / tool / verdict / reason / 结果摘要 / 延迟），落库失败静默不阻断决策；为管理侧调用分析预留数据底座。
+
+### 4. SSE 契约化：事件齐备 + usage 必选 + 流式一致性（契约 §5.1）
+SSE 帧按 `event: <type>\n\ndata: {json}` 格式推送，前端 `useSSE.ts` 逐帧解析：
+
+| 事件 | 必选 | 说明 |
+|------|------|------|
+| `meta` | 首帧 | 接口身份声明（`agent`/`interface`/`contract_version`） |
+| `status` | 可选 | 阶段进度文案（前端进度条） |
+| `reasoning` | 可选 | 状态机推理依据（如投诉严重性评估依据，content+delta 双字段） |
+| `tool_call` | 可选 | 工具动作透出（`query_order`/`create_return`/`create_complaint`…） |
+| `token` | 流式 | `token.content`/`token.delta` 双字段逐段文本（TTFT 起点；`content`/`delta` 均为本帧增量，拼接即最终回复） |
+| `usage` | **必选** | token 用量聚合（prompt/completion/total + cache 命中/未命中） |
+| `done` | **必选** | 收尾，携带最终 `content` 与 `session_id` |
+| `error` | 失败 | 错误文案 |
+
+- **token 拼接 == done.content**：流式中途熔断/异常/空返回时 reply 拼接「已流部分 + 兜底」，`token` 只补发新增段，前端拼接结果与 `done.content` 严格一致；
+- **content == delta 恒等**：两字段均为本帧增量（`content` 与 `delta` 同值），非累积全文——勿改为累积值，否则 token 拼接与 `done.content` 不再一致；
+- **greeting 路径也补发**：新会话问候无 LLM 调用，同样补发 `token` + `usage` + `done`，契约不因降级而缺帧；
+- **标准契约端点**：`GET /api/contracts` 声明 agent 的对外接口与验收场景清单（chat/login + greeting/order_query/after_sales/human_handoff），供外部系统自动发现与联调。
+
+### 5. RAG 一致性：MySQL 为源 + Milvus 派生索引（数据完整性）
+- **根除行业通病**：纯向量库方案下 chunks 是"可变快照"，改过就无法还原原文；本项目改为 **MySQL 存原始 Markdown（source of truth），Milvus 只存分块向量快照（LlamaIndex 管理）**，每次从源重新生成，不独立演进；
+- **一致性策略**：写向量失败 → 标记 `pending` → 下次写操作增量补偿（O(失败数)），全量对账仅异常恢复时 admin 手动触发；
+- **检索链路**：Embedding(bge-small-zh) → Milvus Top-10 → Re-rank Top-3 → Redis 精确缓存（TTL 600s）；空结果（score<0.3）不注入 prompt，回复引导人工；
+- **增量跳检**：chunks 以 `content_hash` 绑定文档与 embedding 模型，源文档/模型未变则跳过重向量化，知识库更新 O(变更) 而非 O(全量)；
+- **检索可靠性**：检索服务故障 → `RetrievalUnavailableError` → LLM 常识兜底 + 低可信度声明 + 转人工建议 + 3 次/60s 冷却，不因检索挂而崩溃。
+
+### 6. DeepSeek Gateway：多 Key 池化 + 排队背压 + 熔断（高并发核心）
+单 Key 有 RPM 上限，撑不起海量并发——**控制并发比加连接数更重要**：
+- **KeyPool**：多 Key 滑动窗口 RPM 追踪，选负载最低的 healthy Key；429 → 自动冷却，5xx → 换 Key 重试（最多 2 次，指数退避 0.1s/0.2s）；
+- **排队背压**：无 healthy Key 时排队 2s，超时返回容量告警，不无限堆积；
+- **熔断状态机**：连续 2 次"逻辑调用彻底失败"（重试耗尽/超时）→ 熔断 30s，期间入口直接快速拒绝、**零网络尝试**；冷却到期半开放行探测，成功即重置。超时类慢挂的代价是等满 timeout 才失败，阈值取 2 让慢挂 2×timeout 即进入冷却，用户快速转入规则引擎兜底；
+- **多节点共享熔断**：熔断连续计数留本地（进程私有），冷却期信号经 Redis 广播共享——任一节点熔断，其他节点免去各自重复探测即同步降级；半开放探测成功仅广播方清除共享信号，他节点成功不 DEL（防撤销他人广播），靠 TTL 自然过期兜底；
+- **故障分级**：429 全冷（AllKeysDown）与本地排队超时（CapacityExceeded）**不累计熔断**（前者已被 KeyPool 冷却覆盖，后者是本进程负载非上游故障）；已流出首个 delta 的流式中断（`StreamInterruptedError`）是连接级抖动，同样不累计——5 个并发长流自然中断不会误熔断全网关；
+- **空返回兜底**：LLM 200 但 content 全空 → 固定话术兜底，且已流式/未流式两种情况都保证前端 `token` 拼接 == `done.content`；
+- **usage 全计**：一轮内多次 LLM 调用（意图分类 + 生成 + 资格判定）token 用量经 contextvar 聚合，`done` 前补发单条 `usage` 事件透传对接方（观测/计费侧）。
+
+### 7. StorageRouter：Redis 主存 + MySQL 双写自动切换（存储高可用）
+- Redis 为主存储（会话/快照/缓存），MySQL 异步兜底双写；
+- Redis 故障 → 自动切 MySQL 模式；后台 5s 探测 Redis，恢复后自动切回，日志记录 `storage_mode_switch`；
+- MySQL 兜底读取时重建最近 10 条消息 + 摘要，保证 LLM 上下文完整。
+- **数据保留（TTL 回收）**：会话/护栏判定日志默认保留 30 天（`SESSION_RETENTION_DAYS`），超期回收 MySQL 存储——后台定时 sweep（`conversation_history`/`tool_call_log` 按 `created_at` 分批删除）+ `get_session` 惰性过期（Redis miss 走 MySQL 恢复时判超期即物理回收），`delete_session` 级联清 tool_call_log。判据全在 MySQL 侧 `NOW()`（与 `created_at` 的 `CURRENT_TIMESTAMP` 同基准，无时区错位）。
+
+### 8. 并发与资源治理
+- **同一会话串行锁（分布式）**：Redis 锁（SET NX PX + token Lua 释放 + 看门狗每 ttl/3 续期）串行化同会话并发请求，**多节点共享**——双击发送、多实例负载均衡下状态不覆盖；Redis 不可用 fail-fast 503、等待超时映射 429；看门狗 Redis 抖动不退出（TTL 兜底）；
+- **SSE 断连自取消**：检测 `request.is_disconnected()`，自动保存进度并取消生成，防资源泄露；
+- **优雅关闭**：停止接新请求 → 30s 宽限 → 保存活跃会话 checkpoint → 关闭连接池；
+- **MySQL 写入重试**：连接错误/死锁指数退避（0.1/0.2/0.4s）3 次，失败统一兜底话术。
+
+### 9. 意图分类规则前置短路（少调 LLM）
+- **少调用优于小模型**：DeepSeek 官方仅 deepseek-chat/reasoner 两档，优化空间在"少调用"——意图分类每轮必调 LLM，但问候/查单/退货/退款/投诉等大量 query 是模板化表达，新增正则判定层（`intent_rules.py`）在 `classify_intent` 开头确定性接管，未命中回退 LLM，标准负载下意图分类 LLM 调用估降 40-60%（成本 + 首字延迟双降）；
+- **保守接管**：只接管正则可锁死的模式；疑问句式（"能退货吗" vs "我要退货"）一律回退 LLM（政策/资格咨询语义）；**POLICY_INQUIRY 刻意不接管**（政策问法最复杂，保分类准确率优先）；规则命中置信度 0.97 且 usage=None（聚合器安全跳过）；
+- **安全边界**：业务流内（确认/好的/补充等短词）与注入命中强制禁用规则——短词保留 LLM+state_hint、注入保留防御声明；
+- **可观测**：命中打 `event=intent_rule_hit`（intent + 输入长度），上线可量化命中率与 LLM 调用降幅。
+
+### 10. 对接层抽象：ABC 接口 + Local/Remote 实现（可演进架构）
+Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `IComplaintService` 等抽象接口，当前 Local 实现直连 MySQL，未来切 Remote（HTTP/gRPC 微服务）**Agent 代码零改动**。
+
+### 11. 安全与可观测性
+- **安全基线 fail-fast（启动强校验）**：`validate_security_config()` 启动即检——JWT 密钥弱（`change-me` 或 <32 字符）直接拒绝启动（无逃生开关）；admin 密码留空/`admin123` 拒绝启动（仅 `ALLOW_WEAK_ADMIN_PASSWORD=true` **且 `APP_ENV=dev`** 本地环境逃生，prod 下逃生开关强制失效，防本地便利误入生产）；
+- **admin 口令 env 唯一事实来源**：`_ensure_admin_password()` 启动**无条件同步**——缺 admin 按 env 建，存量任何 hash（含历史未知弱口令）都覆盖为 env 密码；本系统无改密入口，不存在需保留的"用户改密"场景；env 密码空值再次 fail-fast 拒启（双保险）；
+- **HTTPS + 安全头（对外入口 nginx）**：TLSv1.2、HSTS（max-age=1y）、`X-Frame-Options`/`X-Content-Type-Options` 防 clickjacking/MIME 嗅探，`server_tokens off` 隐藏版本；HTTP 全量 301，明文不承载业务；证书自签（`scripts/gen_cert.sh` 可重生成），公网换 Let's Encrypt；
+- **/metrics（Prometheus 文本格式，零依赖）**：LLM 调用量/失败率/延迟、熔断拒绝数、排队超时、会话锁等待 429、意图规则命中率；`GET /metrics` 即可抓取，接入告警（如失败率飙升/熔断 opens）；
+- **三层 Prompt Injection 防护**：预处理正则（零成本拦截）+ prompt 五维度法（结构、边界、权限、数据、应急）+ System Prompt 安全注入；
+- **JWT 认证**：payload 含 role，Admin 接口权限隔离，前端按 role 显隐入口；
+- **JSON 结构化日志**：每个请求 1 进 1 出 + 6 阶段各 1 条 + LLM 调用/DB 操作全埋点，注入 `session_id` / `intent` / `latency_ms`，支持全链路追踪；
+- **会话消息体截断**：`SESSION_MAX_MESSAGES`（默认 40 条）超限截断为「首条 user 消息 + 最近 N-1 条」，防止会话无限增长（LLM/状态机不读消息全文，截断仅影响前端历史展示）。
+
+### 12. 工程化质量
+- **后端 419 项测试全绿**：意图分类（6 类准确率 >90%）、退货/退款/投诉状态机（7 节点 + 三级判定）、编排器（多轮商品合并、确认/取消 action 语义、转人工优先、流式一致性、空返回兜底）、LLM 工具决策循环（护栏 allow/reject/override 三态、同参去重、累计调用截断）、SSE 契约（帧格式/usage 必选/token-done 一致）、DeepSeek Gateway（熔断 open/半开放行/成功 reset、共享熔断 close 仅本地广播方、chat 与 chat_stream 双入口、流中断隔离、429/5xx/超时退避、首 delta 后不重试、兜底异常元组去重）、部分退货规则兜底、RAG、StorageRouter、分布式锁（获取/等待/超时/看门狗续期）、tool_call_log 落库、应用启动自建表+种子（schema 幂等）、admin 口令兜底（创建/弱口令 sync/强口令不覆盖）、安全基线校验（弱 JWT/弱 admin 拒绝、逃生放行）、/metrics 埋点（计数器/Summary/格式）、会话历史/消息截断、contracts 端点；
+- **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
+- **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
+
 ---
 
 ## 六、技术栈一览
@@ -414,7 +416,7 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 | 向量库 | Milvus + LlamaIndex + bge-small-zh | 知识库派生向量索引，Top-10 → Re-rank Top-3 |
 | LLM | DeepSeek（openai 兼容） | 统一 chat（意图/响应/闲聊/严重性）；资格判定规则化，超时降级 |
 | 网关 | 自研 KeyPool + 熔断 | 多 Key 滑动窗口 RPM + 排队背压 + 指数退避 + 规则引擎兜底 |
-| 测试 | pytest + pytest-asyncio + vitest | 后端 386 / 前端 41，集成测试真实链路可重跑 |
+| 测试 | pytest + pytest-asyncio + vitest | 后端 419 / 前端 41，集成测试真实链路可重跑 |
 
 ---
 
@@ -509,7 +511,7 @@ customer-service/
 
 | 阶段 | 内容 | 结果 |
 |------|------|------|
-| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环（含规则短路）+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / 分布式锁 / tool_call_log / contracts / 建表种子 / TTL 清理 / severity 模型档守护 | **383 passed** |
+| 后端单元/契约 | 意图（含规则前置短路）/ 状态机 / 编排器 / 决策循环（含规则短路）+护栏 / SSE 契约 / Gateway 熔断+退避 / usage / RAG / 会话 / 分布式锁 / tool_call_log / contracts / 建表种子 / TTL 清理 / severity 模型档守护 | **416 passed, 3 skipped** |
 | 前端组件 | ChatPanel / ChatInput / 登录注册表单 / useChat / useSession / useSSE / formatTime / 视图 | **41 passed** |
 | 集成测试 | 真实服务链路（会话 → SSE → 退单落库），`GET /healthz` 探测，未启动自动跳过 | 服务在跑时 **3 passed** |
 | E2E | `backend/verify_cs_e2e.py`：4 场景契约断言（闲聊/订单/政策/投诉，token 拼接 == done.content） | 已验证通过 |
@@ -553,7 +555,7 @@ docker compose exec backend bash  # 进入后端容器开发/调试
 - 新增 SSE 事件类型时，同步更新 `backend/app/api/contracts.py` 的 MANIFEST 与前端 `useSSE.ts` 的事件分支。
 
 ### 编码规范（约定）
-- 4 空格缩进、阿里 Java 规范思想；注释写"为什么"不写"做什么"（public 方法 Javadoc 除外）；中文注释、英文标识符；
+- 4 空格缩进；注释写"为什么"不写"做什么"（public 方法除外）；中文注释、英文标识符；
 - 新增接口/消费者打印入参出参（debug 级）；核心逻辑（Service 业务分支含正/异常路径）必须单测覆盖。
 
 ---
