@@ -1,0 +1,16 @@
+# 提示词模板（backend/app/agent/prompts/*.md）：不是给人读的文档，而是程序读取、
+# 原样拼进 system 提示词送 LLM 的**程序输入**。锁 LF 是为了让「文件字节」跨平台确定，
+# 不是为了修某个已知缺陷。
+#
+# 说清楚理由（2026-09-22 实测）：本仓 core.autocrlf=true 且此前无 .gitattributes，
+# Windows 检出会把 LF 转成 CRLF。但当前 loader 是
+# `Path.read_text(encoding="utf-8")`——文本模式默认 newline=None，做 universal-newline
+# 归一化，CRLF 会被吃掉，**送到 LLM 的文本不变**。所以缺这条规则不是当前的功能 bug。
+# 它兜住的是两件别的事：
+#   1. 隐式不变量：谁把 read_text 改成 read_bytes().decode() 或加 newline=""，CRLF 才会
+#      漏过去，且不报错。显式锁死后该风险不存在。
+#   2. 验收可复现：本仓提示词外置的验收证据是「.md 字节 == 原字面量字节」的逐字节比对，
+#      文件字节若随检出平台漂移，这类比对就失去意义。
+#
+# 只限定到本目录，不影响仓内其他文件。
+backend/app/agent/prompts/*.md text eol=lf

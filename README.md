@@ -402,6 +402,17 @@ Agent 只依赖 `IOrderService` / `IReturnService` / `IRefundService` / `ICompla
 - **前端 41 项测试全绿**：ChatPanel 渲染、ChatInput、登录/注册表单、useChat/useSession/useSSE、formatTime、客服/登录/注册视图；
 - **集成测试可重跑**：真实服务链路（会话 → SSE → 退单落库），服务未启动自动跳过不误报。
 
+### 13. 提示词外置：模板独立成文件 + 等价性逐字节验收
+
+7 个提示词从 Python 字符串字面量外置为 `backend/app/agent/prompts/*.md`（正文即全部内容、零转义），文件纳入 Git 版本控制——可 diff、可追溯、可按提交回滚。
+
+- **加载与插值分离**：`load_prompt(name)` 只做 `read_text(encoding="utf-8")`、**不做任何插值**，占位符原样返回由调用方填充——`decision.md`/`policy_answer.md` 走 `str.format`（`{tools}`/`{ctx}`），`intent_system.md` 因正文含 22 处 JSON 示例的**字面大括号**，改用 `string.Template` + `$state_hint`（该模板走 `format` 会把字面大括号当占位符而抛异常）。插值机制按模板而异是刻意的、不强行统一；模板与占位符对不上时调用点当场抛 `KeyError`，不会静默发出半个 prompt。
+- **验收口径：字节级往返等价**。本次改动的验收标准就是「产出物逐字节未变」——用真实 builder 以边界参数产出字符串，与 HEAD 版的产出**逐字节比对**，23/23 全等，含 8 组边界参数（空 ctx、含花括号/美元符/反斜杠/引号/CR 的 ctx、3000 字超长 ctx，以及 `build_intent_system` 的 None / 空串 / 特殊字符 / 2000 字超长）。这证明「外置」没有偷偷改动任何字符。
+- **比对函数输出而非字面量**：把 HEAD 版文件加载成独立模块，比对的是**函数产出**，而不是把新旧字符串摆一起肉眼看；7 个 `.md` 的字节数同时与原字面量对账（`policy_answer.md` 631 vs 627，差值恰为 `+len("{ctx}")-len("X")`；`intent_system.md` 4067 vs 4056，差值恰为 `+len("$state_hint")`），无无法解释的多余字节。
+- **结构守卫**：`tests/test_prompt_guard.py`（38 项）原本就断言意图/工具决策/政策答复三类模板的五维度法 XML 段标签齐备，外置后这些断言读的正是 `.md`——等于给「外置」加了一道回归守卫。
+- **`.gitattributes` 锁 LF**（`backend/app/agent/prompts/*.md text eol=lf`）：目的**不是修某个已知缺陷**——loader 走 `read_text`，文本模式 universal-newline 会把 CRLF 归一化，送到 LLM 的文本不变——而是让**文件字节**跨平台确定（上面的字节级比对若随检出平台漂移即失去意义），并兜住「谁把 loader 改成 `read_bytes().decode()`，CRLF 才会漏过去且不报错」这个隐式不变量。
+- **回滚口径**：模板随 `COPY backend/ /app/` 打进镜像，回滚 = 切回旧提交后**重新构建并发布**，不是热回滚。
+
 ---
 
 ## 六、技术栈一览
@@ -470,7 +481,7 @@ customer-service/
 │   │   │   ├── usage.py          # token 用量聚合（contextvar，按 asyncio task 隔离）
 │   │   │   ├── state_machine/    # 退货/退款/投诉状态机（LangGraph）
 │   │   │   ├── function_calling/ # 工具 + 护栏（order/return/refund/policy tools、guardrail、tool_call_log）
-│   │   │   └── prompts/          # prompt 模板（意图/闲聊/政策…）
+│   │   │   └── prompts/          # 提示词模板 *.md（意图/闲聊/政策/工具决策…）+ load_prompt 加载器
 │   │   ├── infrastructure/       # 资源层门面：interfaces（Protocol）+ 统一导出（llm_gateway/mysql_pool/retriever）+ DeepSeek Gateway + MySQL + schema
 │   │   ├── rag/                  # 资源层：RAG（embedder/retriever/milvus_impl/kb_store/knowledge）
 │   │   ├── services/             # 能力层：业务服务（interfaces ABC + local_impl + 重试）
